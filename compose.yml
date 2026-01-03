@@ -1,0 +1,45 @@
+services:
+  livellm-computer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kamasalyamov/livellm-browser:0.1.0
+    container_name: livellm-browser-0.1.0
+    ports:
+      # VNC port
+      - "5901:5901"
+      # noVNC web interface
+      - "6901:6901"
+      # FastAPI Controller
+      - "8000:8000"
+    environment:
+      - VNC_PW=headless
+      - VNC_RESOLUTION=1920x1080
+      - DISPLAY=:1
+    volumes:
+      # Persist Chrome profile for Playwright
+      - chrome-profile:/controller/profile
+      # Optional: Persist Firefox profile
+      - firefox-profile:/headless/.mozilla
+      # Optional: Persist downloads
+      - downloads:/headless/Downloads
+      # Optional: Shared documents
+      - documents:/headless/Documents
+    restart: unless-stopped
+    shm_size: '2gb'
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: '2gb'
+        reservations:
+          cpus: '0.5'
+          memory: '1gb'
+
+volumes:
+  chrome-profile:
+  firefox-profile:
+  downloads:
+  documents:
+
+

@@ -18,6 +18,16 @@ import uuid
 import logging
 from typing import List, Annotated, Optional
 
+
+class PingFilter(logging.Filter):
+    """Filter out /ping health check requests from access logs."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return "/ping" not in message
+
+uvicorn_access_logger = logging.getLogger("uvicorn.access")
+uvicorn_access_logger.addFilter(PingFilter())
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')

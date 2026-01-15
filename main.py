@@ -4,7 +4,16 @@ from fastapi.responses import Response
 from models.responses import (
     PingResponse, 
     SearchResult,
-    SelectorResult
+    SelectorResult,
+    ActionResult
+)
+from js_helpers import (
+    get_html_js,
+    get_text_js,
+    get_click_js,
+    get_fill_js,
+    get_attribute_js,
+    get_attribute_direct_xpath_js
 )
 from models.requests import (
     SearchRequest,
@@ -13,7 +22,12 @@ from models.requests import (
     MouseMoveRequest,
     ScreenshotRequest,
     ClickRequest,
-    ScrollRequest
+    ScrollRequest,
+    HtmlAction,
+    TextAction,
+    ClickAction,
+    FillAction,
+    AttributeAction
 )
 from contextlib import asynccontextmanager
 from patchright.async_api import async_playwright
@@ -261,14 +275,59 @@ async def get_content(request: GetHtmlRequest, page: PageDep) -> str:
 @app.post("/selectors")
 async def execute_selectors(request: SelectorRequest, page: PageDep) -> List[SelectorResult]:
     """
-    Execute CSS or XPath selectors on a page and retrieve values
+    Execute CSS or XPath selectors on a page and perform actions on matched elements.
+    
+    All actions use page.evaluate() with isolated_context=True for undetectability.
     
     Args:
-        request: SelectorRequest with URL and list of selectors to execute
+        request: SelectorRequest with URL and list of selectors with actions to execute
         page: Page object automatically managed by session (via X-Session-Id header)
         
     Returns:
-        List[SelectorResult]: Array of results with name and value for each selector
+        List[SelectorResult]: Array of results with name and action results for each selector
+        
+    Action types (each action is a separate model):
+        - HtmlAction: Returns outer HTML of elements (default)
+        - TextAction: Returns text content of elements
+        - ClickAction: Clicks on element(s) - supports nth param (0=first, -1=last, null=all)
+        - FillAction: Fills input element(s) - supports nth param (0=first, -1=last, null=all)
+        - AttributeAction: Gets attribute value (requires 'name' param)
+        
+    Examples:
+        
+        1. Get HTML (default behavior):
+           {"name": "nav", "type": "css", "value": "nav.main"}
+           
+        2. Get text content:
+           {"name": "titles", "type": "css", "value": "h1", "actions": [{"action": "text"}]}
+           
+        3. Click first element (default nth=0):
+           {"name": "btn", "type": "css", "value": "#submit", "actions": [{"action": "click"}]}
+           
+        4. Click last element:
+           {"name": "btn", "type": "css", "value": ".item", "actions": [{"action": "click", "nth": -1}]}
+           
+        5. Click all elements:
+           {"name": "btns", "type": "css", "value": ".btn", "actions": [{"action": "click", "nth": null}]}
+           
+        6. Fill first input (default nth=0):
+           {"name": "search", "type": "css", "value": "input[name='q']", 
+            "actions": [{"action": "fill", "value": "search term"}]}
+            
+        7. Fill all inputs:
+           {"name": "fields", "type": "css", "value": "input.field",
+            "actions": [{"action": "fill", "value": "test", "nth": null}]}
+           
+        8. Get href attribute (CSS):
+           {"name": "links", "type": "css", "value": "a.nav-link", 
+            "actions": [{"action": "attribute", "name": "href"}]}
+           
+        9. Get href attribute (XPath direct):
+           {"name": "links", "type": "xml", "value": "//a/@href"}
+           
+        10. Multiple actions (get text then click first):
+            {"name": "menu", "type": "css", "value": ".dropdown-item", 
+             "actions": [{"action": "text"}, {"action": "click"}]}
     """
     try:
         await page.goto(request.url, wait_until=request.wait_until, timeout=request.timeout)
@@ -280,58 +339,79 @@ async def execute_selectors(request: SelectorRequest, page: PageDep) -> List[Sel
         results = []
         
         for selector in request.selectors:
-            try:
-                if selector.type == "css":
-                    # Execute CSS selector using page.evaluate with isolated context (undetectable)
-                    values = await page.evaluate(
-                        """
-                        (selector) => {
-                            const elements = document.querySelectorAll(selector);
-                            return Array.from(elements).map(el => el.outerHTML);
-                        }
-                        """,
-                        selector.value,
-                        isolated_context=True
-                    )
-                    logger.info(f"Found {len(values)} elements for selector {selector.name}")
-                    
-                elif selector.type == "xml":
-                    # Execute XPath selector using page.evaluate with isolated context (undetectable)
-                    values = await page.evaluate(
-                        """
-                        (xpath) => {
-                            const result = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-                            const elements = [];
-                            for (let i = 0; i < result.snapshotLength; i++) {
-                                const node = result.snapshotItem(i);
-                                if (node.outerHTML) {
-                                    elements.push(node.outerHTML);
-                                } else if (node.textContent) {
-                                    elements.push(node.textContent);
-                                }
-                            }
-                            return elements;
-                        }
-                        """,
-                        selector.value,
-                        isolated_context=True
-                    )
-                    logger.info(f"Found {len(values)} elements for xpath selector {selector.name}")
-                else:
+            action_results = []
+            
+            for action in selector.actions:
+                try:
                     values = []
-                
-                results.append(SelectorResult(
-                    name=selector.name,
-                    value=values
-                ))
-                
-            except Exception as e:
-                # If selector fails, return empty list but still include the result
-                logger.warning(f"Selector {selector.name} failed: {e}")
-                results.append(SelectorResult(
-                    name=selector.name,
-                    value=[]
-                ))
+                    
+                    if isinstance(action, HtmlAction):
+                        # Get outer HTML
+                        js_code = get_html_js(selector.type)
+                        values = await page.evaluate(js_code, selector.value, isolated_context=True)
+                        logger.info(f"Got {len(values)} HTML elements for selector {selector.name}")
+                        
+                    elif isinstance(action, TextAction):
+                        # Get text content
+                        js_code = get_text_js(selector.type)
+                        values = await page.evaluate(js_code, selector.value, isolated_context=True)
+                        logger.info(f"Got {len(values)} text values for selector {selector.name}")
+                        
+                    elif isinstance(action, ClickAction):
+                        # Click on elements with nth parameter
+                        # nth: 0=first (default), -1=last, None=all
+                        js_code = get_click_js(selector.type)
+                        values = await page.evaluate(
+                            js_code, 
+                            [selector.value, action.nth], 
+                            isolated_context=True
+                        )
+                        nth_desc = "first" if action.nth == 0 else ("last" if action.nth == -1 else "all")
+                        logger.info(f"Clicked {len(values)} elements ({nth_desc}) for selector {selector.name}")
+                        
+                    elif isinstance(action, FillAction):
+                        # Fill elements with value and nth parameter
+                        # nth: 0=first (default), -1=last, None=all
+                        js_code = get_fill_js(selector.type)
+                        values = await page.evaluate(
+                            js_code, 
+                            [selector.value, action.value, action.nth], 
+                            isolated_context=True
+                        )
+                        nth_desc = "first" if action.nth == 0 else ("last" if action.nth == -1 else "all")
+                        logger.info(f"Filled {len(values)} elements ({nth_desc}) for selector {selector.name}")
+                            
+                    elif isinstance(action, AttributeAction):
+                        # Get attribute value
+                        # Check if XPath selector already targets attribute (e.g., //a/@href)
+                        if selector.type == "xml" and "/@" in selector.value:
+                            js_code = get_attribute_direct_xpath_js()
+                            values = await page.evaluate(js_code, selector.value, isolated_context=True)
+                        else:
+                            js_code = get_attribute_js(selector.type)
+                            values = await page.evaluate(
+                                js_code, 
+                                [selector.value, action.name], 
+                                isolated_context=True
+                            )
+                        logger.info(f"Got {len(values)} attribute values for selector {selector.name}")
+                    
+                    action_results.append(ActionResult(
+                        action=action.action,
+                        values=values if values else []
+                    ))
+                    
+                except Exception as e:
+                    logger.warning(f"Action {action.action} failed for selector {selector.name}: {e}")
+                    action_results.append(ActionResult(
+                        action=action.action,
+                        values=[f"error: {str(e)}"]
+                    ))
+            
+            results.append(SelectorResult(
+                name=selector.name,
+                results=action_results
+            ))
         
         return results
         

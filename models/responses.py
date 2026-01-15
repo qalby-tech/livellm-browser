@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Literal, List
+from typing import Literal, List, Any
 
 class PingResponse(BaseModel):
     status: Literal["ok", "error"] = Field("ok", description="The status of the API")
@@ -11,6 +11,24 @@ class SearchResult(BaseModel):
     snippet: str = Field(..., description="A brief description or snippet from the search result page")
 
 
+class ActionResult(BaseModel):
+    """Result of a single action performed on selector elements"""
+    action: str = Field(..., description="The action that was performed (html, text, click, fill, attribute)")
+    values: List[str] = Field(..., description="List of results from the action")
+
+
 class SelectorResult(BaseModel):
+    """
+    Result of selector execution with action results.
+    
+    Example response:
+    {
+        "name": "links",
+        "results": [
+            {"action": "text", "values": ["Home", "About", "Contact"]},
+            {"action": "click", "values": ["clicked", "clicked", "clicked"]}
+        ]
+    }
+    """
     name: str = Field(..., description="Unique identifier matching the selector name")
-    value: List[str] = Field(..., description="List of extracted HTML elements from the selector")
+    results: List[ActionResult] = Field(..., description="List of action results performed on the selector")

@@ -20,31 +20,26 @@ RUN apt-get update && \
 # Install Python 3.9 using uv
 RUN uv python install 3.9
 
-# Create workspace and copy controller files
+# Create workspace and controller directory
 RUN mkdir -p /workspace /controller
+WORKDIR /controller
+
+# Copy only dependency files first (for better caching)
+COPY pyproject.toml uv.lock ./
+
+# Install Python dependencies and Chrome (cached layer)
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync
+RUN uv run patchright install chrome
+
+# Now copy the rest of the application code
 COPY . /controller/
 
 # Create necessary directories for headless user and set permissions
 RUN mkdir -p /home/headless/.cache /home/headless/.local/share/uv /controller/profile && \
     chown -R headless:headless /controller /workspace /home/headless/.cache /home/headless/.local
 
-# Install dependencies and run the application
-WORKDIR /controller
-# Cache uv dependencies
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync
-# Cache Chrome installation using BuildKit cache mount
-RUN --mount=type=cache,target=/root/.cache/ms-playwright \
-    uv run patchright install chrome
-
 # Switch back to headless user
 USER headless
 # CMD ["--tail-log"]
 CMD ["uv", "run", "main.py"]
-
-
-
-
-
-
-

@@ -1,5 +1,6 @@
 import asyncio
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
+from fastapi.responses import Response
 from models.responses import (
     PingResponse, 
     SearchResult,
@@ -8,7 +9,11 @@ from models.responses import (
 from models.requests import (
     SearchRequest,
     GetHtmlRequest,
-    SelectorRequest
+    SelectorRequest,
+    MouseMoveRequest,
+    ScreenshotRequest,
+    ClickRequest,
+    ScrollRequest
 )
 from contextlib import asynccontextmanager
 from patchright.async_api import async_playwright
@@ -43,6 +48,7 @@ async def lifespan(app: FastAPI):
         headless=False,
         channel="chrome",
         no_viewport=True,
+        args=["--start-maximized"],
     )
     app.state.playwright = playwright
     app.state.browser = browser
@@ -276,27 +282,41 @@ async def execute_selectors(request: SelectorRequest, page: PageDep) -> List[Sel
         for selector in request.selectors:
             try:
                 if selector.type == "css":
-                    # Execute CSS selector
-                    elements = await page.query_selector_all(selector.value)
-                    logger.info(f"Found {len(elements)} elements for selector {selector.name}")
-                    # Extract HTML content from all matching elements
-                    values = []
-                    for element in elements:
-                        html = await element.outer_html()
-                        if html:
-                            values.append(html)
+                    # Execute CSS selector using page.evaluate with isolated context (undetectable)
+                    values = await page.evaluate(
+                        """
+                        (selector) => {
+                            const elements = document.querySelectorAll(selector);
+                            return Array.from(elements).map(el => el.outerHTML);
+                        }
+                        """,
+                        selector.value,
+                        isolated_context=True
+                    )
+                    logger.info(f"Found {len(values)} elements for selector {selector.name}")
                     
                 elif selector.type == "xml":
-                    # Execute XPath selector (XML path selector)
-                    # Playwright uses locator with xpath= prefix for XPath
-                    locator = page.locator(f"xpath={selector.value}")
-                    count = await locator.count()
-                    values = []
-                    for i in range(count):
-                        element = locator.nth(i)
-                        html = await element.outer_html()
-                        if html:
-                            values.append(html)
+                    # Execute XPath selector using page.evaluate with isolated context (undetectable)
+                    values = await page.evaluate(
+                        """
+                        (xpath) => {
+                            const result = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                            const elements = [];
+                            for (let i = 0; i < result.snapshotLength; i++) {
+                                const node = result.snapshotItem(i);
+                                if (node.outerHTML) {
+                                    elements.push(node.outerHTML);
+                                } else if (node.textContent) {
+                                    elements.push(node.textContent);
+                                }
+                            }
+                            return elements;
+                        }
+                        """,
+                        selector.value,
+                        isolated_context=True
+                    )
+                    logger.info(f"Found {len(values)} elements for xpath selector {selector.name}")
                 else:
                     values = []
                 
@@ -307,6 +327,7 @@ async def execute_selectors(request: SelectorRequest, page: PageDep) -> List[Sel
                 
             except Exception as e:
                 # If selector fails, return empty list but still include the result
+                logger.warning(f"Selector {selector.name} failed: {e}")
                 results.append(SelectorResult(
                     name=selector.name,
                     value=[]
@@ -316,6 +337,122 @@ async def execute_selectors(request: SelectorRequest, page: PageDep) -> List[Sel
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to execute selectors: {str(e)}")
+
+
+@app.post("/screenshot")
+async def get_screenshot(request: ScreenshotRequest, page: PageDep) -> Response:
+    """
+    Take a screenshot of the given webpage
+    
+    Args:
+        request: ScreenshotRequest with URL and screenshot options
+        page: Page object automatically managed by session (via X-Session-Id header)
+        
+    Returns:
+        Response: PNG image of the screenshot
+    """
+    try:
+        await page.goto(request.url, wait_until=request.wait_until, timeout=request.timeout)
+        
+        # Wait for idle time if specified
+        if request.idle > 0:
+            await asyncio.sleep(request.idle)
+        
+        # Take screenshot
+        screenshot_bytes = await page.screenshot(full_page=request.full_page, type="png")
+        
+        return Response(content=screenshot_bytes, media_type="image/png")
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to take screenshot: {str(e)}")
+
+
+@app.post("/move")
+async def move_cursor(request: MouseMoveRequest, page: PageDep) -> dict:
+    """
+    Move the mouse cursor to a specific point on the page
+    
+    Args:
+        request: MouseMoveRequest with URL and x, y coordinates
+        page: Page object automatically managed by session (via X-Session-Id header)
+        
+    Returns:
+        dict: Status message indicating success
+    """
+    try:
+        await page.goto(request.url, wait_until="commit")
+        
+        # Move mouse to the specified coordinates
+        await page.mouse.move(request.x, request.y, steps=request.steps)
+        
+        return {
+            "status": "success",
+            "message": f"Mouse moved to ({request.x}, {request.y}) with {request.steps} steps"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to move cursor: {str(e)}")
+
+
+@app.post("/click")
+async def click(request: ClickRequest, page: PageDep) -> dict:
+    """
+    Click at a specific point on the page
+    
+    Args:
+        request: ClickRequest with URL and x, y coordinates
+        page: Page object automatically managed by session (via X-Session-Id header)
+        
+    Returns:
+        dict: Status message indicating success
+    """
+    try:
+        await page.goto(request.url, wait_until="commit")
+        
+        # Click at the specified coordinates
+        await page.mouse.click(
+            request.x, 
+            request.y, 
+            button=request.button,
+            click_count=request.click_count,
+            delay=request.delay
+        )
+        
+        return {
+            "status": "success",
+            "message": f"Clicked at ({request.x}, {request.y}) with {request.button} button"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to click: {str(e)}")
+
+
+@app.post("/scroll")
+async def scroll(request: ScrollRequest, page: PageDep) -> dict:
+    """
+    Scroll the page by specified delta
+    
+    Args:
+        request: ScrollRequest with URL and scroll deltas
+        page: Page object automatically managed by session (via X-Session-Id header)
+        
+    Returns:
+        dict: Status message indicating success
+    """
+    try:
+        await page.goto(request.url, wait_until="commit")
+        
+        # Scroll the page using mouse wheel
+        await page.mouse.wheel(request.x, request.y)
+        
+        return {
+            "status": "success",
+            "message": f"Scrolled by ({request.x}, {request.y})"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to scroll: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn

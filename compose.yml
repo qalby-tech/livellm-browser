@@ -17,29 +17,25 @@ services:
       - VNC_RESOLUTION=1920x1080
       - DISPLAY=:1
     volumes:
-      # Persist Chrome profile for Playwright
-      - chrome-profile:/controller/profile
-      # Optional: Persist Firefox profile
-      - firefox-profile:/headless/.mozilla
-      # Optional: Persist downloads
-      - downloads:/headless/Downloads
-      # Optional: Shared documents
-      - documents:/headless/Documents
+      # Mount profiles directory from host with read/write access
+      # Create your profile directory on host: mkdir -p ./profiles/myprofile
+      # Then set PROFILE_NAME=myprofile to use it
+      - profiles_volume:/controller/profiles:rw
     restart: unless-stopped
-    shm_size: '2gb'
+    shm_size: '4gb'
     deploy:
       resources:
         limits:
           cpus: '1'
-          memory: '2gb'
+          memory: '4gb'
         reservations:
           cpus: '0.5'
-          memory: '1gb'
+          memory: '2gb'
 
 volumes:
-  chrome-profile:
-  firefox-profile:
-  downloads:
-  documents:
+  profiles_volume:
+    driver: local
+
+#   chrome-profile:
 
 

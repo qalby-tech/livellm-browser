@@ -36,7 +36,8 @@ RUN uv run patchright install chrome
 COPY . /controller/
 
 # Create necessary directories for headless user and set permissions
-RUN mkdir -p /home/headless/.cache /home/headless/.local/share/uv /controller/profile && \
+# profiles/default is the default browser profile directory
+RUN mkdir -p /home/headless/.cache /home/headless/.local/share/uv /controller/profiles/default && \
     chown -R headless:headless /controller /workspace /home/headless/.cache /home/headless/.local
 
 # Switch back to headless user

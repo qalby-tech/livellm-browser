@@ -9,7 +9,7 @@ class SearchRequest(BaseModel):
 
 
 class GetHtmlRequest(BaseModel):
-    url: str = Field(..., description="The URL to get the HTML from")
+    url: Optional[str] = Field(default=None, description="The URL to get the HTML from. If not provided, uses current page.")
     wait_until: Literal["commit", "domcontentloaded", "load", "networkidle"] = Field(default="commit", description="The wait until event to wait for")
     timeout: float = Field(default=3600, description="The timeout in milliseconds")
     idle: float = Field(default=1.5, description="Idle time in milliseconds to wait after page loaded")
@@ -90,9 +90,82 @@ class AttributeAction(Action):
     name: str = Field(..., description="Attribute name to extract (e.g., 'href', 'src', 'data-id')")
 
 
-# Union type for all possible actions with discriminator
+class RemoveAction(Action):
+    """
+    Remove selected element(s) from the DOM.
+    
+    The nth parameter controls which element to remove:
+    - nth=0 (default): remove only the first element
+    - nth=-1: remove only the last element
+    - nth=None: remove all matching elements
+    
+    Useful for cleaning up pages before extracting content (e.g., removing ads, popups, etc.)
+    """
+    action: Literal["remove"] = Field(default="remove", description="Removes element(s) from the DOM")
+    nth: Optional[int] = Field(
+        default=0, 
+        description="Which element to remove: 0=first (default), -1=last, None=all"
+    )
+
+
+# ==================== Interact Actions ====================
+
+class ScreenshotAction(Action):
+    """Take a screenshot of the page"""
+    action: Literal["screenshot"] = Field(default="screenshot", description="Takes a screenshot of the page")
+    full_page: bool = Field(default=False, description="If True, capture full scrollable page")
+
+
+class ScrollAction(Action):
+    """Scroll the page by specified delta"""
+    action: Literal["scroll"] = Field(default="scroll", description="Scrolls the page by delta")
+    x: float = Field(default=0, description="Horizontal scroll delta")
+    y: float = Field(default=0, description="Vertical scroll delta (positive = down, negative = up)")
+
+
+class MoveAction(Action):
+    """Move mouse cursor to coordinates"""
+    action: Literal["move"] = Field(default="move", description="Moves mouse to coordinates")
+    x: float = Field(..., description="X coordinate to move to")
+    y: float = Field(..., description="Y coordinate to move to")
+    steps: int = Field(default=10, description="Number of intermediate steps for smooth movement")
+
+
+class MouseClickAction(Action):
+    """
+    Click at specific coordinates on the page.
+    
+    Different from ClickAction which clicks on selected elements.
+    This action clicks at absolute x,y coordinates.
+    """
+    action: Literal["mouse_click"] = Field(default="mouse_click", description="Clicks at coordinates")
+    x: float = Field(..., description="X coordinate to click")
+    y: float = Field(..., description="Y coordinate to click")
+    button: Literal["left", "right", "middle"] = Field(default="left", description="Mouse button to click")
+    click_count: int = Field(default=1, description="Number of clicks (1 for single, 2 for double)")
+    delay: float = Field(default=0, description="Delay between mousedown and mouseup in milliseconds")
+
+
+class IdleAction(Action):
+    """
+    Wait for a specified duration.
+    
+    Useful for adding delays between actions, waiting for animations,
+    or giving the page time to load dynamic content.
+    """
+    action: Literal["idle"] = Field(default="idle", description="Waits for specified duration")
+    duration: float = Field(..., description="Duration to wait in seconds")
+
+
+# Union type for selector actions
 SelectorAction = Annotated[
-    Union[HtmlAction, TextAction, ClickAction, FillAction, AttributeAction],
+    Union[HtmlAction, TextAction, ClickAction, FillAction, AttributeAction, RemoveAction],
+    Discriminator("action")
+]
+
+# Union type for interact actions (reuses HtmlAction and TextAction from selector actions)
+InteractAction = Annotated[
+    Union[ScreenshotAction, ScrollAction, MoveAction, MouseClickAction, IdleAction, HtmlAction, TextAction],
     Discriminator("action")
 ]
 
@@ -135,6 +208,12 @@ class Selector(BaseModel):
     
     11. XPath with attribute action:
         {"name": "images", "type": "xml", "value": "//img", "actions": [{"action": "attribute", "name": "src"}]}
+    
+    12. Remove all matching elements (e.g., ads):
+        {"name": "ads", "type": "css", "value": ".advertisement", "actions": [{"action": "remove", "nth": null}]}
+    
+    13. Remove first popup:
+        {"name": "popup", "type": "css", "value": ".modal", "actions": [{"action": "remove"}]}
     """
     name: str = Field(..., description="Unique identifier for the selector")
     type: Literal["css", "xml"] = Field(..., description="Type of selector: css or xml (xpath)")
@@ -146,38 +225,86 @@ class Selector(BaseModel):
 
 
 class SelectorRequest(BaseModel):
-    url: str = Field(..., description="The URL to execute selectors on")
+    url: Optional[str] = Field(default=None, description="The URL to execute selectors on. If not provided, uses current page.")
     selectors: list[Selector] = Field(..., description="List of selectors to execute")
     wait_until: Literal["commit", "domcontentloaded", "load", "networkidle"] = Field(default="commit", description="The wait until event to wait for")
     timeout: float = Field(default=3600, description="The timeout in milliseconds")
     idle: float = Field(default=1.5, description="Idle time in milliseconds to wait after page loaded")
 
 
-class ScreenshotRequest(BaseModel):
-    url: str = Field(..., description="The URL to take a screenshot of")
-    wait_until: Literal["commit", "domcontentloaded", "load", "networkidle"] = Field(default="load", description="The wait until event to wait for")
-    timeout: float = Field(default=30000, description="The timeout in milliseconds")
-    idle: float = Field(default=1.0, description="Idle time in seconds to wait after page loaded")
-    full_page: bool = Field(default=False, description="If True, capture full scrollable page")
-
-
-class MouseMoveRequest(BaseModel):
-    url: str = Field(..., description="The URL to navigate to")
-    x: float = Field(..., description="The x coordinate to move the mouse to")
-    y: float = Field(..., description="The y coordinate to move the mouse to")
-    steps: int = Field(default=10, description="Number of intermediate steps for smooth movement")
-
-
-class ClickRequest(BaseModel):
-    url: str = Field(..., description="The URL to navigate to")
-    x: float = Field(..., description="The x coordinate to click")
-    y: float = Field(..., description="The y coordinate to click")
-    button: Literal["left", "right", "middle"] = Field(default="left", description="Mouse button to click")
-    click_count: int = Field(default=1, description="Number of clicks (1 for single, 2 for double)")
-    delay: float = Field(default=0, description="Delay between mousedown and mouseup in milliseconds")
-
-
-class ScrollRequest(BaseModel):
-    url: str = Field(..., description="The URL to navigate to")
-    x: float = Field(default=0, description="Horizontal scroll delta")
-    y: float = Field(default=0, description="Vertical scroll delta (positive = down, negative = up)")
+class InteractRequest(BaseModel):
+    """
+    Unified request for page interactions using actions list.
+    
+    If URL is provided, navigates to it first. Otherwise, uses current page.
+    Actions are executed in the order they appear in the list.
+    
+    Available actions:
+    - screenshot: Take a screenshot (returns PNG image)
+    - scroll: Scroll the page by delta
+    - move: Move mouse to coordinates
+    - mouse_click: Click at coordinates
+    - idle: Wait for specified duration
+    - html: Get page HTML content
+    - text: Get page text content
+    
+    Usage examples:
+    
+    1. Take screenshot of current page:
+       {"actions": [{"action": "screenshot"}]}
+       
+    2. Take full page screenshot of URL:
+       {"url": "https://example.com", "actions": [{"action": "screenshot", "full_page": true}]}
+       
+    3. Click at coordinates:
+       {"actions": [{"action": "mouse_click", "x": 100, "y": 200}]}
+       
+    4. Double-click with right button:
+       {"actions": [{"action": "mouse_click", "x": 100, "y": 200, "button": "right", "click_count": 2}]}
+       
+    5. Move mouse to position:
+       {"actions": [{"action": "move", "x": 300, "y": 400, "steps": 20}]}
+       
+    6. Scroll down:
+       {"actions": [{"action": "scroll", "y": 500}]}
+       
+    7. Navigate and scroll:
+       {"url": "https://example.com", "actions": [{"action": "scroll", "y": 1000}]}
+       
+    8. Multiple actions (move, click, then screenshot):
+       {"actions": [
+           {"action": "move", "x": 100, "y": 200},
+           {"action": "mouse_click", "x": 100, "y": 200},
+           {"action": "screenshot"}
+       ]}
+       
+    9. Scroll and take screenshot:
+       {"actions": [
+           {"action": "scroll", "y": 500},
+           {"action": "screenshot", "full_page": true}
+       ]}
+       
+    10. Wait between actions:
+        {"actions": [
+            {"action": "mouse_click", "x": 100, "y": 200},
+            {"action": "idle", "duration": 2},
+            {"action": "screenshot"}
+        ]}
+        
+    11. Get page HTML:
+        {"actions": [{"action": "html"}]}
+        
+    12. Get page text:
+        {"actions": [{"action": "text"}]}
+        
+    13. Navigate, scroll, then get text:
+        {"url": "https://example.com", "actions": [
+            {"action": "scroll", "y": 500},
+            {"action": "text"}
+        ]}
+    """
+    url: Optional[str] = Field(default=None, description="URL to navigate to. If not provided, uses current page.")
+    wait_until: Literal["commit", "domcontentloaded", "load", "networkidle"] = Field(default="commit", description="Wait until event when navigating")
+    timeout: float = Field(default=30000, description="Navigation timeout in milliseconds")
+    idle: float = Field(default=0, description="Idle time in seconds to wait after page loaded")
+    actions: List[InteractAction] = Field(..., description="List of actions to perform in order")

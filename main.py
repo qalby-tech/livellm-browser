@@ -1,4 +1,6 @@
 import asyncio
+import os
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.responses import Response
 from models.responses import (
@@ -7,35 +9,35 @@ from models.responses import (
     SelectorResult,
     ActionResult
 )
-from js_helpers import (
-    get_html_js,
-    get_text_js,
-    get_click_js,
-    get_fill_js,
-    get_attribute_js,
-    get_attribute_direct_xpath_js
-)
 from models.requests import (
     SearchRequest,
     GetHtmlRequest,
     SelectorRequest,
-    MouseMoveRequest,
-    ScreenshotRequest,
-    ClickRequest,
-    ScrollRequest,
+    InteractRequest,
     HtmlAction,
     TextAction,
     ClickAction,
     FillAction,
-    AttributeAction
+    AttributeAction,
+    RemoveAction,
+    ScreenshotAction,
+    ScrollAction,
+    MoveAction,
+    MouseClickAction,
+    IdleAction
 )
 from contextlib import asynccontextmanager
-from patchright.async_api import async_playwright
-from patchright.async_api import BrowserContext
+from patchright.async_api import async_playwright, Playwright
+from patchright.async_api import Browser, BrowserContext
 from patchright.async_api import Page
 import uuid
 import logging
 from typing import List, Annotated, Optional
+from pydantic import BaseModel, Field
+
+# Default profile configuration
+PROFILES_DIR = Path("./profiles")
+DEFAULT_BROWSER_ID = "default"
 
 
 class PingFilter(logging.Filter):
@@ -54,72 +56,251 @@ handler = logging.StreamHandler()
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
+
+class BrowserInfo:
+    """Container for browser, context and its associated pages."""
+    def __init__(self, browser: Browser, context: BrowserContext, profile_path: Path):
+        self.browser = browser
+        self.context = context
+        self.profile_path = profile_path
+        self.pages: dict[str, Page] = {}
+
+
+
+class BrowserManager:
+    """Manages multiple browser instances."""
+    def __init__(self):
+        self.playwright: Optional[Playwright] = None
+        self.browsers: dict[str, BrowserInfo] = {}
+    
+    async def start(self, playwright: Playwright):
+        """Initialize the browser manager with playwright instance."""
+        self.playwright = playwright
+        # Create default browser
+        await self.create_browser(profile_dir=str(PROFILES_DIR / DEFAULT_BROWSER_ID))
+        logger.info("Browser manager started with default browser")
+    
+    async def create_browser(self, profile_dir: Optional[str] = None) -> tuple[str, BrowserInfo]:
+        """
+        Create a new browser instance.
+        
+        Args:
+            profile_dir: Profile directory path. If provided, used as browser_id.
+                        If not provided, generates UUID and uses profiles/{uuid}.
+        
+        Returns:
+            Tuple of (browser_id, BrowserInfo)
+        """
+        if not self.playwright:
+            raise RuntimeError("Browser manager not started")
+        
+        # Determine browser_id and profile_path
+        if profile_dir:
+            browser_id = profile_dir
+            profile_path = Path(profile_dir)
+        else:
+            browser_id = str(uuid.uuid4())
+            profile_path = PROFILES_DIR / browser_id
+        
+        if browser_id in self.browsers:
+            raise ValueError(f"Browser with id '{browser_id}' already exists")
+
+        
+        # Launch browser with persistent context (Playwright creates dir if needed)
+        # This returns a BrowserContext, but we can access the Browser via context.browser
+        context = await self.playwright.chromium.launch_persistent_context(
+            user_data_dir=str(profile_path),
+            headless=False,
+            channel="chrome",
+            no_viewport=True,
+            args=["--start-maximized"],
+        )
+        
+        # Get the browser object from the context so we can properly close it
+        browser = context.browser
+        if browser is None:
+            raise RuntimeError(f"Failed to get browser object from context for profile {profile_path}")
+        
+        browser_info = BrowserInfo(browser, context, profile_path)
+        self.browsers[browser_id] = browser_info
+        logger.info(f"Created browser '{browser_id}' with profile at {profile_path}")
+        
+        return browser_id, browser_info
+    
+    def get_browser(self, browser_id: str) -> BrowserInfo:
+        """Get a browser by its ID."""
+        if browser_id not in self.browsers:
+            raise KeyError(f"Browser with id '{browser_id}' not found")
+        return self.browsers[browser_id]
+    
+    def get_default_browser(self) -> BrowserInfo:
+        """Get the default browser."""
+        return self.browsers[str(PROFILES_DIR / DEFAULT_BROWSER_ID)]
+    
+    def get_default_browser_id(self) -> str:
+        """Get the default browser ID."""
+        return str(PROFILES_DIR / DEFAULT_BROWSER_ID)
+    
+    async def close_browser(self, browser_id: str) -> bool:
+        """Close and remove a browser instance."""
+        default_id = str(PROFILES_DIR / DEFAULT_BROWSER_ID)
+        if browser_id == default_id:
+            raise ValueError("Cannot close the default browser")
+        
+        if browser_id not in self.browsers:
+            return False
+        
+        browser_info = self.browsers[browser_id]
+        
+        # Close all pages
+        for page in browser_info.pages.values():
+            try:
+                await page.close()
+            except Exception as e:
+                logger.warning(f"Error closing page: {e}")
+        
+        # Close browser context
+        try:
+            await browser_info.context.close()
+        except Exception as e:
+            logger.warning(f"Error closing context: {e}")
+        
+        # Close browser (this properly releases all resources and lock files)
+        try:
+            await browser_info.browser.close()
+        except Exception as e:
+            logger.warning(f"Error closing browser: {e}")
+        
+        del self.browsers[browser_id]
+        logger.info(f"Closed browser '{browser_id}'")
+        return True
+    
+    async def shutdown(self):
+        """Close all browsers and cleanup."""
+        for browser_id in list(self.browsers.keys()):
+            browser_info = self.browsers[browser_id]
+            
+            # Close all pages
+            for page in browser_info.pages.values():
+                try:
+                    await page.close()
+                except Exception as e:
+                    logger.warning(f"Error closing page: {e}")
+            
+            # Close browser context
+            try:
+                await browser_info.context.close()
+            except Exception as e:
+                logger.warning(f"Error closing context for browser {browser_id}: {e}")
+            
+            # Close browser (this properly releases all resources and lock files)
+            try:
+                await browser_info.browser.close()
+            except Exception as e:
+                logger.warning(f"Error closing browser {browser_id}: {e}")
+        
+        self.browsers.clear()
+        logger.info("All browsers closed")
+
+
+# Global browser manager
+browser_manager = BrowserManager()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Clean up Chrome lock files before starting Playwright
+    # This ensures a clean state on container restart
+    default_profile = PROFILES_DIR / DEFAULT_BROWSER_ID
+    default_profile.mkdir(parents=True, exist_ok=True)
+    
+    # Start playwright and browser manager
     playwright = await async_playwright().start()
-    browser = await playwright.chromium.launch_persistent_context(
-        user_data_dir="./profile",
-        headless=False,
-        channel="chrome",
-        no_viewport=True,
-        args=["--start-maximized"],
-    )
+    await browser_manager.start(playwright)
+    
     app.state.playwright = playwright
-    app.state.browser = browser
-    app.state.pages: dict[str, Page] = {} # id: page object
+    app.state.browser_manager = browser_manager
+    
     yield
-    # Clean up all pages before closing browser
-    for page in app.state.pages.values():
-        try:
-            await page.close()
-        except Exception as e:
-            logger.warning(f"Error closing page: {e}")
-    await browser.close()
+    
+    # Cleanup: properly close all browsers before stopping Playwright
+    await browser_manager.shutdown()
     await playwright.stop()
 
 
-app = FastAPI(title="Controller API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Controller API", version="0.2.0", lifespan=lifespan)
 
 
-BrowserContextDep = Annotated[BrowserContext, Depends(lambda: app.state.browser)]
+# Request/Response models for browser management
+class CreateBrowserRequest(BaseModel):
+    profile_dir: Optional[str] = Field(
+        default=None, 
+        description="Profile directory path. If provided, used as browser_id. If not, UUID is generated."
+    )
+
+
+class BrowserResponse(BaseModel):
+    browser_id: str
+    profile_path: str
+    session_count: int
+
+
+class StartSessionRequest(BaseModel):
+    browser_id: Optional[str] = Field(default=None, description="Browser to create session in. Defaults to default browser.")
+
+
+# Dependencies
+BrowserIdDep = Annotated[Optional[str], Header(alias="X-Browser-Id")]
 SessionIdDep = Annotated[Optional[str], Header(alias="X-Session-Id")]
+
+
+async def get_browser_info(
+    request: Request,
+    browser_id: BrowserIdDep = None
+) -> BrowserInfo:
+    """Get browser info, defaulting to the default browser."""
+    manager: BrowserManager = request.app.state.browser_manager
+    bid = browser_id or manager.get_default_browser_id()
+    try:
+        return manager.get_browser(bid)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Browser '{bid}' not found")
+
+
+BrowserInfoDep = Annotated[BrowserInfo, Depends(get_browser_info)]
+
 
 async def get_or_create_page(
     request: Request,
-    context: BrowserContextDep, 
+    browser_info: BrowserInfoDep,
     session_id: SessionIdDep = None
 ) -> Page:
     """
-    Get or create a page object for the given session ID.
+    Get or create a page object for the given session ID within a browser.
     If no session_id is provided, a new one is generated and stored in the request state.
     """
     # Generate session_id if not provided
     if session_id is None:
         session_id = str(uuid.uuid4())
-        request.state.session_id = session_id
-    else:
-        request.state.session_id = session_id
+    request.state.session_id = session_id
     
-    # Get pages dict from app state
-    pages = request.app.state.pages
+    pages = browser_info.pages
     
     # Check if page already exists
     page = pages.get(session_id, None)
     if page:
         # Verify page is still valid (not closed)
         try:
-            # Try to access a property to check if page is still valid
             _ = page.url
             return page
         except Exception:
-            # Page was closed, create a new one
             logger.info(f"Page for session {session_id} was closed, creating new one")
-            page = await context.new_page()
+            page = await browser_info.context.new_page()
             pages[session_id] = page
             return page
     
     # Create new page
-    page = await context.new_page()
+    page = await browser_info.context.new_page()
     pages[session_id] = page
     logger.info(f"Created new page for session {session_id}")
     return page
@@ -128,35 +309,115 @@ async def get_or_create_page(
 PageDep = Annotated[Page, Depends(get_or_create_page)]
 
 
+# ==================== Browser Management Endpoints ====================
+
 @app.get("/ping")
 async def root() -> PingResponse:
     """Health check endpoint"""
     return PingResponse(status="ok", message="Controller API is running")
 
 
-@app.get("/start_session")
-async def start_session(context: BrowserContextDep) -> dict:
+@app.get("/browsers")
+async def list_browsers() -> List[BrowserResponse]:
+    """List all active browsers."""
+    return [
+        BrowserResponse(
+            browser_id=bid,
+            profile_path=str(info.profile_path),
+            session_count=len(info.pages)
+        )
+        for bid, info in browser_manager.browsers.items()
+    ]
+
+
+@app.post("/browsers")
+async def create_browser(request: CreateBrowserRequest = CreateBrowserRequest()) -> BrowserResponse:
     """
-    Start a new session and return the session ID (creates page object).
-    You can use this session_id in the X-Session-Id header for subsequent requests.
+    Create a new browser instance.
+    
+    If profile_dir is provided, it becomes the browser_id.
+    If not provided, a UUID is generated as browser_id and profile stored in profiles/{uuid}.
+    
+    The profile directory is created by Playwright when the browser starts.
     """
+    try:
+        browser_id, browser_info = await browser_manager.create_browser(
+            profile_dir=request.profile_dir
+        )
+        return BrowserResponse(
+            browser_id=browser_id,
+            profile_path=str(browser_info.profile_path),
+            session_count=0
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/browsers/{browser_id:path}")
+async def delete_browser(browser_id: str) -> dict:
+    """
+    Close and remove a browser instance.
+    Cannot delete the default browser.
+    """
+    try:
+        success = await browser_manager.close_browser(browser_id)
+        if success:
+            return {"status": "success", "message": f"Browser '{browser_id}' closed"}
+        else:
+            raise HTTPException(status_code=404, detail=f"Browser '{browser_id}' not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ==================== Session Management Endpoints ====================
+
+@app.post("/start_session")
+async def start_session(
+    request: StartSessionRequest = StartSessionRequest(),
+    browser_id: BrowserIdDep = None
+) -> dict:
+    """
+    Start a new session in a browser and return the session ID.
+    
+    The browser_id can be specified via:
+    - X-Browser-Id header
+    - request body browser_id field
+    
+    If neither is provided, uses the default browser.
+    """
+    # Use request body browser_id if header not provided
+    bid = browser_id or request.browser_id or browser_manager.get_default_browser_id()
+    
+    try:
+        browser_info = browser_manager.get_browser(bid)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Browser '{bid}' not found")
+    
     session_id = str(uuid.uuid4())
-    page = await context.new_page()
-    app.state.pages[session_id] = page
-    logger.info(f"Started new session: {session_id}")
-    return {"session_id": session_id, "message": "Session created. Use X-Session-Id header in subsequent requests."}
+    page = await browser_info.context.new_page()
+    browser_info.pages[session_id] = page
+    logger.info(f"Started new session: {session_id} in browser '{bid}'")
+    
+    return {
+        "session_id": session_id,
+        "browser_id": bid,
+        "message": "Session created. Use X-Session-Id and X-Browser-Id headers in subsequent requests."
+    }
 
 
-@app.get("/end_session")
-async def end_session(session_id: SessionIdDep = None) -> dict:
+@app.delete("/end_session")
+async def end_session(
+    browser_info: BrowserInfoDep,
+    session_id: SessionIdDep = None
+) -> dict:
     """
-    End a session and delete the page object.
-    Requires X-Session-Id header.
+    End a session and close the page.
+    Requires X-Session-Id header. X-Browser-Id header is optional (defaults to default browser).
     """
     if session_id is None:
         raise HTTPException(status_code=400, detail="X-Session-Id header is required")
     
-    page = app.state.pages.pop(session_id, None)
+    page = browser_info.pages.pop(session_id, None)
     if page:
         try:
             await page.close()
@@ -167,6 +428,169 @@ async def end_session(session_id: SessionIdDep = None) -> dict:
             return {"status": "success", "message": f"Session {session_id} removed (page was already closed)"}
     else:
         return {"status": "success", "message": f"Session {session_id} not found (already ended or never existed)"}
+
+
+# ==================== Helper Functions for Native Playwright ====================
+
+def build_locator(page: Page, selector_type: str, selector_value: str):
+    """Build a Playwright locator from selector type and value."""
+    if selector_type == "css":
+        return page.locator(selector_value)
+    else:  # xml/xpath
+        return page.locator(f"xpath={selector_value}")
+
+
+async def get_elements_html(page: Page, selector_type: str, selector_value: str) -> List[str]:
+    """Get outer HTML of all matching elements using native Playwright."""
+    locator = build_locator(page, selector_type, selector_value)
+    count = await locator.count()
+    results = []
+    for i in range(count):
+        try:
+            html = await locator.nth(i).evaluate("el => el.outerHTML")
+            results.append(html)
+        except Exception as e:
+            results.append(f"error: {str(e)}")
+    return results
+
+
+async def get_elements_text(page: Page, selector_type: str, selector_value: str) -> List[str]:
+    """Get text content of all matching elements using native Playwright."""
+    locator = build_locator(page, selector_type, selector_value)
+    return await locator.all_inner_texts()
+
+
+async def click_elements(page: Page, selector_type: str, selector_value: str, nth: Optional[int] = 0) -> List[str]:
+    """Click on elements. nth=0 first, nth=-1 last, nth=None all."""
+    locator = build_locator(page, selector_type, selector_value)
+    count = await locator.count()
+    if count == 0:
+        return []
+    
+    results = []
+    if nth is None:
+        # Click all
+        for i in range(count):
+            try:
+                await locator.nth(i).click()
+                results.append("clicked")
+            except Exception as e:
+                results.append(f"error: {str(e)}")
+    elif nth == -1:
+        # Click last
+        try:
+            await locator.last.click()
+            results.append("clicked")
+        except Exception as e:
+            results.append(f"error: {str(e)}")
+    else:
+        # Click nth (default 0 = first)
+        try:
+            await locator.nth(nth).click()
+            results.append("clicked")
+        except Exception as e:
+            results.append(f"error: {str(e)}")
+    return results
+
+
+async def fill_elements(page: Page, selector_type: str, selector_value: str, value: str, nth: Optional[int] = 0) -> List[str]:
+    """Fill elements with value. nth=0 first, nth=-1 last, nth=None all."""
+    locator = build_locator(page, selector_type, selector_value)
+    count = await locator.count()
+    if count == 0:
+        return []
+    
+    results = []
+    if nth is None:
+        # Fill all
+        for i in range(count):
+            try:
+                await locator.nth(i).fill(value)
+                results.append("filled")
+            except Exception as e:
+                results.append(f"error: {str(e)}")
+    elif nth == -1:
+        # Fill last
+        try:
+            await locator.last.fill(value)
+            results.append("filled")
+        except Exception as e:
+            results.append(f"error: {str(e)}")
+    else:
+        # Fill nth (default 0 = first)
+        try:
+            await locator.nth(nth).fill(value)
+            results.append("filled")
+        except Exception as e:
+            results.append(f"error: {str(e)}")
+    return results
+
+
+async def get_elements_attribute(page: Page, selector_type: str, selector_value: str, attr_name: str) -> List[str]:
+    """Get attribute value from all matching elements."""
+    # Handle direct XPath attribute syntax like //a/@href
+    if selector_type == "xml" and "/@" in selector_value:
+        # Use evaluate for direct attribute XPath
+        result = await page.evaluate("""
+            (xpath) => {
+                const result = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                const values = [];
+                for (let i = 0; i < result.snapshotLength; i++) {
+                    const node = result.snapshotItem(i);
+                    values.push(node.nodeValue || node.textContent || '');
+                }
+                return values;
+            }
+        """, selector_value)
+        return result
+    
+    locator = build_locator(page, selector_type, selector_value)
+    count = await locator.count()
+    results = []
+    for i in range(count):
+        try:
+            val = await locator.nth(i).get_attribute(attr_name)
+            results.append(val or "")
+        except Exception as e:
+            results.append(f"error: {str(e)}")
+    return results
+
+
+async def remove_elements(page: Page, selector_type: str, selector_value: str, nth: Optional[int] = 0) -> List[str]:
+    """Remove elements from DOM. nth=0 first, nth=-1 last, nth=None all."""
+    locator = build_locator(page, selector_type, selector_value)
+    count = await locator.count()
+    if count == 0:
+        return []
+    
+    results = []
+    if nth is None:
+        # Remove all (in reverse order to avoid index shifting)
+        for i in range(count - 1, -1, -1):
+            try:
+                await locator.nth(i).evaluate("el => el.remove()")
+                results.append("removed")
+            except Exception as e:
+                results.append(f"error: {str(e)}")
+        results.reverse()  # Return in original order
+    elif nth == -1:
+        # Remove last
+        try:
+            await locator.last.evaluate("el => el.remove()")
+            results.append("removed")
+        except Exception as e:
+            results.append(f"error: {str(e)}")
+    else:
+        # Remove nth (default 0 = first)
+        try:
+            await locator.nth(nth).evaluate("el => el.remove()")
+            results.append("removed")
+        except Exception as e:
+            results.append(f"error: {str(e)}")
+    return results
+
+
+# ==================== Core Endpoints ====================
 
 @app.post("/search")
 async def search(request: SearchRequest, page: PageDep) -> List[SearchResult]:
@@ -181,15 +605,10 @@ async def search(request: SearchRequest, page: PageDep) -> List[SearchResult]:
         List[SearchResult]: Array of search results with link, title, and snippet
     """
     try:
-        # Navigate to Google search
         await page.goto(f"https://www.google.com/search?q={request.query}&num={request.count}", wait_until="commit")
-        
         await asyncio.sleep(3)
 
-        # Extract search results
         results = []
-        
-        # Get all divs with data-rpos attribute
         result_divs = await page.query_selector_all('div[data-rpos]')
         
         for result_div in result_divs:
@@ -197,10 +616,7 @@ async def search(request: SearchRequest, page: PageDep) -> List[SearchResult]:
                 break
                 
             try:
-                # Inside this div, find all span elements
                 span_elements = await result_div.query_selector_all('span')
-
-                # Find the first span that contains an <a> tag
                 link_element = None
                 for span in span_elements:
                     a = await span.query_selector('a')
@@ -209,13 +625,11 @@ async def search(request: SearchRequest, page: PageDep) -> List[SearchResult]:
                         break
 
                 if not link_element:
-                    continue  # skip if no link found
+                    continue
 
                 href = await link_element.get_attribute('href')
                 title = await link_element.inner_text()
 
-                # For snippet: find span(s) whose inner_html contains <em>
-                # (because inner_text() strips tags, so you can't check for <em> in text)
                 snippet_texts = []
                 for span in span_elements:
                     html = await span.inner_html()
@@ -223,8 +637,7 @@ async def search(request: SearchRequest, page: PageDep) -> List[SearchResult]:
                         text = await span.inner_text()
                         snippet_texts.append(text)
 
-                # Join snippets or take first, depending on your needs
-                snippet = '\n'.join(snippet_texts)  # or snippet_texts[0] if you expect one
+                snippet = '\n'.join(snippet_texts)
 
                 results.append(SearchResult(
                     link=href,
@@ -232,8 +645,7 @@ async def search(request: SearchRequest, page: PageDep) -> List[SearchResult]:
                     snippet=snippet
                 ))
                         
-            except Exception as e:
-                # Skip this result if extraction fails
+            except Exception:
                 continue
         
         return results
@@ -245,26 +657,20 @@ async def search(request: SearchRequest, page: PageDep) -> List[SearchResult]:
 @app.post("/content")
 async def get_content(request: GetHtmlRequest, page: PageDep) -> str:
     """
-    Get the HTML or text content of the given page
+    Get the HTML or text content of the given page.
     
-    Args:
-        request: GetHtmlRequest with URL and return_html flag
-        page: Page object automatically managed by session (via X-Session-Id header)
-        
-    Returns:
-        str: The HTML content if return_html is True, or inner text if False
+    If URL is provided, navigates to it first. Otherwise, uses current page.
     """
     try:
-        await page.goto(request.url, wait_until=request.wait_until, timeout=request.timeout)
+        if request.url:
+            await page.goto(request.url, wait_until=request.wait_until, timeout=request.timeout)
         
-        # Wait for idle time if specified
         if request.idle > 0:
             await asyncio.sleep(request.idle)
         
         if request.return_html:
             content = await page.content()
         else:
-            # Get inner text of the whole page
             content = await page.inner_text("body")
         
         return content
@@ -277,62 +683,13 @@ async def execute_selectors(request: SelectorRequest, page: PageDep) -> List[Sel
     """
     Execute CSS or XPath selectors on a page and perform actions on matched elements.
     
-    All actions use page.evaluate() with isolated_context=True for undetectability.
-    
-    Args:
-        request: SelectorRequest with URL and list of selectors with actions to execute
-        page: Page object automatically managed by session (via X-Session-Id header)
-        
-    Returns:
-        List[SelectorResult]: Array of results with name and action results for each selector
-        
-    Action types (each action is a separate model):
-        - HtmlAction: Returns outer HTML of elements (default)
-        - TextAction: Returns text content of elements
-        - ClickAction: Clicks on element(s) - supports nth param (0=first, -1=last, null=all)
-        - FillAction: Fills input element(s) - supports nth param (0=first, -1=last, null=all)
-        - AttributeAction: Gets attribute value (requires 'name' param)
-        
-    Examples:
-        
-        1. Get HTML (default behavior):
-           {"name": "nav", "type": "css", "value": "nav.main"}
-           
-        2. Get text content:
-           {"name": "titles", "type": "css", "value": "h1", "actions": [{"action": "text"}]}
-           
-        3. Click first element (default nth=0):
-           {"name": "btn", "type": "css", "value": "#submit", "actions": [{"action": "click"}]}
-           
-        4. Click last element:
-           {"name": "btn", "type": "css", "value": ".item", "actions": [{"action": "click", "nth": -1}]}
-           
-        5. Click all elements:
-           {"name": "btns", "type": "css", "value": ".btn", "actions": [{"action": "click", "nth": null}]}
-           
-        6. Fill first input (default nth=0):
-           {"name": "search", "type": "css", "value": "input[name='q']", 
-            "actions": [{"action": "fill", "value": "search term"}]}
-            
-        7. Fill all inputs:
-           {"name": "fields", "type": "css", "value": "input.field",
-            "actions": [{"action": "fill", "value": "test", "nth": null}]}
-           
-        8. Get href attribute (CSS):
-           {"name": "links", "type": "css", "value": "a.nav-link", 
-            "actions": [{"action": "attribute", "name": "href"}]}
-           
-        9. Get href attribute (XPath direct):
-           {"name": "links", "type": "xml", "value": "//a/@href"}
-           
-        10. Multiple actions (get text then click first):
-            {"name": "menu", "type": "css", "value": ".dropdown-item", 
-             "actions": [{"action": "text"}, {"action": "click"}]}
+    Uses native Playwright locators for better performance.
+    If URL is provided, navigates to it first. Otherwise, uses current page.
     """
     try:
-        await page.goto(request.url, wait_until=request.wait_until, timeout=request.timeout)
+        if request.url:
+            await page.goto(request.url, wait_until=request.wait_until, timeout=request.timeout)
         
-        # Wait for idle time if specified
         if request.idle > 0:
             await asyncio.sleep(request.idle)
         
@@ -346,55 +703,31 @@ async def execute_selectors(request: SelectorRequest, page: PageDep) -> List[Sel
                     values = []
                     
                     if isinstance(action, HtmlAction):
-                        # Get outer HTML
-                        js_code = get_html_js(selector.type)
-                        values = await page.evaluate(js_code, selector.value, isolated_context=True)
+                        values = await get_elements_html(page, selector.type, selector.value)
                         logger.info(f"Got {len(values)} HTML elements for selector {selector.name}")
                         
                     elif isinstance(action, TextAction):
-                        # Get text content
-                        js_code = get_text_js(selector.type)
-                        values = await page.evaluate(js_code, selector.value, isolated_context=True)
+                        values = await get_elements_text(page, selector.type, selector.value)
                         logger.info(f"Got {len(values)} text values for selector {selector.name}")
                         
                     elif isinstance(action, ClickAction):
-                        # Click on elements with nth parameter
-                        # nth: 0=first (default), -1=last, None=all
-                        js_code = get_click_js(selector.type)
-                        values = await page.evaluate(
-                            js_code, 
-                            [selector.value, action.nth], 
-                            isolated_context=True
-                        )
+                        values = await click_elements(page, selector.type, selector.value, action.nth)
                         nth_desc = "first" if action.nth == 0 else ("last" if action.nth == -1 else "all")
                         logger.info(f"Clicked {len(values)} elements ({nth_desc}) for selector {selector.name}")
                         
                     elif isinstance(action, FillAction):
-                        # Fill elements with value and nth parameter
-                        # nth: 0=first (default), -1=last, None=all
-                        js_code = get_fill_js(selector.type)
-                        values = await page.evaluate(
-                            js_code, 
-                            [selector.value, action.value, action.nth], 
-                            isolated_context=True
-                        )
+                        values = await fill_elements(page, selector.type, selector.value, action.value, action.nth)
                         nth_desc = "first" if action.nth == 0 else ("last" if action.nth == -1 else "all")
                         logger.info(f"Filled {len(values)} elements ({nth_desc}) for selector {selector.name}")
                             
                     elif isinstance(action, AttributeAction):
-                        # Get attribute value
-                        # Check if XPath selector already targets attribute (e.g., //a/@href)
-                        if selector.type == "xml" and "/@" in selector.value:
-                            js_code = get_attribute_direct_xpath_js()
-                            values = await page.evaluate(js_code, selector.value, isolated_context=True)
-                        else:
-                            js_code = get_attribute_js(selector.type)
-                            values = await page.evaluate(
-                                js_code, 
-                                [selector.value, action.name], 
-                                isolated_context=True
-                            )
+                        values = await get_elements_attribute(page, selector.type, selector.value, action.name)
                         logger.info(f"Got {len(values)} attribute values for selector {selector.name}")
+                    
+                    elif isinstance(action, RemoveAction):
+                        values = await remove_elements(page, selector.type, selector.value, action.nth)
+                        nth_desc = "first" if action.nth == 0 else ("last" if action.nth == -1 else "all")
+                        logger.info(f"Removed {len(values)} elements ({nth_desc}) for selector {selector.name}")
                     
                     action_results.append(ActionResult(
                         action=action.action,
@@ -419,119 +752,82 @@ async def execute_selectors(request: SelectorRequest, page: PageDep) -> List[Sel
         raise HTTPException(status_code=500, detail=f"Failed to execute selectors: {str(e)}")
 
 
-@app.post("/screenshot")
-async def get_screenshot(request: ScreenshotRequest, page: PageDep) -> Response:
+@app.post("/interact")
+async def interact(request: InteractRequest, page: PageDep) -> Response:
     """
-    Take a screenshot of the given webpage
+    Unified endpoint for page interactions using an actions list.
     
-    Args:
-        request: ScreenshotRequest with URL and screenshot options
-        page: Page object automatically managed by session (via X-Session-Id header)
-        
-    Returns:
-        Response: PNG image of the screenshot
+    If URL is provided, navigates to it first. Otherwise, uses current page.
+    Actions are executed in the order they appear in the list.
     """
     try:
-        await page.goto(request.url, wait_until=request.wait_until, timeout=request.timeout)
+        actions_performed = []
+        screenshot_bytes = None
+        content_result = None
         
-        # Wait for idle time if specified
+        if request.url:
+            await page.goto(request.url, wait_until=request.wait_until, timeout=request.timeout)
+            actions_performed.append(f"navigated to {request.url}")
+        
         if request.idle > 0:
             await asyncio.sleep(request.idle)
         
-        # Take screenshot
-        screenshot_bytes = await page.screenshot(full_page=request.full_page, type="png")
+        for action in request.actions:
+            if isinstance(action, MoveAction):
+                await page.mouse.move(action.x, action.y, steps=action.steps)
+                actions_performed.append(f"moved to ({action.x}, {action.y})")
+                logger.info(f"Moved mouse to ({action.x}, {action.y}) with {action.steps} steps")
+                
+            elif isinstance(action, MouseClickAction):
+                await page.mouse.click(
+                    action.x, 
+                    action.y, 
+                    button=action.button,
+                    click_count=action.click_count,
+                    delay=action.delay
+                )
+                actions_performed.append(f"clicked at ({action.x}, {action.y}) with {action.button} button")
+                logger.info(f"Clicked at ({action.x}, {action.y}) with {action.button} button")
+                
+            elif isinstance(action, ScrollAction):
+                await page.mouse.wheel(action.x, action.y)
+                actions_performed.append(f"scrolled by ({action.x}, {action.y})")
+                logger.info(f"Scrolled by ({action.x}, {action.y})")
+                
+            elif isinstance(action, IdleAction):
+                await asyncio.sleep(action.duration)
+                actions_performed.append(f"waited {action.duration}s")
+                logger.info(f"Waited {action.duration} seconds")
+                
+            elif isinstance(action, HtmlAction):
+                content_result = await page.content()
+                actions_performed.append("got html content")
+                logger.info("Got HTML content")
+                
+            elif isinstance(action, TextAction):
+                content_result = await page.inner_text("body")
+                actions_performed.append("got text content")
+                logger.info("Got text content")
+                
+            elif isinstance(action, ScreenshotAction):
+                screenshot_bytes = await page.screenshot(full_page=action.full_page, type="png")
+                actions_performed.append(f"screenshot taken (full_page={action.full_page})")
+                logger.info(f"Screenshot taken (full_page={action.full_page})")
         
-        return Response(content=screenshot_bytes, media_type="image/png")
+        if screenshot_bytes:
+            return Response(content=screenshot_bytes, media_type="image/png")
         
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to take screenshot: {str(e)}")
-
-
-@app.post("/move")
-async def move_cursor(request: MouseMoveRequest, page: PageDep) -> dict:
-    """
-    Move the mouse cursor to a specific point on the page
-    
-    Args:
-        request: MouseMoveRequest with URL and x, y coordinates
-        page: Page object automatically managed by session (via X-Session-Id header)
+        if content_result is not None:
+            return Response(content=content_result, media_type="text/plain")
         
-    Returns:
-        dict: Status message indicating success
-    """
-    try:
-        await page.goto(request.url, wait_until="commit")
-        
-        # Move mouse to the specified coordinates
-        await page.mouse.move(request.x, request.y, steps=request.steps)
-        
-        return {
-            "status": "success",
-            "message": f"Mouse moved to ({request.x}, {request.y}) with {request.steps} steps"
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to move cursor: {str(e)}")
-
-
-@app.post("/click")
-async def click(request: ClickRequest, page: PageDep) -> dict:
-    """
-    Click at a specific point on the page
-    
-    Args:
-        request: ClickRequest with URL and x, y coordinates
-        page: Page object automatically managed by session (via X-Session-Id header)
-        
-    Returns:
-        dict: Status message indicating success
-    """
-    try:
-        await page.goto(request.url, wait_until="commit")
-        
-        # Click at the specified coordinates
-        await page.mouse.click(
-            request.x, 
-            request.y, 
-            button=request.button,
-            click_count=request.click_count,
-            delay=request.delay
+        import json
+        return Response(
+            content=json.dumps({"status": "success", "actions": actions_performed}),
+            media_type="application/json"
         )
         
-        return {
-            "status": "success",
-            "message": f"Clicked at ({request.x}, {request.y}) with {request.button} button"
-        }
-        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to click: {str(e)}")
-
-
-@app.post("/scroll")
-async def scroll(request: ScrollRequest, page: PageDep) -> dict:
-    """
-    Scroll the page by specified delta
-    
-    Args:
-        request: ScrollRequest with URL and scroll deltas
-        page: Page object automatically managed by session (via X-Session-Id header)
-        
-    Returns:
-        dict: Status message indicating success
-    """
-    try:
-        await page.goto(request.url, wait_until="commit")
-        
-        # Scroll the page using mouse wheel
-        await page.mouse.wheel(request.x, request.y)
-        
-        return {
-            "status": "success",
-            "message": f"Scrolled by ({request.x}, {request.y})"
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to scroll: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to interact: {str(e)}")
 
 
 if __name__ == "__main__":
@@ -543,3 +839,4 @@ if __name__ == "__main__":
         port=8000,
         log_level="info"
     )
+

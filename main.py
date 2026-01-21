@@ -24,7 +24,8 @@ from models.requests import (
     ScrollAction,
     MoveAction,
     MouseClickAction,
-    IdleAction
+    IdleAction,
+    LoginAction
 )
 from contextlib import asynccontextmanager
 from patchright.async_api import async_playwright, Playwright
@@ -80,13 +81,18 @@ class BrowserManager:
         await self.create_browser(profile_dir=str(PROFILES_DIR / DEFAULT_BROWSER_ID))
         logger.info("Browser manager started with default browser")
     
-    async def create_browser(self, profile_dir: Optional[str] = None) -> tuple[str, BrowserInfo]:
+    async def create_browser(
+        self, 
+        profile_dir: Optional[str] = None,
+        proxy: Optional["ProxySettings"] = None
+    ) -> tuple[str, BrowserInfo]:
         """
         Create a new browser instance.
         
         Args:
             profile_dir: Profile directory path. If provided, used as browser_id.
                         If not provided, generates UUID and uses profiles/{uuid}.
+            proxy: Optional proxy settings for the browser.
         
         Returns:
             Tuple of (browser_id, BrowserInfo)
@@ -105,16 +111,30 @@ class BrowserManager:
         if browser_id in self.browsers:
             raise ValueError(f"Browser with id '{browser_id}' already exists")
 
+        # Build launch arguments
+        launch_kwargs = {
+            "user_data_dir": str(profile_path),
+            "headless": False,
+            "channel": "chrome",
+            "no_viewport": True,
+            "args": ["--start-maximized"],
+        }
+        
+        # Add proxy if provided
+        if proxy:
+            proxy_config = {"server": proxy.server}
+            if proxy.username:
+                proxy_config["username"] = proxy.username
+            if proxy.password:
+                proxy_config["password"] = proxy.password
+            if proxy.bypass:
+                proxy_config["bypass"] = proxy.bypass
+            launch_kwargs["proxy"] = proxy_config
+            logger.info(f"Browser '{browser_id}' configured with proxy: {proxy.server}")
         
         # Launch browser with persistent context (Playwright creates dir if needed)
         # This returns a BrowserContext, but we can access the Browser via context.browser
-        context = await self.playwright.chromium.launch_persistent_context(
-            user_data_dir=str(profile_path),
-            headless=False,
-            channel="chrome",
-            no_viewport=True,
-            args=["--start-maximized"],
-        )
+        context = await self.playwright.chromium.launch_persistent_context(**launch_kwargs)
         
         # Get the browser object from the context so we can properly close it
         browser = context.browser
@@ -232,10 +252,22 @@ app = FastAPI(title="Controller API", version="0.2.0", lifespan=lifespan)
 
 
 # Request/Response models for browser management
+class ProxySettings(BaseModel):
+    """Proxy configuration for browser."""
+    server: str = Field(..., description="Proxy server URL (e.g., 'http://myproxy.com:3128')")
+    username: Optional[str] = Field(default=None, description="Proxy authentication username")
+    password: Optional[str] = Field(default=None, description="Proxy authentication password")
+    bypass: Optional[str] = Field(default=None, description="Comma-separated hosts to bypass proxy")
+
+
 class CreateBrowserRequest(BaseModel):
     profile_dir: Optional[str] = Field(
         default=None, 
         description="Profile directory path. If provided, used as browser_id. If not, UUID is generated."
+    )
+    proxy: Optional[ProxySettings] = Field(
+        default=None,
+        description="Proxy settings for the browser. Only applies when creating a new browser."
     )
 
 
@@ -338,11 +370,15 @@ async def create_browser(request: CreateBrowserRequest = CreateBrowserRequest())
     If profile_dir is provided, it becomes the browser_id.
     If not provided, a UUID is generated as browser_id and profile stored in profiles/{uuid}.
     
+    Proxy settings can be specified to route all browser traffic through a proxy server.
+    Note: Proxy settings can only be configured when creating a new browser.
+    
     The profile directory is created by Playwright when the browser starts.
     """
     try:
         browser_id, browser_info = await browser_manager.create_browser(
-            profile_dir=request.profile_dir
+            profile_dir=request.profile_dir,
+            proxy=request.proxy
         )
         return BrowserResponse(
             browser_id=browser_id,
@@ -798,6 +834,19 @@ async def interact(request: InteractRequest, page: PageDep) -> Response:
                 await asyncio.sleep(action.duration)
                 actions_performed.append(f"waited {action.duration}s")
                 logger.info(f"Waited {action.duration} seconds")
+            
+            elif isinstance(action, LoginAction):
+                import base64
+                if action.username and action.password:
+                    credentials = base64.b64encode(f"{action.username}:{action.password}".encode()).decode()
+                    await page.context.set_extra_http_headers({"Authorization": f"Basic {credentials}"})
+                    actions_performed.append(f"set http credentials for user '{action.username}'")
+                    logger.info(f"Set HTTP Basic Auth credentials for user '{action.username}'")
+                else:
+                    # Clear credentials by setting empty headers
+                    await page.context.set_extra_http_headers({})
+                    actions_performed.append("cleared http credentials")
+                    logger.info("Cleared HTTP Basic Auth credentials")
                 
             elif isinstance(action, HtmlAction):
                 content_result = await page.content()

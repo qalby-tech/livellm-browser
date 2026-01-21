@@ -10,3 +10,4 @@ wheels/
 .venv
 
 profiles/
+.pytest_cache/

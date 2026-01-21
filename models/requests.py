@@ -157,6 +157,20 @@ class IdleAction(Action):
     duration: float = Field(..., description="Duration to wait in seconds")
 
 
+class LoginAction(Action):
+    """
+    Set HTTP Basic Authentication credentials for the browser context.
+    
+    This sets the Authorization header for all subsequent requests in the session.
+    Use this when accessing pages protected by HTTP Basic Authentication.
+    
+    To clear credentials, call with empty username and password.
+    """
+    action: Literal["login"] = Field(default="login", description="Sets HTTP authentication credentials")
+    username: str = Field(..., description="HTTP authentication username")
+    password: str = Field(..., description="HTTP authentication password")
+
+
 # Union type for selector actions
 SelectorAction = Annotated[
     Union[HtmlAction, TextAction, ClickAction, FillAction, AttributeAction, RemoveAction],
@@ -165,7 +179,7 @@ SelectorAction = Annotated[
 
 # Union type for interact actions (reuses HtmlAction and TextAction from selector actions)
 InteractAction = Annotated[
-    Union[ScreenshotAction, ScrollAction, MoveAction, MouseClickAction, IdleAction, HtmlAction, TextAction],
+    Union[ScreenshotAction, ScrollAction, MoveAction, MouseClickAction, IdleAction, HtmlAction, TextAction, LoginAction],
     Discriminator("action")
 ]
 

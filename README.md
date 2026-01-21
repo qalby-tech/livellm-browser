@@ -8,6 +8,8 @@ Built with FastAPI, Patchright (undetectable Playwright fork), and runs in a Doc
 
 - **REST API Control** - Navigate, click, scroll, fill forms, extract content
 - **Multi-Browser Support** - Create multiple isolated browser instances with persistent profiles
+- **Proxy Support** - Configure HTTP/HTTPS/SOCKS proxy per browser instance
+- **HTTP Authentication** - Set HTTP Basic Auth credentials for protected pages
 - **Undetectable Automation** - Uses Patchright with native Playwright locators
 - **VNC Access** - Watch browser actions in real-time via VNC or noVNC web interface
 - **Session Management** - Multiple isolated browser sessions via `X-Session-Id` header
@@ -59,11 +61,24 @@ POST /browsers
 ```
 ```json
 {
-  "profile_dir": "/path/to/profile"
+  "profile_dir": "/path/to/profile",
+  "proxy": {
+    "server": "http://myproxy.com:3128",
+    "username": "proxyuser",
+    "password": "proxypass",
+    "bypass": "localhost,*.example.com"
+  }
 }
 ```
 - `profile_dir` - Optional. If provided, becomes the `browser_id` and stores profile there
 - If omitted, generates UUID as `browser_id` and stores profile in `./profiles/{uuid}`
+- `proxy` - Optional. Proxy settings for the browser (only configurable at browser creation)
+  - `server` - Proxy server URL (required if proxy is set)
+  - `username` - Proxy auth username (optional)
+  - `password` - Proxy auth password (optional)
+  - `bypass` - Comma-separated hosts to bypass proxy (optional)
+
+**Note:** The default browser does not use a proxy. Proxy settings can only be configured when creating a new browser.
 
 **Examples:**
 ```bash
@@ -76,6 +91,21 @@ curl -X POST http://localhost:8000/browsers \
 # Create browser with auto-generated UUID
 curl -X POST http://localhost:8000/browsers
 # Response: {"browser_id": "a1b2c3d4-...", "profile_path": "./profiles/a1b2c3d4-...", "session_count": 0}
+
+# Create browser with proxy
+curl -X POST http://localhost:8000/browsers \
+  -H "Content-Type: application/json" \
+  -d '{"proxy": {"server": "http://proxy.example.com:8080"}}'
+
+# Create browser with authenticated proxy
+curl -X POST http://localhost:8000/browsers \
+  -H "Content-Type: application/json" \
+  -d '{"proxy": {"server": "http://proxy.example.com:8080", "username": "user", "password": "pass"}}'
+
+# Create browser with SOCKS5 proxy
+curl -X POST http://localhost:8000/browsers \
+  -H "Content-Type: application/json" \
+  -d '{"proxy": {"server": "socks5://127.0.0.1:1080"}}'
 ```
 
 #### Delete Browser
@@ -214,6 +244,7 @@ Unified endpoint for screenshots, scrolling, mouse movements, and clicks.
 | `idle` | Wait/sleep | `duration` (seconds) |
 | `html` | Get page HTML | - |
 | `text` | Get page text | - |
+| `login` | Set HTTP Basic Auth | `username`, `password` |
 
 **Examples:**
 
@@ -263,6 +294,29 @@ Unified endpoint for screenshots, scrolling, mouse movements, and clicks.
     {"action": "mouse_click", "x": 100, "y": 200},
     {"action": "idle", "duration": 2},
     {"action": "screenshot"}
+  ]
+}
+
+// Set HTTP Basic Auth credentials and navigate
+{
+  "actions": [
+    {"action": "login", "username": "admin", "password": "secret123"}
+  ]
+}
+
+// Login and access protected page
+{
+  "url": "https://protected.example.com/admin",
+  "actions": [
+    {"action": "login", "username": "admin", "password": "secret123"},
+    {"action": "html"}
+  ]
+}
+
+// Clear HTTP credentials
+{
+  "actions": [
+    {"action": "login", "username": "", "password": ""}
   ]
 }
 ```

@@ -29,7 +29,7 @@ COPY pyproject.toml uv.lock ./
 
 # Install Python dependencies and Chrome (cached layer)
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync
+    uv sync --no-dev
 RUN uv run patchright install chrome
 
 # Now copy the rest of the application code

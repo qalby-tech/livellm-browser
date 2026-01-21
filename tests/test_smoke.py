@@ -32,12 +32,12 @@ class TestSessionManagement:
 
     def test_start_session_returns_200(self, client: TestClient):
         """Verify start_session endpoint returns 200 OK."""
-        response = client.get("/start_session")
+        response = client.post("/start_session")
         assert response.status_code == 200
 
     def test_start_session_returns_session_id(self, client: TestClient):
         """Verify start_session returns a valid session ID."""
-        response = client.get("/start_session")
+        response = client.post("/start_session")
         data = response.json()
         
         assert "session_id" in data
@@ -48,12 +48,12 @@ class TestSessionManagement:
 
     def test_end_session_without_header_returns_400(self, client: TestClient):
         """Verify end_session requires X-Session-Id header."""
-        response = client.get("/end_session")
+        response = client.delete("/end_session")
         assert response.status_code == 400
 
     def test_end_session_with_invalid_session(self, client: TestClient):
         """Verify end_session handles non-existent sessions gracefully."""
-        response = client.get(
+        response = client.delete(
             "/end_session",
             headers={"X-Session-Id": "non-existent-session-id"}
         )
@@ -64,12 +64,12 @@ class TestSessionManagement:
     def test_full_session_lifecycle(self, client: TestClient):
         """Test complete session creation and deletion flow."""
         # Create session
-        start_response = client.get("/start_session")
+        start_response = client.post("/start_session")
         assert start_response.status_code == 200
         session_id = start_response.json()["session_id"]
         
         # End session
-        end_response = client.get(
+        end_response = client.delete(
             "/end_session",
             headers={"X-Session-Id": session_id}
         )
@@ -79,10 +79,10 @@ class TestSessionManagement:
 class TestContentEndpoint:
     """Tests for the /content endpoint."""
 
-    def test_content_requires_url(self, client: TestClient):
-        """Verify content endpoint requires URL in request body."""
+    def test_content_works_without_url(self, client: TestClient):
+        """Verify content endpoint works without URL (uses current page)."""
         response = client.post("/content", json={})
-        assert response.status_code == 422  # Validation error
+        assert response.status_code == 200
 
     def test_content_with_valid_url(self, client: TestClient):
         """Verify content endpoint accepts valid URL."""
@@ -125,10 +125,10 @@ class TestSearchEndpoint:
 class TestSelectorsEndpoint:
     """Tests for the /selectors endpoint."""
 
-    def test_selectors_requires_url(self, client: TestClient):
-        """Verify selectors endpoint requires URL."""
+    def test_selectors_works_without_url(self, client: TestClient):
+        """Verify selectors endpoint works without URL (uses current page)."""
         response = client.post("/selectors", json={"selectors": []})
-        assert response.status_code == 422  # Validation error
+        assert response.status_code == 200
 
     def test_selectors_requires_selectors_list(self, client: TestClient):
         """Verify selectors endpoint requires selectors list."""
@@ -217,7 +217,7 @@ class TestOpenAPISchema:
         
         schema = response.json()
         assert schema["info"]["title"] == "Controller API"
-        assert schema["info"]["version"] == "0.1.0"
+        assert schema["info"]["version"] == "0.2.0"
 
     def test_docs_endpoint_available(self, client: TestClient):
         """Verify Swagger UI docs are accessible."""
@@ -241,7 +241,7 @@ class TestSessionIdHeader:
     def test_content_with_session_id_header(self, client: TestClient):
         """Verify endpoints accept X-Session-Id header."""
         # First create a session
-        session_response = client.get("/start_session")
+        session_response = client.post("/start_session")
         session_id = session_response.json()["session_id"]
         
         # Use the session
@@ -252,3 +252,242 @@ class TestSessionIdHeader:
         )
         assert response.status_code == 200
 
+
+class TestInteractEndpoint:
+    """Tests for the /interact endpoint."""
+
+    def test_interact_requires_actions(self, client: TestClient):
+        """Verify interact endpoint requires actions list."""
+        response = client.post("/interact", json={})
+        assert response.status_code == 422  # Validation error
+
+    def test_interact_with_screenshot_action(self, client: TestClient):
+        """Verify interact endpoint accepts screenshot action."""
+        response = client.post(
+            "/interact",
+            json={"actions": [{"action": "screenshot"}]}
+        )
+        assert response.status_code == 200
+
+    def test_interact_with_scroll_action(self, client: TestClient):
+        """Verify interact endpoint accepts scroll action."""
+        response = client.post(
+            "/interact",
+            json={"actions": [{"action": "scroll", "x": 0, "y": 500}]}
+        )
+        assert response.status_code == 200
+
+    def test_interact_with_idle_action(self, client: TestClient):
+        """Verify interact endpoint accepts idle action."""
+        response = client.post(
+            "/interact",
+            json={"actions": [{"action": "idle", "duration": 0.1}]}
+        )
+        assert response.status_code == 200
+
+    def test_interact_with_html_action(self, client: TestClient):
+        """Verify interact endpoint accepts html action."""
+        response = client.post(
+            "/interact",
+            json={"actions": [{"action": "html"}]}
+        )
+        assert response.status_code == 200
+
+    def test_interact_with_text_action(self, client: TestClient):
+        """Verify interact endpoint accepts text action."""
+        response = client.post(
+            "/interact",
+            json={"actions": [{"action": "text"}]}
+        )
+        assert response.status_code == 200
+
+    def test_interact_with_login_action(self, client: TestClient):
+        """Verify interact endpoint accepts login action for HTTP Basic Auth."""
+        response = client.post(
+            "/interact",
+            json={
+                "actions": [
+                    {"action": "login", "username": "testuser", "password": "testpass"}
+                ]
+            }
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "actions" in data
+        assert any("http credentials" in action.lower() for action in data["actions"])
+
+    def test_interact_login_with_empty_credentials_clears_auth(self, client: TestClient):
+        """Verify login action with empty credentials clears auth."""
+        response = client.post(
+            "/interact",
+            json={
+                "actions": [
+                    {"action": "login", "username": "", "password": ""}
+                ]
+            }
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "actions" in data
+        assert any("cleared" in action.lower() for action in data["actions"])
+
+    def test_interact_with_multiple_actions(self, client: TestClient):
+        """Verify interact endpoint handles multiple actions."""
+        response = client.post(
+            "/interact",
+            json={
+                "actions": [
+                    {"action": "login", "username": "admin", "password": "secret"},
+                    {"action": "idle", "duration": 0.1},
+                    {"action": "html"}
+                ]
+            }
+        )
+        assert response.status_code == 200
+
+    def test_interact_with_url_navigation(self, client: TestClient):
+        """Verify interact endpoint navigates to URL when provided."""
+        response = client.post(
+            "/interact",
+            json={
+                "url": "https://example.com",
+                "actions": [{"action": "html"}]
+            }
+        )
+        assert response.status_code == 200
+
+    def test_interact_login_requires_username(self, client: TestClient):
+        """Verify login action requires username field."""
+        response = client.post(
+            "/interact",
+            json={
+                "actions": [
+                    {"action": "login", "password": "testpass"}
+                ]
+            }
+        )
+        assert response.status_code == 422  # Validation error
+
+    def test_interact_login_requires_password(self, client: TestClient):
+        """Verify login action requires password field."""
+        response = client.post(
+            "/interact",
+            json={
+                "actions": [
+                    {"action": "login", "username": "testuser"}
+                ]
+            }
+        )
+        assert response.status_code == 422  # Validation error
+
+
+class TestBrowserManagement:
+    """Tests for browser management endpoints."""
+
+    def test_list_browsers(self, client: TestClient):
+        """Verify list browsers endpoint returns 200."""
+        response = client.get("/browsers")
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
+
+    def test_create_browser_without_params(self, client: TestClient):
+        """Verify create browser works without parameters."""
+        response = client.post("/browsers", json={})
+        assert response.status_code == 200
+        data = response.json()
+        assert "browser_id" in data
+        assert "profile_path" in data
+
+    def test_create_browser_with_profile_dir(self, client: TestClient):
+        """Verify create browser accepts profile_dir."""
+        response = client.post(
+            "/browsers",
+            json={"profile_dir": "/tmp/test-profile"}
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["browser_id"] == "/tmp/test-profile"
+
+    def test_create_browser_with_proxy(self, client: TestClient):
+        """Verify create browser accepts proxy settings."""
+        response = client.post(
+            "/browsers",
+            json={
+                "proxy": {
+                    "server": "http://proxy.example.com:8080"
+                }
+            }
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "browser_id" in data
+
+    def test_create_browser_with_proxy_auth(self, client: TestClient):
+        """Verify create browser accepts proxy with authentication."""
+        response = client.post(
+            "/browsers",
+            json={
+                "proxy": {
+                    "server": "http://proxy.example.com:8080",
+                    "username": "proxyuser",
+                    "password": "proxypass"
+                }
+            }
+        )
+        assert response.status_code == 200
+
+    def test_create_browser_with_proxy_bypass(self, client: TestClient):
+        """Verify create browser accepts proxy with bypass list."""
+        response = client.post(
+            "/browsers",
+            json={
+                "proxy": {
+                    "server": "http://proxy.example.com:8080",
+                    "bypass": "localhost,*.local,192.168.*"
+                }
+            }
+        )
+        assert response.status_code == 200
+
+    def test_create_browser_with_socks_proxy(self, client: TestClient):
+        """Verify create browser accepts SOCKS proxy."""
+        response = client.post(
+            "/browsers",
+            json={
+                "proxy": {
+                    "server": "socks5://127.0.0.1:1080"
+                }
+            }
+        )
+        assert response.status_code == 200
+
+    def test_create_browser_with_all_proxy_options(self, client: TestClient):
+        """Verify create browser accepts all proxy options together."""
+        response = client.post(
+            "/browsers",
+            json={
+                "profile_dir": "/tmp/proxied-browser",
+                "proxy": {
+                    "server": "http://proxy.example.com:8080",
+                    "username": "user",
+                    "password": "pass",
+                    "bypass": "localhost,*.internal.com"
+                }
+            }
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["browser_id"] == "/tmp/proxied-browser"
+
+    def test_proxy_requires_server(self, client: TestClient):
+        """Verify proxy settings require server field."""
+        response = client.post(
+            "/browsers",
+            json={
+                "proxy": {
+                    "username": "user",
+                    "password": "pass"
+                }
+            }
+        )
+        assert response.status_code == 422  # Validation error

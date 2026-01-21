@@ -248,7 +248,7 @@ async def lifespan(app: FastAPI):
     await playwright.stop()
 
 
-app = FastAPI(title="Controller API", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Controller API", version="0.2.0", lifespan=lifespan, root_path="/parser")
 
 
 # Request/Response models for browser management

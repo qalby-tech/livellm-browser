@@ -195,32 +195,47 @@ class BrowserManager:
         logger.info(f"Closed browser '{browser_id}'")
         return True
     
-    async def shutdown(self):
-        """Close all browsers and cleanup."""
-        for browser_id in list(self.browsers.keys()):
-            browser_info = self.browsers[browser_id]
-            
-            # Close all pages
-            for page in browser_info.pages.values():
-                try:
-                    await page.close()
-                except Exception as e:
-                    logger.warning(f"Error closing page: {e}")
-            
-            # Close browser context
-            try:
-                await browser_info.context.close()
-            except Exception as e:
-                logger.warning(f"Error closing context for browser {browser_id}: {e}")
-            
-            # Close browser (this properly releases all resources and lock files)
-            try:
-                await browser_info.browser.close()
-            except Exception as e:
-                logger.warning(f"Error closing browser {browser_id}: {e}")
+    async def shutdown(self, timeout: float = 25.0):
+        """Close all browsers and cleanup with timeout protection."""
+        logger.info("Starting browser shutdown...")
         
-        self.browsers.clear()
-        logger.info("All browsers closed")
+        async def _shutdown_task():
+            for browser_id in list(self.browsers.keys()):
+                browser_info = self.browsers[browser_id]
+                
+                # Close all pages first
+                for page in browser_info.pages.values():
+                    try:
+                        await asyncio.wait_for(page.close(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Timeout closing page, forcing close")
+                    except Exception as e:
+                        logger.warning(f"Error closing page: {e}")
+                
+                # Close browser context
+                try:
+                    await asyncio.wait_for(browser_info.context.close(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout closing context for browser {browser_id}")
+                except Exception as e:
+                    logger.warning(f"Error closing context for browser {browser_id}: {e}")
+                
+                # Close browser (this properly releases all resources and lock files)
+                try:
+                    await asyncio.wait_for(browser_info.browser.close(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout closing browser {browser_id}")
+                except Exception as e:
+                    logger.warning(f"Error closing browser {browser_id}: {e}")
+            
+            self.browsers.clear()
+            logger.info("All browsers closed")
+        
+        try:
+            await asyncio.wait_for(_shutdown_task(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.error(f"Shutdown timed out after {timeout}s, forcing cleanup")
+            self.browsers.clear()
 
 
 # Global browser manager
@@ -244,8 +259,20 @@ async def lifespan(app: FastAPI):
     yield
     
     # Cleanup: properly close all browsers before stopping Playwright
-    await browser_manager.shutdown()
-    await playwright.stop()
+    logger.info("Application shutting down, cleaning up resources...")
+    try:
+        await browser_manager.shutdown(timeout=25.0)
+    except Exception as e:
+        logger.error(f"Error during browser shutdown: {e}")
+    
+    try:
+        await asyncio.wait_for(playwright.stop(), timeout=5.0)
+    except asyncio.TimeoutError:
+        logger.warning("Timeout stopping playwright, continuing shutdown")
+    except Exception as e:
+        logger.warning(f"Error stopping playwright: {e}")
+    
+    logger.info("Shutdown complete")
 
 
 app = FastAPI(title="Controller API", version="0.2.0", lifespan=lifespan, root_path="/parser")

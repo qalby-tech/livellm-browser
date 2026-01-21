@@ -20,8 +20,9 @@ services:
       # Mount profiles directory from host with read/write access
       # Create your profile directory on host: mkdir -p ./profiles/myprofile
       # Then set PROFILE_NAME=myprofile to use it
-      - profiles_volume:/controller/profiles:rw
+      - profiles_volume:/home/headless/Desktop/app/profiles:rw
     restart: unless-stopped
+    stop_grace_period: 10s
     shm_size: '4gb'
     deploy:
       resources:

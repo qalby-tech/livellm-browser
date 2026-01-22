@@ -398,15 +398,15 @@ class TestBrowserManagement:
         assert "browser_id" in data
         assert "profile_path" in data
 
-    def test_create_browser_with_profile_dir(self, client: TestClient):
-        """Verify create browser accepts profile_dir."""
+    def test_create_browser_with_profile_uid(self, client: TestClient):
+        """Verify create browser accepts profile_uid."""
         response = client.post(
             "/browsers",
-            json={"profile_dir": "/tmp/test-profile"}
+            json={"profile_uid": "test-profile-uid"}
         )
         assert response.status_code == 200
         data = response.json()
-        assert data["browser_id"] == "/tmp/test-profile"
+        assert data["browser_id"] == "test-profile-uid"
 
     def test_create_browser_with_proxy(self, client: TestClient):
         """Verify create browser accepts proxy settings."""
@@ -466,7 +466,7 @@ class TestBrowserManagement:
         response = client.post(
             "/browsers",
             json={
-                "profile_dir": "/tmp/proxied-browser",
+                "profile_uid": "proxied-browser-uid",
                 "proxy": {
                     "server": "http://proxy.example.com:8080",
                     "username": "user",
@@ -477,7 +477,7 @@ class TestBrowserManagement:
         )
         assert response.status_code == 200
         data = response.json()
-        assert data["browser_id"] == "/tmp/proxied-browser"
+        assert data["browser_id"] == "proxied-browser-uid"
 
     def test_proxy_requires_server(self, client: TestClient):
         """Verify proxy settings require server field."""

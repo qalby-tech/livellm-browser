@@ -82,14 +82,16 @@ def mock_browser_manager(mock_playwright, mock_browser_context, mock_browser, mo
     manager.browsers = {"./profiles/default": browser_info}
     
     # Mock methods
-    async def mock_create_browser(profile_dir=None, proxy=None):
+    async def mock_create_browser(profile_uid=None, proxy=None):
         new_browser_info = MagicMock()
         new_browser_info.browser = mock_browser
         new_browser_info.context = mock_browser_context
-        new_browser_info.profile_path = Path(profile_dir) if profile_dir else Path(f"./profiles/test-uuid")
+        # Use profile_uid if provided, otherwise random ID
+        browser_id = profile_uid if profile_uid else "test-uuid"
+        
+        new_browser_info.profile_path = Path(f"./profiles/{browser_id}")
         new_browser_info.pages = {}
         
-        browser_id = profile_dir if profile_dir else "test-uuid"
         manager.browsers[browser_id] = new_browser_info
         return browser_id, new_browser_info
     

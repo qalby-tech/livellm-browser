@@ -11,3 +11,4 @@ wheels/
 
 profiles/
 .pytest_cache/
+*json

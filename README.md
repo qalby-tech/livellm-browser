@@ -61,7 +61,7 @@ POST /browsers
 ```
 ```json
 {
-  "profile_dir": "/path/to/profile",
+  "profile_uid": "my-profile",
   "proxy": {
     "server": "http://myproxy.com:3128",
     "username": "proxyuser",
@@ -70,8 +70,9 @@ POST /browsers
   }
 }
 ```
-- `profile_dir` - Optional. If provided, becomes the `browser_id` and stores profile there
-- If omitted, generates UUID as `browser_id` and stores profile in `./profiles/{uuid}`
+- `profile_uid` - Optional.
+  - If provided, used as `browser_id` and stores profile in `./profiles/{uid}` (persistent).
+  - If omitted, generates random UUID as `browser_id` (ephemeral/incognito).
 - `proxy` - Optional. Proxy settings for the browser (only configurable at browser creation)
   - `server` - Proxy server URL (required if proxy is set)
   - `username` - Proxy auth username (optional)
@@ -82,15 +83,16 @@ POST /browsers
 
 **Examples:**
 ```bash
-# Create browser with custom profile directory
+# Create browser with named persistent profile
 curl -X POST http://localhost:8000/browsers \
   -H "Content-Type: application/json" \
-  -d '{"profile_dir": "/data/my-profile"}'
-# Response: {"browser_id": "/data/my-profile", "profile_path": "/data/my-profile", "session_count": 0}
+  -d '{"profile_uid": "work-profile"}'
+# Response: {"browser_id": "work-profile", "profile_path": "profiles/work-profile", "session_count": 0}
 
-# Create browser with auto-generated UUID
+# Create ephemeral browser (incognito)
 curl -X POST http://localhost:8000/browsers
-# Response: {"browser_id": "a1b2c3d4-...", "profile_path": "./profiles/a1b2c3d4-...", "session_count": 0}
+# Response: {"browser_id": "a1b2c3d4-...", "profile_path": null, "session_count": 0}
+
 
 # Create browser with proxy
 curl -X POST http://localhost:8000/browsers \
@@ -399,6 +401,85 @@ curl -X POST http://localhost:8000/content \
 curl -X DELETE http://localhost:8000/end_session \
   -H "X-Session-Id: abc-123"
 ```
+
+## Parallel Scraping Example
+
+Here is a Python example showing how to scrape multiple pages in parallel using the default browser profile.
+
+```python
+import asyncio
+import aiohttp
+
+API_URL = "http://localhost:8000"
+
+async def scrape_url(session, url):
+    """
+    Creates a new browser tab (session), scrapes content, and closes the tab.
+    Uses the default browser profile automatically.
+    """
+    try:
+        # 1. Start a new session (tab) in the default browser
+        async with session.post(f"{API_URL}/start_session") as resp:
+            data = await resp.json()
+            session_id = data["session_id"]
+            print(f"Started session {session_id} for {url}")
+
+        # 2. Navigate and get content
+        # We pass X-Session-Id to target our specific tab
+        headers = {"X-Session-Id": session_id}
+        payload = {
+            "url": url,
+            "return_html": False, # Get text only
+            "wait_until": "domcontentloaded",
+            "idle": 1  # Optional wait for dynamic content
+        }
+        
+        async with session.post(f"{API_URL}/content", json=payload, headers=headers) as resp:
+            content = await resp.text()
+            print(f"[{url}] Content length: {len(content)}")
+            
+        # 3. Cleanup: End the session (close the tab)
+        async with session.delete(f"{API_URL}/end_session", headers=headers) as resp:
+            await resp.json()
+            print(f"Closed session {session_id}")
+            
+        return {"url": url, "content_length": len(content)}
+
+    except Exception as e:
+        print(f"Error scraping {url}: {e}")
+        return {"url": url, "error": str(e)}
+
+async def main():
+    urls = [
+        "https://example.com",
+        "https://python.org",
+        "https://fastapi.tiangolo.com",
+        "https://github.com",
+        "https://news.ycombinator.com"
+    ]
+
+    # Create a persistent HTTP session for API calls
+    async with aiohttp.ClientSession() as session:
+        # Create tasks for all URLs to run in parallel
+        tasks = [scrape_url(session, url) for url in urls]
+        
+        # Run all tasks concurrently
+        results = await asyncio.gather(*tasks)
+        
+        print("\n--- Results ---")
+        for res in results:
+            print(res)
+
+if __name__ == "__main__":
+    # uv add aiohttp
+    asyncio.run(main())
+```
+
+### Key Points:
+1.  **Isolation**: Each `scrape_url` call creates its own **Session ID** (`start_session`). This corresponds to a unique tab in the browser.
+2.  **Concurrency**: `asyncio.gather` runs all requests simultaneously. The browser handles multiple tabs efficiently.
+3.  **Cleanup**: Always call `end_session` to close the tab and free up memory.
+4.  **Default Browser**: By not specifying `X-Browser-Id`, all sessions open in the default persistent profile.
 
 ## Configuration
 

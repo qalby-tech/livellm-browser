@@ -22,6 +22,7 @@ from models.requests import (
     RemoveAction,
     ScreenshotAction,
     ScrollAction,
+    ScrollToBottomAction,
     MoveAction,
     MouseClickAction,
     IdleAction,
@@ -33,7 +34,7 @@ from patchright.async_api import Browser, BrowserContext
 from patchright.async_api import Page
 import uuid
 import logging
-from typing import List, Annotated, Optional
+from typing import List, Annotated, Optional, AsyncGenerator
 from pydantic import BaseModel, Field
 
 import shutil
@@ -398,36 +399,50 @@ async def get_or_create_page(
     request: Request,
     browser_info: BrowserInfoDep,
     session_id: SessionIdDep = None
-) -> Page:
+) -> AsyncGenerator[Page, None]:
     """
     Get or create a page object for the given session ID within a browser.
-    If no session_id is provided, a new one is generated and stored in the request state.
+    If no session_id is provided, a new one is generated and stored in the request state,
+    and the session is treated as 'ad-hoc' (closed after request).
     """
+    is_ad_hoc = False
     # Generate session_id if not provided
     if session_id is None:
         session_id = str(uuid.uuid4())
+        is_ad_hoc = True
+        
     request.state.session_id = session_id
     
     pages = browser_info.pages
+    page = None
     
     # Check if page already exists
-    page = pages.get(session_id, None)
-    if page:
+    if session_id in pages:
+        page = pages[session_id]
         # Verify page is still valid (not closed)
         try:
             _ = page.url
-            return page
         except Exception:
             logger.info(f"Page for session {session_id} was closed, creating new one")
-            page = await browser_info.context.new_page()
-            pages[session_id] = page
-            return page
+            page = None
+            
+    if page is None:
+        # Create new page
+        page = await browser_info.context.new_page()
+        pages[session_id] = page
+        logger.info(f"Created new page for session {session_id} (ad-hoc={is_ad_hoc})")
     
-    # Create new page
-    page = await browser_info.context.new_page()
-    pages[session_id] = page
-    logger.info(f"Created new page for session {session_id}")
-    return page
+    try:
+        yield page
+    finally:
+        if is_ad_hoc:
+            try:
+                # Remove from pages dict first to prevent race conditions or stale access
+                pages.pop(session_id, None)
+                await page.close()
+                logger.info(f"Closed ad-hoc page for session {session_id}")
+            except Exception as e:
+                logger.warning(f"Error closing ad-hoc page for session {session_id}: {e}")
 
 
 PageDep = Annotated[Page, Depends(get_or_create_page)]
@@ -918,6 +933,34 @@ async def interact(request: InteractRequest, page: PageDep) -> Response:
                 await page.mouse.wheel(action.x, action.y)
                 actions_performed.append(f"scrolled by ({action.x}, {action.y})")
                 logger.info(f"Scrolled by ({action.x}, {action.y})")
+            
+            elif isinstance(action, ScrollToBottomAction):
+                # Smooth scroll to bottom logic
+                start_time = asyncio.get_event_loop().time()
+                
+                while True:
+                    # Check timeout - strict exit condition
+                    if asyncio.get_event_loop().time() - start_time > action.timeout:
+                        logger.info(f"Scroll to bottom finished (timeout {action.timeout}s reached)")
+                        break
+                    
+                    # Scroll down by step
+                    #await page.evaluate(f"window.scrollBy(0, {action.step_pixels})")
+                    await page.mouse.wheel(0, action.step_pixels)
+                    await asyncio.sleep(action.step_delay)
+                    
+                    # If we just want to keep scrolling until timeout, we don't strictly need to break at bottom.
+                    # However, to be efficient, we can check if we really are stuck at bottom.
+                    # But user requested "scroll until timeout", which implies forcing scroll attempts
+                    # even if it looks like bottom (useful for aggressive infinite scrolls or tricky DOMs).
+                    
+                    # Optional: We can still check if we are at bottom to maybe speed up 'step_delay' 
+                    # or just unconditionally scroll until timeout. 
+                    # Based on user request "scroll not until bottom but until timeout is reached",
+                    # we will prioritize the timeout loop.
+                
+                actions_performed.append("scrolled (duration based)")
+                logger.info("Scrolled (duration based)")
                 
             elif isinstance(action, IdleAction):
                 await asyncio.sleep(action.duration)

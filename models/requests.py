@@ -123,6 +123,19 @@ class ScrollAction(Action):
     y: float = Field(default=0, description="Vertical scroll delta (positive = down, negative = up)")
 
 
+class ScrollToBottomAction(Action):
+    """
+    Scroll smoothly to the bottom of the page.
+    
+    Automatically handles lazy loading content by scrolling in steps
+    and waiting for new content to load.
+    """
+    action: Literal["scroll_to_bottom"] = Field(default="scroll_to_bottom", description="Scrolls smoothly to page bottom")
+    step_pixels: int = Field(default=500, description="Pixels to scroll per step")
+    step_delay: float = Field(default=0.2, description="Delay between steps in seconds")
+    timeout: float = Field(default=30.0, description="Maximum time to spend scrolling in seconds")
+
+
 class MoveAction(Action):
     """Move mouse cursor to coordinates"""
     action: Literal["move"] = Field(default="move", description="Moves mouse to coordinates")
@@ -179,7 +192,7 @@ SelectorAction = Annotated[
 
 # Union type for interact actions (reuses HtmlAction and TextAction from selector actions)
 InteractAction = Annotated[
-    Union[ScreenshotAction, ScrollAction, MoveAction, MouseClickAction, IdleAction, HtmlAction, TextAction, LoginAction],
+    Union[ScreenshotAction, ScrollAction, ScrollToBottomAction, MoveAction, MouseClickAction, IdleAction, HtmlAction, TextAction, LoginAction],
     Discriminator("action")
 ]
 

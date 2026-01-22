@@ -36,9 +36,39 @@ import logging
 from typing import List, Annotated, Optional
 from pydantic import BaseModel, Field
 
+import shutil
+
 # Default profile configuration
 PROFILES_DIR = Path("./profiles")
 DEFAULT_BROWSER_ID = "default"
+
+
+def cleanup_profile_locks(profile_path: Path):
+    """Remove Chrome lock files from a profile directory to prevent startup errors."""
+    if not profile_path.exists():
+        return
+        
+    locks = [
+        "SingletonLock",
+        "SingletonSocket",
+        "SingletonCookie"
+    ]
+    
+    for lock_name in locks:
+        lock_file = profile_path / lock_name
+        # Check if file exists or is a broken symlink
+        if os.path.lexists(lock_file):
+            try:
+                if os.path.islink(lock_file):
+                    os.unlink(lock_file)
+                elif lock_file.is_dir():
+                    shutil.rmtree(lock_file)
+                else:
+                    lock_file.unlink()
+                logger.info(f"Removed lock file: {lock_file}")
+            except Exception as e:
+                logger.warning(f"Failed to remove lock file {lock_file}: {e}")
+
 
 
 class PingFilter(logging.Filter):
@@ -60,7 +90,7 @@ logger.addHandler(handler)
 
 class BrowserInfo:
     """Container for browser, context and its associated pages."""
-    def __init__(self, browser: Browser, context: BrowserContext, profile_path: Path):
+    def __init__(self, browser: Browser, context: BrowserContext, profile_path: Optional[Path] = None):
         self.browser = browser
         self.context = context
         self.profile_path = profile_path
@@ -78,20 +108,20 @@ class BrowserManager:
         """Initialize the browser manager with playwright instance."""
         self.playwright = playwright
         # Create default browser
-        await self.create_browser(profile_dir=str(PROFILES_DIR / DEFAULT_BROWSER_ID))
+        await self.create_browser(profile_uid=DEFAULT_BROWSER_ID)
         logger.info("Browser manager started with default browser")
     
     async def create_browser(
         self, 
-        profile_dir: Optional[str] = None,
+        profile_uid: Optional[str] = None,
         proxy: Optional["ProxySettings"] = None
     ) -> tuple[str, BrowserInfo]:
         """
         Create a new browser instance.
         
         Args:
-            profile_dir: Profile directory path. If provided, used as browser_id.
-                        If not provided, generates UUID and uses profiles/{uuid}.
+            profile_uid: Profile name/UID. If provided, checks profiles/{uid} and creates persistent context.
+                        If not provided, creates a fresh ephemeral browser instance (incognito).
             proxy: Optional proxy settings for the browser.
         
         Returns:
@@ -101,26 +131,22 @@ class BrowserManager:
             raise RuntimeError("Browser manager not started")
         
         # Determine browser_id and profile_path
-        if profile_dir:
-            browser_id = profile_dir
-            profile_path = Path(profile_dir)
+        if profile_uid:
+            browser_id = profile_uid
+            profile_path = PROFILES_DIR / profile_uid
+            # Ensure no stale locks for this profile if it exists
+            cleanup_profile_locks(profile_path)
+            is_persistent = True
         else:
             browser_id = str(uuid.uuid4())
-            profile_path = PROFILES_DIR / browser_id
+            profile_path = None
+            is_persistent = False
         
         if browser_id in self.browsers:
             raise ValueError(f"Browser with id '{browser_id}' already exists")
 
-        # Build launch arguments
-        launch_kwargs = {
-            "user_data_dir": str(profile_path),
-            "headless": False,
-            "channel": "chrome",
-            "no_viewport": True,
-            "args": ["--start-maximized"],
-        }
-        
-        # Add proxy if provided
+        # Proxy configuration
+        proxy_config = None
         if proxy:
             proxy_config = {"server": proxy.server}
             if proxy.username:
@@ -129,21 +155,55 @@ class BrowserManager:
                 proxy_config["password"] = proxy.password
             if proxy.bypass:
                 proxy_config["bypass"] = proxy.bypass
-            launch_kwargs["proxy"] = proxy_config
             logger.info(f"Browser '{browser_id}' configured with proxy: {proxy.server}")
         
-        # Launch browser with persistent context (Playwright creates dir if needed)
-        # This returns a BrowserContext, but we can access the Browser via context.browser
-        context = await self.playwright.chromium.launch_persistent_context(**launch_kwargs)
+        browser = None
+        context = None
+
+        if is_persistent:
+            # Build launch arguments for persistent context
+            launch_kwargs = {
+                "user_data_dir": str(profile_path),
+                "headless": False,
+                "channel": "chrome",
+                "no_viewport": True,
+                "args": ["--start-maximized"],
+            }
+            if proxy_config:
+                launch_kwargs["proxy"] = proxy_config
+            
+            # Launch browser with persistent context (Playwright creates dir if needed)
+            context = await self.playwright.chromium.launch_persistent_context(**launch_kwargs)
+            browser = context.browser
         
-        # Get the browser object from the context so we can properly close it
-        browser = context.browser
+        else:
+            # Build launch arguments for ephemeral browser
+            launch_kwargs = {
+                "headless": False,
+                "channel": "chrome",
+                "args": ["--start-maximized"],
+            }
+            if proxy_config:
+                launch_kwargs["proxy"] = proxy_config
+            
+            browser = await self.playwright.chromium.launch(**launch_kwargs)
+            
+            # Create new context
+            context = await browser.new_context(no_viewport=True)
+
+        if browser is None and context:
+            browser = context.browser
+            
         if browser is None:
-            raise RuntimeError(f"Failed to get browser object from context for profile {profile_path}")
+            raise RuntimeError(f"Failed to get browser object for {browser_id}")
         
         browser_info = BrowserInfo(browser, context, profile_path)
         self.browsers[browser_id] = browser_info
-        logger.info(f"Created browser '{browser_id}' with profile at {profile_path}")
+        
+        if is_persistent:
+            logger.info(f"Created persistent browser '{browser_id}' with profile at {profile_path}")
+        else:
+            logger.info(f"Created ephemeral browser '{browser_id}'")
         
         return browser_id, browser_info
     
@@ -155,16 +215,15 @@ class BrowserManager:
     
     def get_default_browser(self) -> BrowserInfo:
         """Get the default browser."""
-        return self.browsers[str(PROFILES_DIR / DEFAULT_BROWSER_ID)]
+        return self.browsers[DEFAULT_BROWSER_ID]
     
     def get_default_browser_id(self) -> str:
         """Get the default browser ID."""
-        return str(PROFILES_DIR / DEFAULT_BROWSER_ID)
+        return DEFAULT_BROWSER_ID
     
     async def close_browser(self, browser_id: str) -> bool:
         """Close and remove a browser instance."""
-        default_id = str(PROFILES_DIR / DEFAULT_BROWSER_ID)
-        if browser_id == default_id:
+        if browser_id == DEFAULT_BROWSER_ID:
             raise ValueError("Cannot close the default browser")
         
         if browser_id not in self.browsers:
@@ -247,11 +306,17 @@ async def lifespan(app: FastAPI):
     # Clean up Chrome lock files before starting Playwright
     # This ensures a clean state on container restart
     default_profile = PROFILES_DIR / DEFAULT_BROWSER_ID
+    cleanup_profile_locks(default_profile)
     default_profile.mkdir(parents=True, exist_ok=True)
     
     # Start playwright and browser manager
     playwright = await async_playwright().start()
-    await browser_manager.start(playwright)
+    try:
+        await browser_manager.start(playwright)
+    except Exception as e:
+        logger.error(f"Failed to start browser manager: {e}")
+        # Try to cleanup and re-raise or handle gracefully?
+        # For now, we log and continue, but app might be unhealthy
     
     app.state.playwright = playwright
     app.state.browser_manager = browser_manager
@@ -288,9 +353,9 @@ class ProxySettings(BaseModel):
 
 
 class CreateBrowserRequest(BaseModel):
-    profile_dir: Optional[str] = Field(
+    profile_uid: Optional[str] = Field(
         default=None, 
-        description="Profile directory path. If provided, used as browser_id. If not, UUID is generated."
+        description="Profile name/UID. If provided, uses persistent profile in profiles/{uid}. If not, creates ephemeral session."
     )
     proxy: Optional[ProxySettings] = Field(
         default=None,
@@ -300,7 +365,7 @@ class CreateBrowserRequest(BaseModel):
 
 class BrowserResponse(BaseModel):
     browser_id: str
-    profile_path: str
+    profile_path: Optional[str]
     session_count: int
 
 
@@ -382,7 +447,7 @@ async def list_browsers() -> List[BrowserResponse]:
     return [
         BrowserResponse(
             browser_id=bid,
-            profile_path=str(info.profile_path),
+            profile_path=str(info.profile_path) if info.profile_path else None,
             session_count=len(info.pages)
         )
         for bid, info in browser_manager.browsers.items()
@@ -394,22 +459,19 @@ async def create_browser(request: CreateBrowserRequest = CreateBrowserRequest())
     """
     Create a new browser instance.
     
-    If profile_dir is provided, it becomes the browser_id.
-    If not provided, a UUID is generated as browser_id and profile stored in profiles/{uuid}.
+    If profile_uid is provided, it creates a persistent browser with that profile (profiles/{uid}).
+    If not provided, creates an ephemeral browser with a random UUID.
     
     Proxy settings can be specified to route all browser traffic through a proxy server.
-    Note: Proxy settings can only be configured when creating a new browser.
-    
-    The profile directory is created by Playwright when the browser starts.
     """
     try:
         browser_id, browser_info = await browser_manager.create_browser(
-            profile_dir=request.profile_dir,
+            profile_uid=request.profile_uid,
             proxy=request.proxy
         )
         return BrowserResponse(
             browser_id=browser_id,
-            profile_path=str(browser_info.profile_path),
+            profile_path=str(browser_info.profile_path) if browser_info.profile_path else None,
             session_count=0
         )
     except ValueError as e:

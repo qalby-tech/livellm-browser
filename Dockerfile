@@ -23,6 +23,8 @@ RUN apt-get update && \
 # Install Python 3.9 using uv
 RUN uv python install 3.9
 
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR "${HOME}"/Desktop/app
 # Copy only dependency files first (for better caching)
 COPY pyproject.toml uv.lock ./
@@ -79,9 +81,9 @@ RUN printf '%s\n' \
     '/dockerstartup/startup.sh "$@" &' \
     'STARTUP_PID=$!' \
     '' \
-    '# Wait for X11 display to be ready (up to 30 seconds)' \
+    '# Wait for X11 display to be ready (up to 80 seconds)' \
     'echo "Waiting for display :1 to be ready..."' \
-    'for i in $(seq 1 30); do' \
+    'for i in $(seq 1 80); do' \
     '  if xdpyinfo -display :1 >/dev/null 2>&1; then' \
     '    echo "Display :1 is ready!"' \
     '    break' \

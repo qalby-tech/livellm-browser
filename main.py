@@ -383,13 +383,26 @@ async def get_browser_info(
     request: Request,
     browser_id: BrowserIdDep = None
 ) -> BrowserInfo:
-    """Get browser info, defaulting to the default browser."""
+    """
+    Get browser info, defaulting to the default browser.
+    
+    If a specific browser_id is provided and doesn't exist, it will be created automatically.
+    If no browser_id is provided, uses the default browser and ensures it exists.
+    """
     manager: BrowserManager = request.app.state.browser_manager
     bid = browser_id or manager.get_default_browser_id()
+    
     try:
         return manager.get_browser(bid)
     except KeyError:
-        raise HTTPException(status_code=404, detail=f"Browser '{bid}' not found")
+        # Browser doesn't exist - create it automatically
+        logger.info(f"Browser '{bid}' not found, creating it automatically")
+        try:
+            # Create the browser with the profile_uid (for persistent profile)
+            _, browser_info = await manager.create_browser(profile_uid=bid)
+            return browser_info
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to create browser '{bid}': {str(e)}")
 
 
 BrowserInfoDep = Annotated[BrowserInfo, Depends(get_browser_info)]
@@ -524,6 +537,7 @@ async def start_session(
     - request body browser_id field
     
     If neither is provided, uses the default browser.
+    If the specified browser doesn't exist, it will be created automatically.
     """
     # Use request body browser_id if header not provided
     bid = browser_id or request.browser_id or browser_manager.get_default_browser_id()
@@ -531,7 +545,12 @@ async def start_session(
     try:
         browser_info = browser_manager.get_browser(bid)
     except KeyError:
-        raise HTTPException(status_code=404, detail=f"Browser '{bid}' not found")
+        # Browser doesn't exist - create it automatically
+        logger.info(f"Browser '{bid}' not found, creating it automatically")
+        try:
+            _, browser_info = await browser_manager.create_browser(profile_uid=bid)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to create browser '{bid}': {str(e)}")
     
     session_id = str(uuid.uuid4())
     page = await browser_info.context.new_page()

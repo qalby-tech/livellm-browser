@@ -8,7 +8,6 @@ from urllib.parse import urlparse, urljoin
 from typing import Set, List, Dict, Any
 from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm_asyncio
-import tqdm
 
 # Configure logging
 logging.basicConfig(
@@ -18,16 +17,88 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class SessionPool:
+    """Pool of persistent browser sessions for reuse."""
+    
+    def __init__(self, client: httpx.AsyncClient, api_base: str, browser_uid: str, size: int):
+        self.client = client
+        self.api_base = api_base
+        self.browser_uid = browser_uid
+        self.size = size
+        self._available: asyncio.Queue[str] = asyncio.Queue()
+        self._all_sessions: List[str] = []
+        self._headers: Dict[str, str] = {}
+        if browser_uid != "default":
+            self._headers["X-Browser-Id"] = browser_uid
+    
+    async def initialize(self):
+        """Create all sessions in the pool."""
+        logger.info(f"Initializing session pool with {self.size} sessions...")
+        for i in range(self.size):
+            try:
+                resp = await self.client.post(
+                    f"{self.api_base}/start_session",
+                    headers=self._headers,
+                    timeout=30.0
+                )
+                if resp.status_code == 200:
+                    session_data = resp.json()
+                    session_id = session_data["session_id"]
+                    self._all_sessions.append(session_id)
+                    await self._available.put(session_id)
+                    logger.info(f"Created session {i+1}/{self.size}: {session_id[:8]}...")
+                else:
+                    logger.error(f"Failed to create session {i+1}: {resp.text}")
+            except Exception as e:
+                logger.error(f"Error creating session {i+1}: {e}")
+        
+        logger.info(f"Session pool ready with {len(self._all_sessions)} sessions")
+    
+    async def acquire(self) -> str:
+        """Acquire a session from the pool (blocks until one is available)."""
+        return await self._available.get()
+    
+    async def release(self, session_id: str):
+        """Return a session to the pool for reuse."""
+        await self._available.put(session_id)
+    
+    def get_headers(self, session_id: str) -> Dict[str, str]:
+        """Get headers for a request with the given session."""
+        headers = self._headers.copy()
+        headers["X-Session-Id"] = session_id
+        return headers
+    
+    async def shutdown(self):
+        """Close all sessions in the pool."""
+        logger.info("Shutting down session pool...")
+        for session_id in self._all_sessions:
+            try:
+                headers = self.get_headers(session_id)
+                await self.client.delete(
+                    f"{self.api_base}/end_session",
+                    headers=headers,
+                    timeout=10.0
+                )
+                logger.info(f"Closed session {session_id[:8]}...")
+            except Exception as e:
+                logger.warning(f"Error closing session {session_id[:8]}: {e}")
+        self._all_sessions.clear()
+        logger.info("Session pool shutdown complete")
+
+
 class Crawler:
-    def __init__(self, home_url: str, depth: int, browser_uid: str, parallel: int, openai_key: str, api_base: str, openai_base_url: str = None):
+    def __init__(self, home_url: str, depth: int, browser_uid: str, parallel: int, openai_key: str, api_base: str, output_file: str, openai_base_url: str = None):
         self.home_url = home_url
         self.max_depth = depth
         self.browser_uid = browser_uid
         self.parallel = parallel
         self.api_base = api_base
+        self.output_file = output_file
         self.domain = urlparse(home_url).netloc
         self.visited_urls: Set[str] = set()
         self.results: List[Dict[str, Any]] = []
+        self.session_pool: SessionPool = None
+        self._file_lock = asyncio.Lock()
         
         # Initialize OpenAI client
         if not openai_key:
@@ -38,8 +109,37 @@ class Crawler:
             base_url=openai_base_url
         )
         
-        # Semaphore for parallel requests
-        self.sem = asyncio.Semaphore(parallel)
+        # Initialize output file with empty array if it doesn't exist or is invalid
+        self._init_output_file()
+
+    def _init_output_file(self):
+        """Initialize output file - load existing results or create empty array."""
+        try:
+            if os.path.exists(self.output_file):
+                with open(self.output_file, 'r') as f:
+                    existing = json.load(f)
+                    if isinstance(existing, list):
+                        self.results = existing
+                        logger.info(f"Loaded {len(self.results)} existing results from {self.output_file}")
+                        return
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"Could not load existing results: {e}")
+        
+        # Create new empty file
+        with open(self.output_file, 'w') as f:
+            json.dump([], f)
+        logger.info(f"Initialized empty output file: {self.output_file}")
+
+    async def _save_result(self, result: Dict[str, Any]):
+        """Save a single result to the output file with locking."""
+        async with self._file_lock:
+            self.results.append(result)
+            try:
+                with open(self.output_file, 'w') as f:
+                    json.dump(self.results, f, ensure_ascii=False, indent=2)
+                logger.debug(f"Saved result to {self.output_file} (total: {len(self.results)})")
+            except IOError as e:
+                logger.error(f"Failed to save result: {e}")
 
     def is_same_domain(self, url: str) -> bool:
         return urlparse(url).netloc == self.domain
@@ -50,13 +150,9 @@ class Crawler:
         parsed = urlparse(url)
         return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
-    async def get_page_links(self, client: httpx.AsyncClient, url: str) -> Set[str]:
-        """Extract all same-domain links from a page."""
+    async def get_page_links(self, url: str) -> Set[str]:
+        """Extract all same-domain links from a page using a pooled session."""
         logger.info(f"Extracting links from {url}")
-        
-        # Use execute_script instead of selectors to get all links at once efficiently
-        # This avoids transferring large JSONs if we filter client-side
-        # Actually, let's keep using selectors but optimize the filter
         
         payload = {
             "url": url,
@@ -69,17 +165,18 @@ class Crawler:
                 }
             ],
             "wait_until": "commit",
-            "timeout": 60000 # Increased timeout
+            "timeout": 60000
         }
 
-        # Create ad-hoc session for extraction (or use persistent browser)
-        headers = {}
-        if self.browser_uid != "default":
-             headers["X-Browser-Id"] = self.browser_uid
-
+        session_id = await self.session_pool.acquire()
         try:
-            # Increased read timeout for client
-            resp = await client.post(f"{self.api_base}/selectors", json=payload, headers=headers, timeout=1200.0)
+            headers = self.session_pool.get_headers(session_id)
+            resp = await self.client.post(
+                f"{self.api_base}/selectors", 
+                json=payload, 
+                headers=headers, 
+                timeout=1200.0
+            )
             if resp.status_code != 200:
                 logger.error(f"Failed to get links from {url}: {resp.text}")
                 return set()
@@ -106,9 +203,11 @@ class Crawler:
         except Exception as e:
             logger.error(f"Error getting links from {url}: {e}")
             return set()
+        finally:
+            await self.session_pool.release(session_id)
 
-    async def extract_product_data(self, client: httpx.AsyncClient, url: str) -> Dict[str, Any]:
-        """Scroll page, get text, and parse with OpenAI."""
+    async def extract_product_data(self, url: str) -> Dict[str, Any]:
+        """Scroll page, get text, and parse with OpenAI using a pooled session."""
         logger.info(f"Processing product data from {url}")
         
         # 1. Get page text with scrolling
@@ -118,62 +217,36 @@ class Crawler:
                 {
                     "action": "scroll_to_bottom",
                     "step_pixels": 500,
-                    "step_delay": 1.5, # Faster scroll for speed
-                    "timeout": 10      # Max 10s scroll
+                    "step_delay": 1.5,
+                    "timeout": 10
                 },
                 {
                     "action": "text"
                 }
             ]
         }
-        
-        headers = {}
-        if self.browser_uid != "default":
-             headers["X-Browser-Id"] = self.browser_uid
 
         text_content = ""
+        session_id = await self.session_pool.acquire()
         try:
-            async with self.sem: # Limit concurrent browser sessions
-                # Start a dedicated session (tab) to ensure isolation
-                start_resp = await client.post(f"{self.api_base}/start_session", headers=headers, timeout=10.0)
-                if start_resp.status_code != 200:
-                    logger.error(f"Failed to start session: {start_resp.text}")
-                    return {}
-                session_data = start_resp.json()
-                session_id = session_data["session_id"]
-                
-                req_headers = headers.copy()
-                req_headers["X-Session-Id"] = session_id
-                
-                try:
-                    interact_resp = await client.post(f"{self.api_base}/interact", json=payload, headers=req_headers, timeout=60.0)
-                    if interact_resp.status_code == 200:
-                        # Response can be text or json depending on accept header, 
-                        # but the endpoint returns plain text for "text" action if it's the only one returning content?
-                        # Actually /interact returns text/plain if only one content result, or json if mixed.
-                        # Let's read based on content-type
-                        ctype = interact_resp.headers.get("Content-Type", "")
-                        if "application/json" in ctype:
-                            data = interact_resp.json()
-                            # Try to find the text result
-                            # NOTE: The current API implementation for /interact returns text/plain directly 
-                            # if a content result is found (lines 958-959 in main.py). 
-                            # If not, it returns JSON status.
-                            # Wait, looking at main.py:
-                            # if content_result is not None: return Response(content=content_result, media_type="text/plain")
-                            # So if we asked for text, we get raw text.
-                            pass
-                        else:
-                            text_content = interact_resp.text
-                    else:
-                        logger.error(f"Failed to interact with {url}: {interact_resp.text}")
-                finally:
-                        # Cleanup session
-                        await client.delete(f"{self.api_base}/end_session", headers=req_headers, timeout=10.0)
-        
+            headers = self.session_pool.get_headers(session_id)
+            interact_resp = await self.client.post(
+                f"{self.api_base}/interact", 
+                json=payload, 
+                headers=headers, 
+                timeout=60.0
+            )
+            if interact_resp.status_code == 200:
+                ctype = interact_resp.headers.get("Content-Type", "")
+                if "application/json" not in ctype:
+                    text_content = interact_resp.text
+            else:
+                logger.error(f"Failed to interact with {url}: {interact_resp.text}")
         except Exception as e:
             logger.error(f"Error scraping {url}: {e}")
             return {}
+        finally:
+            await self.session_pool.release(session_id)
 
         if not text_content:
             return {}
@@ -181,7 +254,7 @@ class Crawler:
         # 2. Extract with OpenAI
         try:
             completion = await self.openai.chat.completions.create(
-                model="gpt-4o-mini", # Use a cheaper/faster model for basic extraction
+                model="google/gemini-2.5-flash-lite", # Use a cheaper/faster model for basic extraction
                 messages=[
                     {
                         "role": "system", 
@@ -204,6 +277,10 @@ If the text does not contain product information, return an empty JSON object {}
                 return {}
                 
             data["url"] = url
+            
+            # Save immediately to backup file
+            await self._save_result(data)
+            
             return data
             
         except Exception as e:
@@ -212,56 +289,60 @@ If the text does not contain product information, return an empty JSON object {}
 
     async def crawl(self):
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # Level 0: Home URL
-            current_urls = {self.home_url}
-            self.visited_urls.add(self.home_url)
+            self.client = client
             
-            for d in range(self.max_depth):
-                logger.info(f"--- Depth {d+1} (Processing {len(current_urls)} URLs) ---")
+            # Initialize the session pool
+            self.session_pool = SessionPool(
+                client=client,
+                api_base=self.api_base,
+                browser_uid=self.browser_uid,
+                size=self.parallel
+            )
+            await self.session_pool.initialize()
+            
+            try:
+                # Level 0: Home URL
+                current_urls = {self.home_url}
+                self.visited_urls.add(self.home_url)
                 
-                next_urls = set()
-                crawl_tasks = []
-                
-                # Process current level URLs
-                for url in current_urls:
-                    # Task 1: Parse data from this URL
-                    crawl_tasks.append(self.extract_product_data(client, url))
+                for d in range(self.max_depth):
+                    logger.info(f"--- Depth {d+1} (Processing {len(current_urls)} URLs) ---")
                     
-                    # Task 2: If we are not at max depth, find more links
+                    next_urls = set()
+                    crawl_tasks = []
+                    
+                    # Process current level URLs
+                    for url in current_urls:
+                        # Task 1: Parse data from this URL
+                        crawl_tasks.append(self.extract_product_data(url))
+
+                    # Run extraction in parallel (limited by session pool size)
+                    # Results are saved incrementally in extract_product_data via _save_result
+                    results = await tqdm_asyncio.gather(*crawl_tasks, desc=f"Scanning depth {d+1}")
+                    
+                    for res in results:
+                        if res:
+                            logger.info(f"Found product: {res.get('name', 'Unknown')}")
+
+                    # If we need to go deeper, extract links from all current pages
                     if d < self.max_depth - 1:
-                        # We need to await this to build the next level
-                        # Ideally we do this in parallel too, but for simplicity let's do it per batch
-                        pass
+                        logger.info("Extracting links for next level...")
+                        link_tasks = [self.get_page_links(url) for url in current_urls]
+                        link_sets = await tqdm_asyncio.gather(*link_tasks, desc="Extracting links")
+                        
+                        for links in link_sets:
+                            for link in links:
+                                if link not in self.visited_urls:
+                                    self.visited_urls.add(link)
+                                    next_urls.add(link)
+                        
+                        current_urls = next_urls
+                        if not current_urls:
+                            break
+            finally:
+                # Always cleanup sessions
+                await self.session_pool.shutdown()
 
-                # Run extraction in parallel
-                # results = await asyncio.gather(*crawl_tasks)
-                results = await tqdm_asyncio.gather(*crawl_tasks, desc=f"Scanning depth {d+1}")
-                
-                for res in results:
-                    if res:
-                        self.results.append(res)
-                        logger.info(f"Found product: {res.get('name', 'Unknown')}")
-
-                # If we need to go deeper, extract links from all current pages
-                if d < self.max_depth - 1:
-                    logger.info("Extracting links for next level...")
-                    link_tasks = [self.get_page_links(client, url) for url in current_urls]
-                    link_sets = await tqdm_asyncio.gather(*link_tasks, desc="Extracting links")
-                    
-                    for links in link_sets:
-                        for link in links:
-                            if link not in self.visited_urls:
-                                self.visited_urls.add(link)
-                                next_urls.add(link)
-                    
-                    current_urls = next_urls
-                    if not current_urls:
-                        break
-
-    def save_results(self, filename: str):
-        with open(filename, 'w') as f:
-            json.dump(self.results, f, ensure_ascii=False, indent=2)
-        logger.info(f"Saved {len(self.results)} items to {filename}")
 
 async def main():
     parser = argparse.ArgumentParser(description="Parallel Crawler with LLM Extraction")
@@ -288,11 +369,12 @@ async def main():
         parallel=args.parallel,
         openai_key=api_key,
         api_base=args.api_base,
+        output_file=args.output,
         openai_base_url=args.openai_base
     )
     
     await crawler.crawl()
-    crawler.save_results(args.output)
+    logger.info(f"Crawl complete. {len(crawler.results)} results saved to {args.output}")
 
 if __name__ == "__main__":
     # Ensure dependencies are installed:

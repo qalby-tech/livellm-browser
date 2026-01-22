@@ -8,6 +8,7 @@ from urllib.parse import urlparse, urljoin
 from typing import Set, List, Dict, Any
 from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm_asyncio
+from bs4 import BeautifulSoup
 
 # Configure logging
 logging.basicConfig(
@@ -151,60 +152,91 @@ class Crawler:
         return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
     async def get_page_links(self, url: str) -> Set[str]:
-        """Extract all same-domain links from a page using a pooled session."""
+        """Extract all same-domain links from a page using scroll + HTML parsing.
+        
+        This is much faster than using /selectors because:
+        1. Getting HTML is a single operation
+        2. BeautifulSoup parsing is in-process and extremely fast
+        3. No iterating through elements one-by-one via Playwright
+        """
         logger.info(f"Extracting links from {url}")
         
+        # Use /interact with scroll_to_bottom + html to get the full page content
         payload = {
             "url": url,
-            "selectors": [
+            "actions": [
                 {
-                    "name": "links",
-                    "type": "css",
-                    "value": "a",
-                    "actions": [{"action": "attribute", "name": "href"}]
+                    "action": "scroll_to_bottom",
+                    "step_pixels": 1500,
+                    "step_delay": 1,
+                    "timeout": 5  # Quick scroll, just to trigger lazy-loaded content
+                },
+                {
+                    "action": "html"
                 }
             ],
             "wait_until": "commit",
-            "timeout": 60000
+            "timeout": 30000
         }
 
         session_id = await self.session_pool.acquire()
         try:
             headers = self.session_pool.get_headers(session_id)
             resp = await self.client.post(
-                f"{self.api_base}/selectors", 
+                f"{self.api_base}/interact", 
                 json=payload, 
                 headers=headers, 
-                timeout=1200.0
+                timeout=60.0
             )
             if resp.status_code != 200:
-                logger.error(f"Failed to get links from {url}: {resp.text}")
+                logger.error(f"Failed to get HTML from {url}: {resp.text}")
                 return set()
             
-            data = resp.json()
-            links = set()
+            # Check if we got HTML content (not JSON status response)
+            content_type = resp.headers.get("Content-Type", "")
+            if "application/json" in content_type:
+                logger.warning(f"Got JSON instead of HTML from {url}")
+                return set()
             
-            # Parse selector results
-            for selector in data:
-                if selector["name"] == "links":
-                    for result in selector["results"]:
-                        for href in result["values"]:
-                            if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
-                                continue
-                            
-                            # Handle relative paths
-                            full_url = urljoin(url, href)
-                            
-                            if self.is_same_domain(full_url):
-                                normalized = self.normalize_url(full_url)
-                                links.add(normalized)
-                                
+            html_content = resp.text
+            
+            # Parse links with BeautifulSoup (very fast, in-process)
+            links = await asyncio.to_thread(self._extract_links_from_html, html_content, url)
+            logger.info(f"Extracted {len(links)} links from {url}")
             return links
+            
         except Exception as e:
             logger.error(f"Error getting links from {url}: {e}")
             return set()
         finally:
             await self.session_pool.release(session_id)
+    
+    def _extract_links_from_html(self, html: str, base_url: str) -> Set[str]:
+        """Extract and normalize same-domain links from HTML content."""
+        links = set()
+        
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            for a_tag in soup.find_all('a', href=True):
+                href = a_tag['href']
+                
+                # Skip non-navigable links
+                if not href or href.startswith(("javascript:", "mailto:", "tel:", "#", "data:")):
+                    continue
+                
+                # Handle relative paths
+                full_url = urljoin(base_url, href)
+                
+                # Only keep same-domain links
+                if self.is_same_domain(full_url):
+                    normalized = self.normalize_url(full_url)
+                    links.add(normalized)
+                    
+        except Exception as e:
+            logger.warning(f"Error parsing HTML for links: {e}")
+        
+        return links
 
     async def extract_product_data(self, url: str) -> Dict[str, Any]:
         """Scroll page, get text, and parse with OpenAI using a pooled session."""

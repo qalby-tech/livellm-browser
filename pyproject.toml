@@ -9,7 +9,6 @@ dependencies = [
     "pydantic>=2.12.4",
     "uvicorn>=0.38.0",
     "patchright>=1.56.0",
-    "openai>=2.15.0",
 ]
 
 [dependency-groups]
@@ -17,6 +16,8 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "httpx>=0.27.0",
+    "beautifulsoup4>=4.12.0",
+    "openai>=2.15.0"
 ]
 
 [tool.pytest.ini_options]

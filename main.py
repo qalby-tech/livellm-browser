@@ -751,6 +751,85 @@ async def remove_elements(page: Page, selector_type: str, selector_value: str, n
 
 # ==================== Core Endpoints ====================
 
+async def _parse_search_results(page: Page, results: List[SearchResult], seen_links: set, count: int) -> List[SearchResult]:
+    """
+    Parse search results from the current Google search page.
+    
+    Args:
+        page: The browser page with Google search results
+        results: Existing results list to append to
+        seen_links: Set of already seen links to avoid duplicates
+        count: Maximum number of results to collect
+        
+    Returns:
+        Updated list of SearchResult objects
+    """
+    result_divs = await page.query_selector_all('div[data-rpos]')
+    
+    for result_div in result_divs:
+        if len(results) >= count:
+            break
+            
+        try:
+            span_elements = await result_div.query_selector_all('span')
+            link_element = None
+            for span in span_elements:
+                a = await span.query_selector('a')
+                if a:
+                    link_element = a
+                    break
+
+            if not link_element:
+                continue
+
+            href = await link_element.get_attribute('href')
+            
+            # Skip if we've already seen this link
+            if href in seen_links:
+                continue
+            seen_links.add(href)
+            
+            title = await link_element.inner_text()
+
+            snippet_texts = []
+            for span in span_elements:
+                html = await span.inner_html()
+                if '<em>' in html:
+                    text = await span.inner_text()
+                    snippet_texts.append(text)
+
+            snippet = '\n'.join(snippet_texts)
+
+            # Try to extract thumbnail image (base64-encoded data URL)
+            image_data = None
+            try:
+                # Priority: Look for the thumbnail image with specific ID pattern or attribute
+                # This avoids picking up the favicon (which is usually just a plain img or has different classes)
+                img_element = await result_div.query_selector('img[id^="dimg_"]')
+                
+                if not img_element:
+                    img_element = await result_div.query_selector('img[data-csiid]')
+
+                if img_element:
+                    src = await img_element.get_attribute('src')
+                    if src and src.startswith('data:image/'):
+                        image_data = src
+            except Exception:
+                pass  # Skip if image extraction fails
+
+            results.append(SearchResult(
+                link=href,
+                title=title,
+                snippet=snippet,
+                image=image_data
+            ))
+                    
+        except Exception:
+            continue
+    
+    return results
+
+
 @app.post("/search")
 async def search(request: SearchRequest, page: PageDep) -> List[SearchResult]:
     """
@@ -768,44 +847,50 @@ async def search(request: SearchRequest, page: PageDep) -> List[SearchResult]:
         await asyncio.sleep(3)
 
         results = []
-        result_divs = await page.query_selector_all('div[data-rpos]')
+        seen_links = set()  # Track seen links to avoid duplicates across pages
         
-        for result_div in result_divs:
-            if len(results) >= request.count:
+        # Parse initial results
+        results = await _parse_search_results(page, results, seen_links, request.count)
+        
+        # Pagination: if we don't have enough results, try next pages
+        max_pages = 10  # Safety limit to prevent infinite loops
+        current_page = 1
+        
+        while len(results) < request.count and current_page < max_pages:
+            # Try to find and click the next page button
+            # Google uses id="pnnext" for the "Next" link
+            next_button = await page.query_selector('a#pnnext')
+            
+            if not next_button:
+                # Try alternative selectors for next page
+                logger.info("No next page button found. Trying alternative selectors: 'aria-label' method")
+                next_button = await page.query_selector('a[aria-label="Next page"]')
+            if not next_button:
+                # Try finding by text content in pagination
+                logger.info("No next page button found. Trying alternative selectors: 'next' text method")
+                next_button = await page.query_selector('table.AaVjTc a:has-text("Next")')
+            
+            if not next_button:
+                # No more pages available
+                logger.info(f"No next page button found after page {current_page}. Got {len(results)} results.")
                 break
-                
-            try:
-                span_elements = await result_div.query_selector_all('span')
-                link_element = None
-                for span in span_elements:
-                    a = await span.query_selector('a')
-                    if a:
-                        link_element = a
-                        break
-
-                if not link_element:
-                    continue
-
-                href = await link_element.get_attribute('href')
-                title = await link_element.inner_text()
-
-                snippet_texts = []
-                for span in span_elements:
-                    html = await span.inner_html()
-                    if '<em>' in html:
-                        text = await span.inner_text()
-                        snippet_texts.append(text)
-
-                snippet = '\n'.join(snippet_texts)
-
-                results.append(SearchResult(
-                    link=href,
-                    title=title,
-                    snippet=snippet
-                ))
-                        
-            except Exception:
-                continue
+            
+            # Click next page
+            await next_button.click()
+            await asyncio.sleep(1)  # Wait for page to load
+            
+            current_page += 1
+            previous_count = len(results)
+            
+            # Parse results from new page
+            results = await _parse_search_results(page, results, seen_links, request.count)
+            
+            # If no new results were added, stop to avoid infinite loop
+            if len(results) == previous_count:
+                logger.info(f"No new results found on page {current_page}. Stopping pagination.")
+                break
+            
+            logger.info(f"Page {current_page}: collected {len(results)}/{request.count} results")
         
         return results
         

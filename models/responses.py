@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Literal, List, Any
+from typing import Literal, List, Any, Optional
 
 class PingResponse(BaseModel):
     status: Literal["ok", "error"] = Field("ok", description="The status of the API")
@@ -9,6 +9,7 @@ class SearchResult(BaseModel):
     link: str = Field(..., description="URL of the search result")
     title: str = Field(..., description="Title of the search result page")
     snippet: str = Field(..., description="A brief description or snippet from the search result page")
+    image: Optional[str] = Field(default=None, description="Base64-encoded thumbnail image data URL if available")
 
 
 class ActionResult(BaseModel):

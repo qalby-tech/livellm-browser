@@ -12,11 +12,17 @@ USER 0
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # Install system dependencies for screenshot functionality and display detection
+# Also install CJK fonts so Chrome can render Chinese/Japanese/Korean characters
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     gnome-screenshot \
     scrot \
     x11-utils \
+    fonts-noto-cjk \
+    fonts-noto-cjk-extra \
+    fonts-wqy-zenhei \
+    fonts-wqy-microhei \
+    && fc-cache -fv \
     && apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 

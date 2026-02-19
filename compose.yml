@@ -3,8 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: kamasalyamov/livellm-browser:1.1.1
-    container_name: livellm-browser-1.1.1
+    image: kamasalyamov/livellm-browser:1.1.2
+    container_name: livellm-browser-1.1.2
     ports:
       # VNC port
       - "5901:5901"

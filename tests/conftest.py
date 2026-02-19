@@ -14,6 +14,7 @@ def mock_page():
     page.goto = AsyncMock()
     page.content = AsyncMock(return_value="<html><body>Test</body></html>")
     page.inner_text = AsyncMock(return_value="Test content")
+    page.query_selector = AsyncMock(return_value=None)
     page.query_selector_all = AsyncMock(return_value=[])
     page.close = AsyncMock()
     page.screenshot = AsyncMock(return_value=b"fake_png_bytes")

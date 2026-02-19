@@ -39,6 +39,12 @@ class WikiResult(BaseModel):
     misc_links: List[str] = Field(default_factory=list)
 
 
+class AiReview(BaseModel):
+    summary: str
+    sources: List[str]
+
+
 class SearchResponse(BaseModel):
+    ai_review: Optional[AiReview] = None
     wiki: Optional[WikiResult] = None
     results: List[SearchResult]

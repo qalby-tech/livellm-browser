@@ -10,7 +10,7 @@ from core.dependencies import PageDep
 from models.requests import SearchRequest
 from models.responses import (
     SearchResponse, SearchResult, SearchMetadata,
-    RatingMetadata, WikiResult,
+    RatingMetadata, WikiResult, AiReview
 )
 
 logger = logging.getLogger(__name__)
@@ -126,6 +126,38 @@ async def _extract_wiki(page: Page) -> Optional[WikiResult]:
         return None
 
 
+async def _extract_ai_review(page: Page) -> Optional[AiReview]:
+    """Extract AI review panel from the search page."""
+    try:
+        review_div = await page.query_selector('div[data-mcpr]')
+        if not review_div:
+            return None
+
+        summary = await review_div.inner_text()
+        if not summary:
+            return None
+        
+        summary = summary.strip()
+
+        raw_links = []
+        for a in await review_div.query_selector_all('a'):
+            href = await a.get_attribute('href')
+            if _is_valid_result_link(href):
+                raw_links.append(href)
+
+        # Deduplicate links
+        seen: set = set()
+        sources = []
+        for link in raw_links:
+            if link not in seen:
+                seen.add(link)
+                sources.append(link)
+
+        return AiReview(summary=summary, sources=sources)
+    except Exception:
+        return None
+
+
 async def _parse_search_results(
     page: Page, results: List[SearchResult], seen_links: set, count: int,
 ) -> List[SearchResult]:
@@ -219,6 +251,7 @@ async def search(request: SearchRequest, page: PageDep) -> SearchResponse:
         results: List[SearchResult] = []
         seen_links: set = set()
 
+        ai_review = await _extract_ai_review(page)
         wiki_result = await _extract_wiki(page)
         results = await _parse_search_results(page, results, seen_links, request.count)
 
@@ -241,6 +274,6 @@ async def search(request: SearchRequest, page: PageDep) -> SearchResponse:
                 break
             logger.info(f"Page {current_page}: {len(results)}/{request.count} results")
 
-        return SearchResponse(wiki=wiki_result, results=results)
+        return SearchResponse(ai_review=ai_review, wiki=wiki_result, results=results)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to search: {str(e)}")

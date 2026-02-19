@@ -6,6 +6,8 @@ from fastapi.responses import Response
 from models.responses import (
     PingResponse, 
     SearchResult,
+    SearchMetadata,
+    RatingMetadata,
     SelectorResult,
     ActionResult
 )
@@ -31,9 +33,10 @@ from models.requests import (
 from contextlib import asynccontextmanager
 from patchright.async_api import async_playwright, Playwright
 from patchright.async_api import Browser, BrowserContext
-from patchright.async_api import Page
+from patchright.async_api import Page, ElementHandle
 import uuid
 import logging
+import re
 from typing import List, Annotated, Optional, AsyncGenerator
 from pydantic import BaseModel, Field
 
@@ -751,6 +754,67 @@ async def remove_elements(page: Page, selector_type: str, selector_value: str, n
 
 # ==================== Core Endpoints ====================
 
+async def _extract_rating(result_div: ElementHandle) -> Optional[RatingMetadata]:
+    """Extract rating metadata from search result."""
+    try:
+        # User instruction: Use div[data-sncf="2"] as the container
+        rating_container = await result_div.query_selector('div[data-sncf="2"]')
+        if not rating_container:
+            return None
+            
+        # Extract description from aria-label if available
+        # Usually found on a child element (like span.Y0A0hc)
+        description = None
+        labeled_element = await rating_container.query_selector('[aria-label]')
+        if labeled_element:
+            description = await labeled_element.get_attribute('aria-label')
+
+        # Get all spans with aria-hidden="true"
+        # User logic: first is rating, second is reviews
+        spans = await rating_container.query_selector_all('span[aria-hidden="true"]')
+        
+        valid_texts = []
+        for span in spans:
+            text = await span.inner_text()
+            text = text.strip()
+            if text:
+                valid_texts.append(text)
+        
+        rating = None
+        reviews = None
+        
+        if len(valid_texts) >= 1:
+            # Parse rating: "4,8" or "4.8"
+            try:
+                rating_text = valid_texts[0].replace(',', '.')
+                rating = float(rating_text)
+            except ValueError:
+                pass
+                
+        if len(valid_texts) >= 2:
+            # Parse reviews: "(16 492)" or "16,492"
+            try:
+                reviews_text = valid_texts[1]
+                # Filter only digits to handle spaces, parens, nbsp, etc.
+                digits = "".join(c for c in reviews_text if c.isdigit())
+                if digits:
+                    reviews = int(digits)
+            except ValueError:
+                pass
+        
+        if rating is None and reviews is None:
+            return None
+            
+        return RatingMetadata(
+            rating=rating,
+            reviews=reviews,
+            description=description
+        )
+
+    except Exception:
+        return None
+
+
 async def _parse_search_results(page: Page, results: List[SearchResult], seen_links: set, count: int) -> List[SearchResult]:
     """
     Parse search results from the current Google search page.
@@ -800,28 +864,48 @@ async def _parse_search_results(page: Page, results: List[SearchResult], seen_li
 
             snippet = '\n'.join(snippet_texts)
 
-            # Try to extract thumbnail image (base64-encoded data URL)
-            image_data = None
+            # Try to extract images (favicon and thumbnail)
+            favicon_data = None
+            thumbnail_data = None
+            
             try:
-                # Priority: Look for the thumbnail image with specific ID pattern or attribute
-                # This avoids picking up the favicon (which is usually just a plain img or has different classes)
-                img_element = await result_div.query_selector('img[id^="dimg_"]')
+                # Find all images in the result div
+                images = await result_div.query_selector_all('img')
                 
-                if not img_element:
-                    img_element = await result_div.query_selector('img[data-csiid]')
-
-                if img_element:
-                    src = await img_element.get_attribute('src')
+                valid_images = []
+                for img in images:
+                    src = await img.get_attribute('src')
                     if src and src.startswith('data:image/'):
-                        image_data = src
+                        valid_images.append(src)
+                
+                if valid_images:
+                    # First image is favicon
+                    favicon_data = valid_images[0]
+                    
+                    # Second image (if exists) is thumbnail
+                    if len(valid_images) > 1:
+                        thumbnail_data = valid_images[1]
+                        
             except Exception:
                 pass  # Skip if image extraction fails
+
+            # Extract rating metadata
+            rating_metadata = await _extract_rating(result_div)
+            
+            # Construct metadata object if we have rating or thumbnail
+            metadata = None
+            if rating_metadata or thumbnail_data:
+                metadata = SearchMetadata(
+                    rating=rating_metadata,
+                    thumbnail=thumbnail_data
+                )
 
             results.append(SearchResult(
                 link=href,
                 title=title,
                 snippet=snippet,
-                image=image_data
+                favicon=favicon_data,
+                metadata=metadata
             ))
                     
         except Exception:

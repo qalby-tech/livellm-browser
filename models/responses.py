@@ -5,11 +5,23 @@ class PingResponse(BaseModel):
     status: Literal["ok", "error"] = Field("ok", description="The status of the API")
     message: str = Field("Controller API is running", description="A message describing the status")
 
+class RatingMetadata(BaseModel):
+    rating: Optional[float] = Field(None, description="Rating value (e.g. 4.9)")
+    reviews: Optional[int] = Field(None, description="Number of reviews (e.g. 34)")
+    description: Optional[str] = Field(None, description="Full rating description string")
+
+
+class SearchMetadata(BaseModel):
+    rating: Optional[RatingMetadata] = Field(default=None, description="Rating information")
+    thumbnail: Optional[str] = Field(default=None, description="Base64-encoded thumbnail image data URL")
+
+
 class SearchResult(BaseModel):
     link: str = Field(..., description="URL of the search result")
     title: str = Field(..., description="Title of the search result page")
     snippet: str = Field(..., description="A brief description or snippet from the search result page")
-    image: Optional[str] = Field(default=None, description="Base64-encoded thumbnail image data URL if available")
+    favicon: Optional[str] = Field(default=None, description="Base64-encoded favicon image data URL if available")
+    metadata: Optional[SearchMetadata] = Field(default=None, description="Additional metadata like rating and thumbnail")
 
 
 class ActionResult(BaseModel):

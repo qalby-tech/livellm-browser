@@ -8,6 +8,8 @@ from models.responses import (
     SearchResult,
     SearchMetadata,
     RatingMetadata,
+    WikiResult,
+    SearchResponse,
     SelectorResult,
     ActionResult
 )
@@ -815,6 +817,70 @@ async def _extract_rating(result_div: ElementHandle) -> Optional[RatingMetadata]
         return None
 
 
+async def _extract_wiki(page: Page) -> Optional[WikiResult]:
+    """
+    Extract wiki result from the search page.
+    Looks for div[data-spe] and extracts text and links from child div[data-rpos].
+    """
+    try:
+        # Look for the wiki container
+        wiki_div = await page.query_selector('div[data-spe]')
+        if not wiki_div:
+            return None
+        
+        # Find all child divs with data-rpos
+        rpos_divs = await wiki_div.query_selector_all('div[data-rpos]')
+        
+        descriptions = []
+        raw_links = []
+        
+        for div in rpos_divs:
+            # Extract text
+            text = await div.inner_text()
+            if text:
+                descriptions.append(text.strip())
+            
+            # Extract links
+            anchors = await div.query_selector_all('a')
+            for a in anchors:
+                href = await a.get_attribute('href')
+                if href and href != '#':  # Filter out empty/hash links
+                    raw_links.append(href)
+                    
+        if not descriptions and not raw_links:
+            return None
+            
+        # Deduplicate links while preserving order
+        seen_links = set()
+        unique_links = []
+        for link in raw_links:
+            if link not in seen_links:
+                seen_links.add(link)
+                unique_links.append(link)
+        
+        # Categorize links
+        wiki_links = []
+        related_links = []
+        misc_links = []
+        
+        for link in unique_links:
+            if 'wikipedia.org' in link:
+                wiki_links.append(link)
+            elif link.startswith('/search'):
+                related_links.append(f"https://www.google.com{link}")
+            else:
+                misc_links.append(link)
+            
+        return WikiResult(
+            desc="\n".join(descriptions),
+            wiki_links=wiki_links,
+            related_links=related_links,
+            misc_links=misc_links
+        )
+    except Exception:
+        return None
+
+
 async def _parse_search_results(page: Page, results: List[SearchResult], seen_links: set, count: int) -> List[SearchResult]:
     """
     Parse search results from the current Google search page.
@@ -915,16 +981,16 @@ async def _parse_search_results(page: Page, results: List[SearchResult], seen_li
 
 
 @app.post("/search")
-async def search(request: SearchRequest, page: PageDep) -> List[SearchResult]:
+async def search(request: SearchRequest, page: PageDep) -> SearchResponse:
     """
-    Search the web using Google and return search results
+    Search the web using Google and return search results with optional wiki data
     
     Args:
         request: SearchRequest with query string and count of results
         page: Page object automatically managed by session (via X-Session-Id header)
         
     Returns:
-        List[SearchResult]: Array of search results with link, title, and snippet
+        SearchResponse: Object containing optional wiki result and list of search results
     """
     try:
         await page.goto(f"https://www.google.com/search?q={request.query}&num={request.count}", wait_until="commit")
@@ -932,6 +998,9 @@ async def search(request: SearchRequest, page: PageDep) -> List[SearchResult]:
 
         results = []
         seen_links = set()  # Track seen links to avoid duplicates across pages
+        
+        # Extract wiki result (only on first page)
+        wiki_result = await _extract_wiki(page)
         
         # Parse initial results
         results = await _parse_search_results(page, results, seen_links, request.count)
@@ -976,7 +1045,10 @@ async def search(request: SearchRequest, page: PageDep) -> List[SearchResult]:
             
             logger.info(f"Page {current_page}: collected {len(results)}/{request.count} results")
         
-        return results
+        return SearchResponse(
+            wiki=wiki_result,
+            results=results
+        )
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to search: {str(e)}")

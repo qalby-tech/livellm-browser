@@ -24,6 +24,18 @@ class SearchResult(BaseModel):
     metadata: Optional[SearchMetadata] = Field(default=None, description="Additional metadata like rating and thumbnail")
 
 
+class WikiResult(BaseModel):
+    desc: str = Field(..., description="Combined text description from wiki result")
+    wiki_links: List[str] = Field(default_factory=list, description="List of wikipedia links")
+    related_links: List[str] = Field(default_factory=list, description="List of related search links (starting with /search)")
+    misc_links: List[str] = Field(default_factory=list, description="List of other miscellaneous links")
+
+
+class SearchResponse(BaseModel):
+    wiki: Optional[WikiResult] = Field(default=None, description="Wiki result if found")
+    results: List[SearchResult] = Field(..., description="List of search results")
+
+
 class ActionResult(BaseModel):
     """Result of a single action performed on selector elements"""
     action: str = Field(..., description="The action that was performed (html, text, click, fill, attribute)")

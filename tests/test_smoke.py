@@ -1,7 +1,6 @@
 """
 Smoke tests for livellm-browser FastAPI controller.
 
-These tests verify basic functionality without requiring a real browser.
 Run with: uv run pytest tests/ -v
 """
 import pytest
@@ -12,17 +11,12 @@ class TestHealthEndpoint:
     """Tests for the /ping health check endpoint."""
 
     def test_ping_returns_200(self, client: TestClient):
-        """Verify ping endpoint returns 200 OK."""
         response = client.get("/ping")
         assert response.status_code == 200
 
     def test_ping_response_structure(self, client: TestClient):
-        """Verify ping response has correct structure."""
         response = client.get("/ping")
         data = response.json()
-        
-        assert "status" in data
-        assert "message" in data
         assert data["status"] == "ok"
         assert "running" in data["message"].lower()
 
@@ -31,47 +25,36 @@ class TestSessionManagement:
     """Tests for session creation and deletion."""
 
     def test_start_session_returns_200(self, client: TestClient):
-        """Verify start_session endpoint returns 200 OK."""
         response = client.post("/start_session")
         assert response.status_code == 200
 
     def test_start_session_returns_session_id(self, client: TestClient):
-        """Verify start_session returns a valid session ID."""
         response = client.post("/start_session")
         data = response.json()
-        
         assert "session_id" in data
-        assert data["session_id"] is not None
         assert len(data["session_id"]) > 0
-        # UUID format check (basic)
         assert "-" in data["session_id"]
 
     def test_end_session_without_header_returns_400(self, client: TestClient):
-        """Verify end_session requires X-Session-Id header."""
         response = client.delete("/end_session")
         assert response.status_code == 400
 
     def test_end_session_with_invalid_session(self, client: TestClient):
-        """Verify end_session handles non-existent sessions gracefully."""
         response = client.delete(
             "/end_session",
-            headers={"X-Session-Id": "non-existent-session-id"}
+            headers={"X-Session-Id": "non-existent-session-id"},
         )
         assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "success"
+        assert response.json()["status"] == "success"
 
     def test_full_session_lifecycle(self, client: TestClient):
-        """Test complete session creation and deletion flow."""
-        # Create session
         start_response = client.post("/start_session")
         assert start_response.status_code == 200
         session_id = start_response.json()["session_id"]
-        
-        # End session
+
         end_response = client.delete(
             "/end_session",
-            headers={"X-Session-Id": session_id}
+            headers={"X-Session-Id": session_id},
         )
         assert end_response.status_code == 200
 
@@ -80,21 +63,52 @@ class TestContentEndpoint:
     """Tests for the /content endpoint."""
 
     def test_content_works_without_url(self, client: TestClient):
-        """Verify content endpoint works without URL (uses current page)."""
-        response = client.post("/content", json={})
+        response = client.post("/content", json={"steps": 0})
         assert response.status_code == 200
 
     def test_content_with_valid_url(self, client: TestClient):
-        """Verify content endpoint accepts valid URL."""
-        response = client.post("/content", json={"url": "https://example.com"})
-        # Should succeed with mocked browser
+        response = client.post("/content", json={"url": "https://example.com", "steps": 0})
         assert response.status_code == 200
 
-    def test_content_return_html_flag(self, client: TestClient):
-        """Verify content endpoint respects return_html flag."""
+    def test_content_default_output_is_text(self, client: TestClient):
+        response = client.post("/content", json={"steps": 0})
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "text/plain; charset=utf-8"
+
+    def test_content_output_html(self, client: TestClient):
         response = client.post(
             "/content",
-            json={"url": "https://example.com", "return_html": False}
+            json={"url": "https://example.com", "output_action": "html", "steps": 0},
+        )
+        assert response.status_code == 200
+        assert "text/html" in response.headers["content-type"]
+
+    def test_content_output_screenshot(self, client: TestClient):
+        response = client.post(
+            "/content",
+            json={"url": "https://example.com", "output_action": "screenshot", "steps": 0},
+        )
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/png"
+
+    def test_content_output_screenshot_full(self, client: TestClient):
+        response = client.post(
+            "/content",
+            json={"url": "https://example.com", "output_action": "screenshot_full", "steps": 0},
+        )
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/png"
+
+    def test_content_with_scroll_steps(self, client: TestClient):
+        """Verify content endpoint accepts scroll parameters."""
+        response = client.post(
+            "/content",
+            json={
+                "url": "https://example.com",
+                "steps": 2,
+                "step_delay": 0.01,
+                "step_pixels": 500,
+            },
         )
         assert response.status_code == 200
 
@@ -103,106 +117,216 @@ class TestSearchEndpoint:
     """Tests for the /search endpoint."""
 
     def test_search_requires_query(self, client: TestClient):
-        """Verify search endpoint requires query parameter."""
         response = client.post("/search", json={})
-        assert response.status_code == 422  # Validation error
+        assert response.status_code == 422
 
     def test_search_with_valid_query(self, client: TestClient):
-        """Verify search endpoint accepts valid query."""
         response = client.post("/search", json={"query": "test search"})
         assert response.status_code == 200
-        assert isinstance(response.json(), list)
+        data = response.json()
+        assert "results" in data
 
     def test_search_with_count_parameter(self, client: TestClient):
-        """Verify search endpoint accepts count parameter."""
+        response = client.post("/search", json={"query": "test search", "count": 10})
+        assert response.status_code == 200
+
+    def test_search_with_idle_parameter(self, client: TestClient):
+        response = client.post("/search", json={"query": "test", "idle": 0.1})
+        assert response.status_code == 200
+
+    def test_search_with_max_pages_parameter(self, client: TestClient):
+        response = client.post("/search", json={"query": "test", "max_pages": 3})
+        assert response.status_code == 200
+
+
+class TestSelectorAction:
+    """Tests for the selector action inside /interact."""
+
+    def test_selector_click(self, client: TestClient):
         response = client.post(
-            "/search",
-            json={"query": "test search", "count": 10}
+            "/interact",
+            json={
+                "actions": [
+                    {"action": "selector", "type": "css", "value": "button", "do": "click"},
+                ],
+            },
         )
         assert response.status_code == 200
 
-
-class TestSelectorsEndpoint:
-    """Tests for the /selectors endpoint."""
-
-    def test_selectors_works_without_url(self, client: TestClient):
-        """Verify selectors endpoint works without URL (uses current page)."""
-        response = client.post("/selectors", json={"selectors": []})
+    def test_selector_click_with_args(self, client: TestClient):
+        response = client.post(
+            "/interact",
+            json={
+                "actions": [
+                    {"action": "selector", "value": "button", "do": "click", "args": {"nth": -1}},
+                ],
+            },
+        )
         assert response.status_code == 200
 
-    def test_selectors_requires_selectors_list(self, client: TestClient):
-        """Verify selectors endpoint requires selectors list."""
-        response = client.post("/selectors", json={"url": "https://example.com"})
-        assert response.status_code == 422  # Validation error
-
-    def test_selectors_with_valid_request(self, client: TestClient):
-        """Verify selectors endpoint works with valid request."""
+    def test_selector_fill(self, client: TestClient):
         response = client.post(
-            "/selectors",
+            "/interact",
+            json={
+                "actions": [
+                    {"action": "selector", "type": "css", "value": "input", "do": "fill", "args": {"value": "hello"}},
+                ],
+            },
+        )
+        assert response.status_code == 200
+
+    def test_selector_fill_requires_value(self, client: TestClient):
+        """FillArgs requires 'value' field."""
+        response = client.post(
+            "/interact",
+            json={
+                "actions": [
+                    {"action": "selector", "value": "input", "do": "fill", "args": {}},
+                ],
+            },
+        )
+        assert response.status_code == 422
+
+    def test_selector_fill_wrong_args_type(self, client: TestClient):
+        """fill action must use FillArgs, not ClickArgs."""
+        response = client.post(
+            "/interact",
+            json={
+                "actions": [
+                    {"action": "selector", "value": "input", "do": "fill", "args": {"nth": 0}},
+                ],
+            },
+        )
+        assert response.status_code == 422
+
+    def test_selector_remove(self, client: TestClient):
+        response = client.post(
+            "/interact",
+            json={
+                "actions": [
+                    {"action": "selector", "type": "css", "value": ".ad", "do": "remove", "args": {"nth": None}},
+                ],
+                "output_action": "text",
+            },
+        )
+        assert response.status_code == 200
+        assert "text/plain" in response.headers["content-type"]
+
+    def test_selector_with_xpath(self, client: TestClient):
+        response = client.post(
+            "/interact",
+            json={
+                "actions": [
+                    {"action": "selector", "type": "xml", "value": "//button", "do": "click"},
+                ],
+            },
+        )
+        assert response.status_code == 200
+
+    def test_selector_requires_do(self, client: TestClient):
+        """'do' field is required."""
+        response = client.post(
+            "/interact",
+            json={
+                "actions": [
+                    {"action": "selector", "type": "css", "value": "h1"},
+                ],
+            },
+        )
+        assert response.status_code == 422
+
+    def test_selector_invalid_do(self, client: TestClient):
+        """Only click, fill, remove are valid 'do' values."""
+        response = client.post(
+            "/interact",
+            json={
+                "actions": [
+                    {"action": "selector", "type": "css", "value": "h1", "do": "html"},
+                ],
+            },
+        )
+        assert response.status_code == 422
+
+    def test_selector_mixed_with_other_actions(self, client: TestClient):
+        """Selector can be mixed with other interact actions."""
+        response = client.post(
+            "/interact",
             json={
                 "url": "https://example.com",
-                "selectors": [
-                    {"name": "title", "type": "css", "value": "h1"}
-                ]
-            }
+                "actions": [
+                    {"action": "selector", "type": "css", "value": ".ad", "do": "remove", "args": {"nth": None}},
+                    {"action": "idle", "duration": 0.01},
+                ],
+                "output_action": "html",
+            },
         )
         assert response.status_code == 200
-        data = response.json()
-        assert isinstance(data, list)
-        assert len(data) == 1
-        assert data[0]["name"] == "title"
+        assert "text/html" in response.headers["content-type"]
 
-    def test_selectors_with_xpath(self, client: TestClient):
-        """Verify selectors endpoint supports XPath selectors."""
+    def test_selector_default_type_is_css(self, client: TestClient):
+        """Type defaults to 'css' if not provided."""
         response = client.post(
-            "/selectors",
+            "/interact",
             json={
-                "url": "https://example.com",
-                "selectors": [
-                    {"name": "heading", "type": "xml", "value": "//h1"}
-                ]
-            }
+                "actions": [
+                    {"action": "selector", "value": "button", "do": "click"},
+                ],
+            },
         )
         assert response.status_code == 200
+
+    def test_selector_output_action_controls_response(self, client: TestClient):
+        """Selector actions are side effects; output_action controls the response."""
+        response = client.post(
+            "/interact",
+            json={
+                "actions": [
+                    {"action": "selector", "type": "css", "value": ".ad", "do": "remove", "args": {"nth": None}},
+                ],
+                "output_action": "screenshot",
+            },
+        )
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/png"
 
 
 class TestRequestValidation:
     """Tests for Pydantic model validation."""
 
     def test_search_request_default_count(self, client: TestClient):
-        """Verify SearchRequest uses default count of 5."""
         response = client.post("/search", json={"query": "test"})
         assert response.status_code == 200
 
     def test_content_request_wait_until_options(self, client: TestClient):
-        """Verify GetHtmlRequest accepts valid wait_until values."""
-        valid_options = ["commit", "domcontentloaded", "load", "networkidle"]
-        
-        for option in valid_options:
+        for option in ("commit", "domcontentloaded", "load", "networkidle"):
             response = client.post(
                 "/content",
-                json={"url": "https://example.com", "wait_until": option}
+                json={"url": "https://example.com", "wait_until": option, "steps": 0},
             )
             assert response.status_code == 200, f"Failed for wait_until={option}"
 
     def test_content_request_invalid_wait_until(self, client: TestClient):
-        """Verify GetHtmlRequest rejects invalid wait_until value."""
         response = client.post(
             "/content",
-            json={"url": "https://example.com", "wait_until": "invalid"}
+            json={"url": "https://example.com", "wait_until": "invalid"},
+        )
+        assert response.status_code == 422
+
+    def test_content_request_invalid_output_action(self, client: TestClient):
+        response = client.post(
+            "/content",
+            json={"url": "https://example.com", "output_action": "invalid"},
         )
         assert response.status_code == 422
 
     def test_selector_type_validation(self, client: TestClient):
-        """Verify Selector rejects invalid type."""
         response = client.post(
-            "/selectors",
+            "/interact",
             json={
-                "url": "https://example.com",
-                "selectors": [
-                    {"name": "test", "type": "invalid", "value": "div"}
-                ]
-            }
+                "actions": [
+                    {"action": "selector", "type": "invalid", "value": "div", "do": "click"},
+                ],
+            },
         )
         assert response.status_code == 422
 
@@ -211,21 +335,17 @@ class TestOpenAPISchema:
     """Tests for API documentation and schema."""
 
     def test_openapi_schema_available(self, client: TestClient):
-        """Verify OpenAPI schema is accessible."""
         response = client.get("/openapi.json")
         assert response.status_code == 200
-        
         schema = response.json()
         assert schema["info"]["title"] == "Controller API"
-        assert schema["info"]["version"] == "0.2.0"
+        assert schema["info"]["version"] == "0.3.0"
 
     def test_docs_endpoint_available(self, client: TestClient):
-        """Verify Swagger UI docs are accessible."""
         response = client.get("/docs")
         assert response.status_code == 200
 
     def test_redoc_endpoint_available(self, client: TestClient):
-        """Verify ReDoc docs are accessible."""
         response = client.get("/redoc")
         assert response.status_code == 200
 
@@ -234,21 +354,17 @@ class TestSessionIdHeader:
     """Tests for X-Session-Id header handling."""
 
     def test_content_creates_session_without_header(self, client: TestClient):
-        """Verify endpoints create session when no X-Session-Id provided."""
-        response = client.post("/content", json={"url": "https://example.com"})
+        response = client.post("/content", json={"url": "https://example.com", "steps": 0})
         assert response.status_code == 200
 
     def test_content_with_session_id_header(self, client: TestClient):
-        """Verify endpoints accept X-Session-Id header."""
-        # First create a session
         session_response = client.post("/start_session")
         session_id = session_response.json()["session_id"]
-        
-        # Use the session
+
         response = client.post(
             "/content",
-            json={"url": "https://example.com"},
-            headers={"X-Session-Id": session_id}
+            json={"url": "https://example.com", "steps": 0},
+            headers={"X-Session-Id": session_id},
         )
         assert response.status_code == 200
 
@@ -256,142 +372,113 @@ class TestSessionIdHeader:
 class TestInteractEndpoint:
     """Tests for the /interact endpoint."""
 
-    def test_interact_requires_actions(self, client: TestClient):
-        """Verify interact endpoint requires actions list."""
+    def test_interact_with_empty_body_returns_text(self, client: TestClient):
+        """Empty body should use defaults: no actions, output_action=text."""
         response = client.post("/interact", json={})
-        assert response.status_code == 422  # Validation error
+        assert response.status_code == 200
+        assert "text/plain" in response.headers["content-type"]
 
-    def test_interact_with_screenshot_action(self, client: TestClient):
-        """Verify interact endpoint accepts screenshot action."""
-        response = client.post(
-            "/interact",
-            json={"actions": [{"action": "screenshot"}]}
-        )
+    def test_interact_with_empty_actions(self, client: TestClient):
+        response = client.post("/interact", json={"actions": []})
         assert response.status_code == 200
 
-    def test_interact_with_scroll_action(self, client: TestClient):
-        """Verify interact endpoint accepts scroll action."""
+    def test_interact_output_text(self, client: TestClient):
+        response = client.post("/interact", json={"output_action": "text"})
+        assert response.status_code == 200
+        assert "text/plain" in response.headers["content-type"]
+
+    def test_interact_output_html(self, client: TestClient):
+        response = client.post("/interact", json={"output_action": "html"})
+        assert response.status_code == 200
+        assert "text/html" in response.headers["content-type"]
+
+    def test_interact_output_screenshot(self, client: TestClient):
+        response = client.post("/interact", json={"output_action": "screenshot"})
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/png"
+
+    def test_interact_output_screenshot_full(self, client: TestClient):
         response = client.post(
             "/interact",
-            json={"actions": [{"action": "scroll", "x": 0, "y": 500}]}
+            json={"output_action": "screenshot_full"},
         )
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/png"
+
+    def test_interact_with_scroll_action(self, client: TestClient):
+        response = client.post("/interact", json={"actions": [{"action": "scroll", "x": 0, "y": 500}]})
         assert response.status_code == 200
 
     def test_interact_with_idle_action(self, client: TestClient):
-        """Verify interact endpoint accepts idle action."""
-        response = client.post(
-            "/interact",
-            json={"actions": [{"action": "idle", "duration": 0.1}]}
-        )
-        assert response.status_code == 200
-
-    def test_interact_with_html_action(self, client: TestClient):
-        """Verify interact endpoint accepts html action."""
-        response = client.post(
-            "/interact",
-            json={"actions": [{"action": "html"}]}
-        )
-        assert response.status_code == 200
-
-    def test_interact_with_text_action(self, client: TestClient):
-        """Verify interact endpoint accepts text action."""
-        response = client.post(
-            "/interact",
-            json={"actions": [{"action": "text"}]}
-        )
+        response = client.post("/interact", json={"actions": [{"action": "idle", "duration": 0.1}]})
         assert response.status_code == 200
 
     def test_interact_with_login_action(self, client: TestClient):
-        """Verify interact endpoint accepts login action for HTTP Basic Auth."""
         response = client.post(
             "/interact",
-            json={
-                "actions": [
-                    {"action": "login", "username": "testuser", "password": "testpass"}
-                ]
-            }
+            json={"actions": [{"action": "login", "username": "testuser", "password": "testpass"}]},
         )
         assert response.status_code == 200
-        data = response.json()
-        assert "actions" in data
-        assert any("http credentials" in action.lower() for action in data["actions"])
 
     def test_interact_login_with_empty_credentials_clears_auth(self, client: TestClient):
-        """Verify login action with empty credentials clears auth."""
         response = client.post(
             "/interact",
-            json={
-                "actions": [
-                    {"action": "login", "username": "", "password": ""}
-                ]
-            }
+            json={"actions": [{"action": "login", "username": "", "password": ""}]},
         )
         assert response.status_code == 200
-        data = response.json()
-        assert "actions" in data
-        assert any("cleared" in action.lower() for action in data["actions"])
 
     def test_interact_with_multiple_actions(self, client: TestClient):
-        """Verify interact endpoint handles multiple actions."""
         response = client.post(
             "/interact",
             json={
                 "actions": [
                     {"action": "login", "username": "admin", "password": "secret"},
                     {"action": "idle", "duration": 0.1},
-                    {"action": "html"}
-                ]
-            }
+                ],
+                "output_action": "html",
+            },
         )
         assert response.status_code == 200
+        assert "text/html" in response.headers["content-type"]
 
     def test_interact_with_url_navigation(self, client: TestClient):
-        """Verify interact endpoint navigates to URL when provided."""
         response = client.post(
             "/interact",
-            json={
-                "url": "https://example.com",
-                "actions": [{"action": "html"}]
-            }
+            json={"url": "https://example.com", "output_action": "html"},
         )
         assert response.status_code == 200
 
     def test_interact_login_requires_username(self, client: TestClient):
-        """Verify login action requires username field."""
         response = client.post(
             "/interact",
-            json={
-                "actions": [
-                    {"action": "login", "password": "testpass"}
-                ]
-            }
+            json={"actions": [{"action": "login", "password": "testpass"}]},
         )
-        assert response.status_code == 422  # Validation error
+        assert response.status_code == 422
 
     def test_interact_login_requires_password(self, client: TestClient):
-        """Verify login action requires password field."""
         response = client.post(
             "/interact",
-            json={
-                "actions": [
-                    {"action": "login", "username": "testuser"}
-                ]
-            }
+            json={"actions": [{"action": "login", "username": "testuser"}]},
         )
-        assert response.status_code == 422  # Validation error
+        assert response.status_code == 422
+
+    def test_interact_invalid_output_action(self, client: TestClient):
+        response = client.post(
+            "/interact",
+            json={"output_action": "invalid"},
+        )
+        assert response.status_code == 422
 
 
 class TestBrowserManagement:
     """Tests for browser management endpoints."""
 
     def test_list_browsers(self, client: TestClient):
-        """Verify list browsers endpoint returns 200."""
         response = client.get("/browsers")
         assert response.status_code == 200
         assert isinstance(response.json(), list)
 
     def test_create_browser_without_params(self, client: TestClient):
-        """Verify create browser works without parameters."""
         response = client.post("/browsers", json={})
         assert response.status_code == 200
         data = response.json()
@@ -399,70 +486,45 @@ class TestBrowserManagement:
         assert "profile_path" in data
 
     def test_create_browser_with_profile_uid(self, client: TestClient):
-        """Verify create browser accepts profile_uid."""
-        response = client.post(
-            "/browsers",
-            json={"profile_uid": "test-profile-uid"}
-        )
+        response = client.post("/browsers", json={"profile_uid": "test-profile-uid"})
         assert response.status_code == 200
-        data = response.json()
-        assert data["browser_id"] == "test-profile-uid"
+        assert response.json()["browser_id"] == "test-profile-uid"
 
     def test_create_browser_with_proxy(self, client: TestClient):
-        """Verify create browser accepts proxy settings."""
         response = client.post(
             "/browsers",
-            json={
-                "proxy": {
-                    "server": "http://proxy.example.com:8080"
-                }
-            }
+            json={"proxy": {"server": "http://proxy.example.com:8080"}},
         )
         assert response.status_code == 200
-        data = response.json()
-        assert "browser_id" in data
 
     def test_create_browser_with_proxy_auth(self, client: TestClient):
-        """Verify create browser accepts proxy with authentication."""
         response = client.post(
             "/browsers",
             json={
                 "proxy": {
                     "server": "http://proxy.example.com:8080",
                     "username": "proxyuser",
-                    "password": "proxypass"
-                }
-            }
+                    "password": "proxypass",
+                },
+            },
         )
         assert response.status_code == 200
 
     def test_create_browser_with_proxy_bypass(self, client: TestClient):
-        """Verify create browser accepts proxy with bypass list."""
         response = client.post(
             "/browsers",
-            json={
-                "proxy": {
-                    "server": "http://proxy.example.com:8080",
-                    "bypass": "localhost,*.local,192.168.*"
-                }
-            }
+            json={"proxy": {"server": "http://proxy.example.com:8080", "bypass": "localhost,*.local,192.168.*"}},
         )
         assert response.status_code == 200
 
     def test_create_browser_with_socks_proxy(self, client: TestClient):
-        """Verify create browser accepts SOCKS proxy."""
         response = client.post(
             "/browsers",
-            json={
-                "proxy": {
-                    "server": "socks5://127.0.0.1:1080"
-                }
-            }
+            json={"proxy": {"server": "socks5://127.0.0.1:1080"}},
         )
         assert response.status_code == 200
 
     def test_create_browser_with_all_proxy_options(self, client: TestClient):
-        """Verify create browser accepts all proxy options together."""
         response = client.post(
             "/browsers",
             json={
@@ -471,23 +533,194 @@ class TestBrowserManagement:
                     "server": "http://proxy.example.com:8080",
                     "username": "user",
                     "password": "pass",
-                    "bypass": "localhost,*.internal.com"
-                }
-            }
+                    "bypass": "localhost,*.internal.com",
+                },
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["browser_id"] == "proxied-browser-uid"
+
+    def test_proxy_requires_server(self, client: TestClient):
+        response = client.post(
+            "/browsers",
+            json={"proxy": {"username": "user", "password": "pass"}},
+        )
+        assert response.status_code == 422
+
+
+class TestAttributeEndpoint:
+    """Tests for the /attribute endpoint."""
+
+    def test_attribute_requires_selectors(self, client: TestClient):
+        """selectors field is required."""
+        response = client.post("/attribute", json={})
+        assert response.status_code == 422
+
+    def test_attribute_requires_at_least_one_selector(self, client: TestClient):
+        """selectors list must not be empty."""
+        response = client.post("/attribute", json={"selectors": []})
+        assert response.status_code == 422
+
+    def test_attribute_css_text_extraction(self, client: TestClient):
+        """Extract text content from CSS selector."""
+        response = client.post(
+            "/attribute",
+            json={
+                "url": "https://example.com",
+                "steps": 0,
+                "selectors": [
+                    {"name": "headings", "selector": "h1"},
+                ],
+            },
         )
         assert response.status_code == 200
         data = response.json()
-        assert data["browser_id"] == "proxied-browser-uid"
+        assert isinstance(data, list)
+        assert len(data) == 1
+        assert data[0]["name"] == "headings"
+        assert isinstance(data[0]["values"], list)
 
-    def test_proxy_requires_server(self, client: TestClient):
-        """Verify proxy settings require server field."""
+    def test_attribute_css_attribute_extraction(self, client: TestClient):
+        """Extract attribute values from CSS selector."""
         response = client.post(
-            "/browsers",
+            "/attribute",
             json={
-                "proxy": {
-                    "username": "user",
-                    "password": "pass"
-                }
-            }
+                "url": "https://example.com",
+                "steps": 0,
+                "selectors": [
+                    {"name": "links", "selector": "a", "attribute": "href"},
+                ],
+            },
         )
-        assert response.status_code == 422  # Validation error
+        assert response.status_code == 200
+        data = response.json()
+        assert data[0]["name"] == "links"
+
+    def test_attribute_xpath_extraction(self, client: TestClient):
+        """XPath selectors use lxml."""
+        response = client.post(
+            "/attribute",
+            json={
+                "url": "https://example.com",
+                "steps": 0,
+                "selectors": [
+                    {"name": "title", "selector": "//h1", "type": "xpath"},
+                ],
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data[0]["name"] == "title"
+
+    def test_attribute_multiple_selectors(self, client: TestClient):
+        """Multiple selectors return multiple result groups."""
+        response = client.post(
+            "/attribute",
+            json={
+                "steps": 0,
+                "selectors": [
+                    {"name": "headings", "selector": "h1"},
+                    {"name": "links", "selector": "a", "attribute": "href"},
+                ],
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 2
+        assert data[0]["name"] == "headings"
+        assert data[1]["name"] == "links"
+
+    def test_attribute_without_url(self, client: TestClient):
+        """Works on current page when no url is provided."""
+        response = client.post(
+            "/attribute",
+            json={
+                "steps": 0,
+                "selectors": [{"name": "body", "selector": "body"}],
+            },
+        )
+        assert response.status_code == 200
+
+    def test_attribute_with_scroll(self, client: TestClient):
+        """Accepts scroll parameters."""
+        response = client.post(
+            "/attribute",
+            json={
+                "url": "https://example.com",
+                "steps": 2,
+                "step_delay": 0.01,
+                "step_pixels": 500,
+                "selectors": [{"name": "body", "selector": "body"}],
+            },
+        )
+        assert response.status_code == 200
+
+    def test_attribute_default_type_is_css(self, client: TestClient):
+        """type defaults to 'css'."""
+        response = client.post(
+            "/attribute",
+            json={
+                "steps": 0,
+                "selectors": [{"name": "all_divs", "selector": "div"}],
+            },
+        )
+        assert response.status_code == 200
+
+
+class TestBsHelpers:
+    """Unit tests for the BS4/lxml extraction helpers."""
+
+    def test_css_text_extraction(self):
+        from helpers.bs import _extract_css
+        html = "<html><body><h1>Hello</h1><h1>World</h1></body></html>"
+        result = _extract_css(html, "h1", None)
+        assert result == ["Hello", "World"]
+
+    def test_css_attribute_extraction(self):
+        from helpers.bs import _extract_css
+        html = '<html><body><a href="/a">A</a><a href="/b">B</a></body></html>'
+        result = _extract_css(html, "a", "href")
+        assert result == ["/a", "/b"]
+
+    def test_css_missing_attribute(self):
+        from helpers.bs import _extract_css
+        html = '<html><body><a>No href</a></body></html>'
+        result = _extract_css(html, "a", "href")
+        assert result == []
+
+    def test_xpath_text_extraction(self):
+        from helpers.bs import _extract_xpath
+        html = "<html><body><h1>Hello</h1></body></html>"
+        result = _extract_xpath(html, "//h1", None)
+        assert result == ["Hello"]
+
+    def test_xpath_attribute_extraction(self):
+        from helpers.bs import _extract_xpath
+        html = '<html><body><a href="/a">A</a><a href="/b">B</a></body></html>'
+        result = _extract_xpath(html, "//a", "href")
+        assert result == ["/a", "/b"]
+
+    def test_xpath_direct_attribute(self):
+        """XPath can return attribute values directly with @attr."""
+        from helpers.bs import _extract_xpath
+        html = '<html><body><a href="/a">A</a><a href="/b">B</a></body></html>'
+        result = _extract_xpath(html, "//a/@href", None)
+        assert result == ["/a", "/b"]
+
+    def test_css_empty_text_filtered(self):
+        from helpers.bs import _extract_css
+        html = "<html><body><span></span><span>Hello</span></body></html>"
+        result = _extract_css(html, "span", None)
+        assert result == ["Hello"]
+
+    def test_extract_all_sync(self):
+        from helpers.bs import _extract_all_sync
+        html = '<html><body><h1>Title</h1><a href="/link">Link</a></body></html>'
+        selectors = [
+            {"name": "heading", "selector": "h1", "type": "css", "attribute": None},
+            {"name": "urls", "selector": "a", "type": "css", "attribute": "href"},
+        ]
+        result = _extract_all_sync(html, selectors)
+        assert len(result) == 2
+        assert result[0] == {"name": "heading", "values": ["Title"]}
+        assert result[1] == {"name": "urls", "values": ["/link"]}

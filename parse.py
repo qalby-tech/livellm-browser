@@ -154,7 +154,7 @@ class Crawler:
     async def get_page_links(self, url: str) -> Set[str]:
         """Extract all same-domain links from a page using scroll + HTML parsing.
         
-        This is much faster than using /selectors because:
+        This is much faster than using selector actions because:
         1. Getting HTML is a single operation
         2. BeautifulSoup parsing is in-process and extremely fast
         3. No iterating through elements one-by-one via Playwright
@@ -171,10 +171,8 @@ class Crawler:
                     "step_delay": 1,
                     "timeout": 5  # Quick scroll, just to trigger lazy-loaded content
                 },
-                {
-                    "action": "html"
-                }
             ],
+            "output_action": "html",
             "wait_until": "commit",
             "timeout": 30000
         }
@@ -252,10 +250,8 @@ class Crawler:
                     "step_delay": 1.5,
                     "timeout": 10
                 },
-                {
-                    "action": "text"
-                }
-            ]
+            ],
+            "output_action": "text",
         }
 
         text_content = ""

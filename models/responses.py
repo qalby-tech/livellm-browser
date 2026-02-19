@@ -1,59 +1,44 @@
 from pydantic import BaseModel, Field
-from typing import Literal, List, Any, Optional
+from typing import Literal, List, Optional
+
 
 class PingResponse(BaseModel):
-    status: Literal["ok", "error"] = Field("ok", description="The status of the API")
-    message: str = Field("Controller API is running", description="A message describing the status")
+    status: Literal["ok", "error"] = Field("ok", description="API status")
+    message: str = Field("Controller API is running", description="Status message")
+
+
+class BrowserResponse(BaseModel):
+    browser_id: str
+    profile_path: Optional[str]
+    session_count: int
+
 
 class RatingMetadata(BaseModel):
     rating: Optional[float] = Field(None, description="Rating value (e.g. 4.9)")
-    reviews: Optional[int] = Field(None, description="Number of reviews (e.g. 34)")
-    description: Optional[str] = Field(None, description="Full rating description string")
+    reviews: Optional[int] = Field(None, description="Number of reviews")
+    description: Optional[str] = Field(None, description="Full rating description")
 
 
 class SearchMetadata(BaseModel):
-    rating: Optional[RatingMetadata] = Field(default=None, description="Rating information")
-    thumbnail: Optional[str] = Field(default=None, description="Base64-encoded thumbnail image data URL")
+    rating: Optional[RatingMetadata] = None
+    thumbnail: Optional[str] = Field(None, description="Base64-encoded thumbnail data URL")
 
 
 class SearchResult(BaseModel):
-    link: str = Field(..., description="URL of the search result")
-    title: str = Field(..., description="Title of the search result page")
-    snippet: str = Field(..., description="A brief description or snippet from the search result page")
-    favicon: Optional[str] = Field(default=None, description="Base64-encoded favicon image data URL if available")
-    metadata: Optional[SearchMetadata] = Field(default=None, description="Additional metadata like rating and thumbnail")
+    link: str
+    title: str
+    snippet: str
+    favicon: Optional[str] = Field(None, description="Base64-encoded favicon data URL")
+    metadata: Optional[SearchMetadata] = None
 
 
 class WikiResult(BaseModel):
-    desc: str = Field(..., description="Combined text description from wiki result")
-    wiki_links: List[str] = Field(default_factory=list, description="List of wikipedia links")
-    related_links: List[str] = Field(default_factory=list, description="List of related search links (starting with /search)")
-    misc_links: List[str] = Field(default_factory=list, description="List of other miscellaneous links")
+    desc: str = Field(..., description="Combined text from wiki panel")
+    wiki_links: List[str] = Field(default_factory=list)
+    related_links: List[str] = Field(default_factory=list)
+    misc_links: List[str] = Field(default_factory=list)
 
 
 class SearchResponse(BaseModel):
-    wiki: Optional[WikiResult] = Field(default=None, description="Wiki result if found")
-    results: List[SearchResult] = Field(..., description="List of search results")
-
-
-class ActionResult(BaseModel):
-    """Result of a single action performed on selector elements"""
-    action: str = Field(..., description="The action that was performed (html, text, click, fill, attribute)")
-    values: List[str] = Field(..., description="List of results from the action")
-
-
-class SelectorResult(BaseModel):
-    """
-    Result of selector execution with action results.
-    
-    Example response:
-    {
-        "name": "links",
-        "results": [
-            {"action": "text", "values": ["Home", "About", "Contact"]},
-            {"action": "click", "values": ["clicked", "clicked", "clicked"]}
-        ]
-    }
-    """
-    name: str = Field(..., description="Unique identifier matching the selector name")
-    results: List[ActionResult] = Field(..., description="List of action results performed on the selector")
+    wiki: Optional[WikiResult] = None
+    results: List[SearchResult]

@@ -48,3 +48,15 @@ class SearchResponse(BaseModel):
     ai_review: Optional[AiReview] = None
     wiki: Optional[WikiResult] = None
     results: List[SearchResult]
+
+
+class NewsResult(BaseModel):
+    link: str
+    title: str
+    snippet: str
+    favicon: Optional[str] = Field(None, description="Base64-encoded favicon data URL")
+    thumbnail: Optional[str] = Field(None, description="Base64-encoded thumbnail data URL")
+
+
+class NewsResponse(BaseModel):
+    results: List[NewsResult]

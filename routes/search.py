@@ -10,7 +10,8 @@ from core.dependencies import PageDep
 from models.requests import SearchRequest
 from models.responses import (
     SearchResponse, SearchResult, SearchMetadata,
-    RatingMetadata, WikiResult, AiReview
+    RatingMetadata, WikiResult, AiReview,
+    NewsResponse, NewsResult
 )
 
 logger = logging.getLogger(__name__)
@@ -231,6 +232,69 @@ async def _parse_search_results(
     return results
 
 
+async def _parse_news_results(
+    page: Page, results: List[NewsResult], seen_links: set, count: int,
+) -> List[NewsResult]:
+    """Parse news results from the current Google search page."""
+    result_divs = await page.query_selector_all('div[data-news-doc-id]')
+
+    for result_div in result_divs:
+        if len(results) >= count:
+            break
+        try:
+            link_element = await result_div.query_selector('a[href]')
+            if not link_element:
+                continue
+
+            href = await link_element.get_attribute('href')
+            if not _is_valid_result_link(href):
+                continue
+
+            if href in seen_links:
+                continue
+            seen_links.add(href)
+
+            title_element = await result_div.query_selector('div[role="heading"]')
+            title = await title_element.inner_text() if title_element else ""
+
+            snippet = await result_div.evaluate(
+                '(element) => {'
+                '  const heading = element.querySelector("div[role=heading]");'
+                '  if (heading && heading.nextElementSibling) {'
+                '    return heading.nextElementSibling.innerText;'
+                '  }'
+                '  return "";'
+                '}'
+            )
+
+            # Extract images
+            thumbnail_data = None
+            favicon_data = None
+            
+            images = await result_div.query_selector_all('img[src]')
+            for img in images:
+                src = await img.get_attribute('src')
+                if not src:
+                    continue
+                # First image is usually the thumbnail
+                if not thumbnail_data:
+                    thumbnail_data = src
+                elif not favicon_data:
+                    favicon_data = src
+            
+            results.append(NewsResult(
+                link=href,
+                title=title,
+                snippet=snippet or "",
+                favicon=favicon_data,
+                thumbnail=thumbnail_data,
+            ))
+        except Exception:
+            continue
+
+    return results
+
+
 # ==================== Endpoint ====================
 
 @router.post("/search")
@@ -277,3 +341,44 @@ async def search(request: SearchRequest, page: PageDep) -> SearchResponse:
         return SearchResponse(ai_review=ai_review, wiki=wiki_result, results=results)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to search: {str(e)}")
+
+
+@router.post("/search_news")
+async def search_news(request: SearchRequest, page: PageDep) -> NewsResponse:
+    """
+    Search for news using Google and return structured results.
+    """
+    try:
+        await page.goto(
+            f"https://www.google.com/search?q={request.query}&num={request.count}&tbm=nws",
+            wait_until="commit",
+        )
+        await asyncio.sleep(request.idle)
+
+        results: List[NewsResult] = []
+        seen_links: set = set()
+
+        results = await _parse_news_results(page, results, seen_links, request.count)
+
+        # Pagination
+        current_page = 1
+        while len(results) < request.count and current_page < request.max_pages:
+            next_button = await page.query_selector('a#pnnext')
+            if not next_button:
+                logger.info(f"No next page after page {current_page}. Got {len(results)} results.")
+                break
+
+            await next_button.click()
+            await asyncio.sleep(1)
+            current_page += 1
+            previous_count = len(results)
+            results = await _parse_news_results(page, results, seen_links, request.count)
+
+            if len(results) == previous_count:
+                logger.info(f"No new results on page {current_page}. Stopping.")
+                break
+            logger.info(f"Page {current_page}: {len(results)}/{request.count} results")
+
+        return NewsResponse(results=results)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to search news: {str(e)}")

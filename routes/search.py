@@ -11,7 +11,8 @@ from models.requests import SearchRequest
 from models.responses import (
     SearchResponse, SearchResult, SearchMetadata,
     RatingMetadata, WikiResult, AiReview,
-    NewsResponse, NewsResult
+    NewsResponse, NewsResult,
+    ImagesResponse, ImageResult
 )
 
 logger = logging.getLogger(__name__)
@@ -295,6 +296,43 @@ async def _parse_news_results(
     return results
 
 
+async def _parse_image_results(
+    page: Page, results: List[ImageResult], seen_links: set, count: int,
+) -> List[ImageResult]:
+    """Parse image results from the current Google search page."""
+    result_divs = await page.query_selector_all('div[data-lpage]')
+
+    for result_div in result_divs:
+        if len(results) >= count:
+            break
+        try:
+            link = await result_div.get_attribute('data-lpage')
+            if not link or not _is_valid_result_link(link):
+                continue
+
+            if link in seen_links:
+                continue
+            seen_links.add(link)
+
+            # Find the img element deep down
+            img_element = await result_div.query_selector('img[src]')
+            if not img_element:
+                continue
+
+            icon = await img_element.get_attribute('src')
+            title = await img_element.get_attribute('alt') or ""
+
+            results.append(ImageResult(
+                link=link,
+                title=title,
+                icon=icon,
+            ))
+        except Exception:
+            continue
+
+    return results
+
+
 # ==================== Endpoint ====================
 
 @router.post("/search")
@@ -382,3 +420,39 @@ async def search_news(request: SearchRequest, page: PageDep) -> NewsResponse:
         return NewsResponse(results=results)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to search news: {str(e)}")
+
+
+@router.post("/search_images")
+async def search_images(request: SearchRequest, page: PageDep) -> ImagesResponse:
+    """
+    Search for images using Google and return structured results.
+    """
+    try:
+        scroll_y = 1000
+        await page.goto(
+            f"https://www.google.com/search?q={request.query}&num={request.count}&udm=2",
+            wait_until="commit",
+        )
+        await asyncio.sleep(request.idle)
+
+        results: List[ImageResult] = []
+        seen_links: set = set()
+
+        results = await _parse_image_results(page, results, seen_links, request.count)
+
+        # Pagination (Google Images usually has infinite scroll)
+        current_scroll = 0
+        while len(results) < request.count and current_scroll < request.max_pages: # reusing max_pages as scroll attempts
+            await page.evaluate(f"window.scrollBy(0, {scroll_y})")
+            await asyncio.sleep(1)
+            current_scroll += 1
+            
+            previous_count = len(results)
+            results = await _parse_image_results(page, results, seen_links, request.count)
+            
+            if len(results) == previous_count:
+                break
+
+        return ImagesResponse(results=results)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to search images: {str(e)}")

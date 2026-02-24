@@ -12,7 +12,7 @@ from models.responses import (
     SearchResponse, SearchResult, SearchMetadata,
     RatingMetadata, WikiResult, AiReview,
     NewsResponse, NewsResult,
-    ImagesResponse, ImageResult
+    ImagesResponse, VideosResponse, MediaResult
 )
 
 logger = logging.getLogger(__name__)
@@ -297,8 +297,8 @@ async def _parse_news_results(
 
 
 async def _parse_image_results(
-    page: Page, results: List[ImageResult], seen_links: set, count: int,
-) -> List[ImageResult]:
+    page: Page, results: List[MediaResult], seen_links: set, count: int,
+) -> List[MediaResult]:
     """Parse image results from the current Google search page."""
     result_divs = await page.query_selector_all('div[data-lpage]')
 
@@ -322,7 +322,46 @@ async def _parse_image_results(
             icon = await img_element.get_attribute('src')
             title = await img_element.get_attribute('alt') or ""
 
-            results.append(ImageResult(
+            results.append(MediaResult(
+                link=link,
+                title=title,
+                icon=icon,
+            ))
+        except Exception:
+            continue
+
+    return results
+
+
+async def _parse_video_results(
+    page: Page, results: List[MediaResult], seen_links: set, count: int,
+) -> List[MediaResult]:
+    """Parse video results from the current Google search page."""
+    result_divs = await page.query_selector_all('div[data-vid]')
+
+    for result_div in result_divs:
+        if len(results) >= count:
+            break
+        try:
+            link_element = await result_div.query_selector('a[href]')
+            if not link_element:
+                continue
+            
+            link = await link_element.get_attribute('href')
+            if not link or not _is_valid_result_link(link):
+                continue
+
+            if link in seen_links:
+                continue
+            seen_links.add(link)
+
+            title_element = await result_div.query_selector('h3')
+            title = await title_element.inner_text() if title_element else ""
+
+            icon_element = await result_div.query_selector('img[src]')
+            icon = await icon_element.get_attribute('src') if icon_element else None
+
+            results.append(MediaResult(
                 link=link,
                 title=title,
                 icon=icon,
@@ -435,7 +474,7 @@ async def search_images(request: SearchRequest, page: PageDep) -> ImagesResponse
         )
         await asyncio.sleep(request.idle)
 
-        results: List[ImageResult] = []
+        results: List[MediaResult] = []
         seen_links: set = set()
 
         results = await _parse_image_results(page, results, seen_links, request.count)
@@ -456,3 +495,39 @@ async def search_images(request: SearchRequest, page: PageDep) -> ImagesResponse
         return ImagesResponse(results=results)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to search images: {str(e)}")
+
+
+@router.post("/search_videos")
+async def search_videos(request: SearchRequest, page: PageDep) -> VideosResponse:
+    """
+    Search for videos using Google and return structured results.
+    """
+    try:
+        scroll_y = 1000
+        await page.goto(
+            f"https://www.google.com/search?q={request.query}&num={request.count}&udm=7",
+            wait_until="commit",
+        )
+        await asyncio.sleep(request.idle)
+
+        results: List[MediaResult] = []
+        seen_links: set = set()
+
+        results = await _parse_video_results(page, results, seen_links, request.count)
+
+        # Pagination (Google Videos usually has infinite scroll)
+        current_scroll = 0
+        while len(results) < request.count and current_scroll < request.max_pages: # reusing max_pages as scroll attempts
+            await page.evaluate(f"window.scrollBy(0, {scroll_y})")
+            await asyncio.sleep(1)
+            current_scroll += 1
+            
+            previous_count = len(results)
+            results = await _parse_video_results(page, results, seen_links, request.count)
+            
+            if len(results) == previous_count:
+                break
+
+        return VideosResponse(results=results)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to search videos: {str(e)}")

@@ -62,11 +62,15 @@ class NewsResponse(BaseModel):
     results: List[NewsResult]
 
 
-class ImageResult(BaseModel):
+class MediaResult(BaseModel):
     link: str
     title: str
     icon: Optional[str] = Field(None, description="Base64-encoded icon/thumbnail data URL")
 
 
 class ImagesResponse(BaseModel):
-    results: List[ImageResult]
+    results: List[MediaResult]
+
+
+class VideosResponse(BaseModel):
+    results: List[MediaResult]

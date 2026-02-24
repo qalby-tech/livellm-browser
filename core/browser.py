@@ -100,26 +100,25 @@ class BrowserManager:
         browser = None
         context = None
 
+        launch_kwargs = {
+            "headless": False,
+            "channel": "chrome",
+            "args": [
+                "--start-maximized",
+                "--ignore-gpu-blocklist",
+                "--enable-webgl",
+                "--enable-gpu",
+            ],
+        }
+        if proxy_config:
+            launch_kwargs["proxy"] = proxy_config
+
         if is_persistent:
-            launch_kwargs = {
-                "user_data_dir": str(profile_path),
-                "headless": False,
-                "channel": "chrome",
-                "no_viewport": True,
-                "args": ["--start-maximized"],
-            }
-            if proxy_config:
-                launch_kwargs["proxy"] = proxy_config
+            launch_kwargs["user_data_dir"] = str(profile_path)
+            launch_kwargs["no_viewport"] = True
             context = await self.playwright.chromium.launch_persistent_context(**launch_kwargs)
             browser = context.browser
         else:
-            launch_kwargs = {
-                "headless": False,
-                "channel": "chrome",
-                "args": ["--start-maximized"],
-            }
-            if proxy_config:
-                launch_kwargs["proxy"] = proxy_config
             browser = await self.playwright.chromium.launch(**launch_kwargs)
             context = await browser.new_context(no_viewport=True)
 

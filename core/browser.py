@@ -1,141 +1,104 @@
 import asyncio
-import os
-import shutil
-import uuid
 import logging
-from pathlib import Path
 from typing import Optional
+import httpx
+import os
 
 from patchright.async_api import Playwright, Browser, BrowserContext, Page
 
 logger = logging.getLogger(__name__)
 
-PROFILES_DIR = Path("./profiles")
 DEFAULT_BROWSER_ID = "default"
-
-
-def cleanup_profile_locks(profile_path: Path):
-    """Remove Chrome lock files from a profile directory to prevent startup errors."""
-    if not profile_path.exists():
-        return
-
-    for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
-        lock_file = profile_path / lock_name
-        if os.path.lexists(lock_file):
-            try:
-                if os.path.islink(lock_file):
-                    os.unlink(lock_file)
-                elif lock_file.is_dir():
-                    shutil.rmtree(lock_file)
-                else:
-                    lock_file.unlink()
-                logger.info(f"Removed lock file: {lock_file}")
-            except Exception as e:
-                logger.warning(f"Failed to remove lock file {lock_file}: {e}")
-
+# Get launcher URL from env, or default to livellm-browser container
+LAUNCHER_URL = os.environ.get("LAUNCHER_URL", "http://livellm-browser:9000")
+# We also need the hostname to connect via CDP
+LAUNCHER_HOST = os.environ.get("LAUNCHER_HOST", "livellm-browser")
 
 class BrowserInfo:
     """Container for browser, context, and its associated pages."""
-
-    def __init__(self, browser: Browser, context: BrowserContext, profile_path: Optional[Path] = None):
+    def __init__(self, browser: Browser, context: BrowserContext, profile_path: Optional[str] = None):
         self.browser = browser
         self.context = context
         self.profile_path = profile_path
         self.pages: dict[str, Page] = {}
 
-
 class BrowserManager:
-    """Manages multiple browser instances with persistent and ephemeral profiles."""
+    """Manages connections to remote browser instances via CDP."""
 
     def __init__(self):
         self.playwright: Optional[Playwright] = None
         self.browsers: dict[str, BrowserInfo] = {}
+        self.http_client = httpx.AsyncClient(base_url=LAUNCHER_URL, timeout=30.0)
 
     async def start(self, playwright: Playwright):
-        """Initialize with a Playwright instance and create the default browser."""
+        """Initialize with a Playwright instance and connect to the default browser."""
         self.playwright = playwright
-        await self.create_browser(profile_uid=DEFAULT_BROWSER_ID)
-        logger.info("Browser manager started with default browser")
+        
+        max_retries = 40
+        for i in range(max_retries):
+            try:
+                # First check if the default browser is already up
+                resp = await self.http_client.get("/browsers")
+                resp.raise_for_status()
+                browsers = resp.json()
+                default_b = next((b for b in browsers if b["browser_id"] == DEFAULT_BROWSER_ID), None)
+                
+                if default_b:
+                    await self._connect_to_existing(default_b)
+                else:
+                    await self.create_browser(profile_uid=DEFAULT_BROWSER_ID)
+                
+                logger.info("Remote browser manager started with default browser")
+                return
+            except httpx.ConnectError:
+                logger.warning(f"Launcher not ready yet, retrying in 3 seconds ({i+1}/{max_retries})...")
+                await asyncio.sleep(3)
+            except Exception as e:
+                logger.error(f"Failed to connect to launcher: {e}")
+                raise
+        raise RuntimeError("Failed to connect to browser launcher after multiple retries")
 
-    async def create_browser(self, profile_uid: Optional[str] = None, proxy=None) -> tuple[str, BrowserInfo]:
-        """
-        Create a new browser instance.
+    async def _connect_to_existing(self, data: dict) -> tuple[str, BrowserInfo]:
+        """Connect to a browser already running on the launcher."""
+        browser_id = data["browser_id"]
+        cdp_port = data["cdp_port"]
+        ws_endpoint = data["ws_endpoint"]
+        profile_path = data.get("profile_path")
 
-        Args:
-            profile_uid: If provided, creates persistent profile in profiles/{uid}.
-                         If not provided, creates an ephemeral browser.
-            proxy: Optional proxy settings (ProxySettings model).
-
-        Returns:
-            Tuple of (browser_id, BrowserInfo).
-        """
-        if not self.playwright:
-            raise RuntimeError("Browser manager not started")
-
-        if profile_uid:
-            browser_id = profile_uid
-            profile_path = PROFILES_DIR / profile_uid
-            cleanup_profile_locks(profile_path)
-            is_persistent = True
-        else:
-            browser_id = str(uuid.uuid4())
-            profile_path = None
-            is_persistent = False
-
-        if browser_id in self.browsers:
-            raise ValueError(f"Browser with id '{browser_id}' already exists")
-
-        # Build proxy config
-        proxy_config = None
-        if proxy:
-            proxy_config = {"server": proxy.server}
-            if proxy.username:
-                proxy_config["username"] = proxy.username
-            if proxy.password:
-                proxy_config["password"] = proxy.password
-            if proxy.bypass:
-                proxy_config["bypass"] = proxy.bypass
-            logger.info(f"Browser '{browser_id}' configured with proxy: {proxy.server}")
-
-        browser = None
-        context = None
-
-        launch_kwargs = {
-            "headless": False,
-            "channel": "chrome",
-            "args": [
-                "--start-maximized",
-                "--ignore-gpu-blocklist",
-                "--enable-webgl",
-                "--enable-gpu",
-            ],
-        }
-        if proxy_config:
-            launch_kwargs["proxy"] = proxy_config
-
-        if is_persistent:
-            launch_kwargs["user_data_dir"] = str(profile_path)
-            launch_kwargs["no_viewport"] = True
-            context = await self.playwright.chromium.launch_persistent_context(**launch_kwargs)
-            browser = context.browser
-        else:
-            browser = await self.playwright.chromium.launch(**launch_kwargs)
-            context = await browser.new_context(no_viewport=True)
-
-        if browser is None and context:
-            browser = context.browser
-        if browser is None:
-            raise RuntimeError(f"Failed to get browser object for {browser_id}")
+        ws_url = f"ws://{LAUNCHER_HOST}:{cdp_port}{ws_endpoint}"
+        logger.info(f"Connecting to CDP WebSocket: {ws_url}")
+        
+        browser = await self.playwright.chromium.connect_over_cdp(ws_url)
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
 
         browser_info = BrowserInfo(browser, context, profile_path)
         self.browsers[browser_id] = browser_info
 
-        kind = "persistent" if is_persistent else "ephemeral"
-        logger.info(f"Created {kind} browser '{browser_id}'" + (f" with profile at {profile_path}" if is_persistent else ""))
+        logger.info(f"Connected to remote browser '{browser_id}' on port {cdp_port}")
         return browser_id, browser_info
 
+    async def create_browser(self, profile_uid: Optional[str] = None, proxy=None) -> tuple[str, BrowserInfo]:
+        """Request a new browser from the launcher and connect to it over CDP."""
+        if not self.playwright:
+            raise RuntimeError("Browser manager not started")
+
+        if profile_uid and profile_uid in self.browsers:
+            raise ValueError(f"Browser with id '{profile_uid}' already exists")
+
+        payload = {}
+        if profile_uid:
+            payload["profile_uid"] = profile_uid
+        if proxy:
+            # handle proxy dict or BaseModel
+            payload["proxy"] = proxy.model_dump() if hasattr(proxy, "model_dump") else proxy
+
+        resp = await self.http_client.post("/browsers", json=payload)
+        if resp.status_code != 200:
+            raise ValueError(f"Failed to create browser on launcher: {resp.text}")
+
+        return await self._connect_to_existing(resp.json())
+
     def get_browser(self, browser_id: str) -> BrowserInfo:
-        """Get a browser by its ID. Raises KeyError if not found."""
         if browser_id not in self.browsers:
             raise KeyError(f"Browser with id '{browser_id}' not found")
         return self.browsers[browser_id]
@@ -147,60 +110,44 @@ class BrowserManager:
         return DEFAULT_BROWSER_ID
 
     async def close_browser(self, browser_id: str) -> bool:
-        """Close and remove a browser instance. Cannot close the default browser."""
+        """Close remote browser and local connection."""
         if browser_id == DEFAULT_BROWSER_ID:
             raise ValueError("Cannot close the default browser")
         if browser_id not in self.browsers:
             return False
 
+        # Close on launcher
+        resp = await self.http_client.delete(f"/browsers/{browser_id}")
+        if resp.status_code not in (200, 404):
+            logger.warning(f"Failed to delete browser on launcher: {resp.text}")
+
         browser_info = self.browsers[browser_id]
-        for page in browser_info.pages.values():
+        for page in list(browser_info.pages.values()):
             try:
                 await page.close()
             except Exception as e:
                 logger.warning(f"Error closing page: {e}")
         try:
-            await browser_info.context.close()
-        except Exception as e:
-            logger.warning(f"Error closing context: {e}")
-        try:
             await browser_info.browser.close()
         except Exception as e:
-            logger.warning(f"Error closing browser: {e}")
+            logger.warning(f"Error closing browser connection: {e}")
 
         del self.browsers[browser_id]
-        logger.info(f"Closed browser '{browser_id}'")
+        logger.info(f"Closed remote browser '{browser_id}'")
         return True
 
     async def shutdown(self, timeout: float = 25.0):
-        """Close all browsers with timeout protection."""
-        logger.info("Starting browser shutdown...")
-
-        async def _shutdown_task():
-            for browser_id in list(self.browsers.keys()):
-                info = self.browsers[browser_id]
-                for page in info.pages.values():
-                    try:
-                        await asyncio.wait_for(page.close(), timeout=2.0)
-                    except (asyncio.TimeoutError, Exception) as e:
-                        logger.warning(f"Error closing page: {e}")
-                try:
-                    await asyncio.wait_for(info.context.close(), timeout=5.0)
-                except (asyncio.TimeoutError, Exception) as e:
-                    logger.warning(f"Error closing context for browser {browser_id}: {e}")
-                try:
-                    await asyncio.wait_for(info.browser.close(), timeout=5.0)
-                except (asyncio.TimeoutError, Exception) as e:
-                    logger.warning(f"Error closing browser {browser_id}: {e}")
-            self.browsers.clear()
-            logger.info("All browsers closed")
-
-        try:
-            await asyncio.wait_for(_shutdown_task(), timeout=timeout)
-        except asyncio.TimeoutError:
-            logger.error(f"Shutdown timed out after {timeout}s, forcing cleanup")
-            self.browsers.clear()
-
+        """Disconnect all browsers."""
+        logger.info("Starting browser manager shutdown...")
+        for browser_id in list(self.browsers.keys()):
+            info = self.browsers[browser_id]
+            try:
+                await info.browser.close()
+            except Exception:
+                pass
+        self.browsers.clear()
+        await self.http_client.aclose()
+        logger.info("All browsers disconnected")
 
 # Global singleton
 browser_manager = BrowserManager()

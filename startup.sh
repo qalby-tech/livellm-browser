@@ -10,7 +10,7 @@ APP_PID=""
 shutdown() {
   echo "Received shutdown signal, stopping services..."
   if [ -n "$APP_PID" ] && kill -0 $APP_PID 2>/dev/null; then
-    echo "Stopping main.py (PID $APP_PID)..."
+    echo "Stopping launch.py (PID $APP_PID)..."
     kill -TERM $APP_PID 2>/dev/null || true
     wait $APP_PID 2>/dev/null || true
   fi
@@ -57,11 +57,11 @@ for i in $(seq 1 80); do
   sleep 1
 done
 
-# Start main.py with logs to stdout (visible in docker logs)
-echo "Starting main.py..."
-cd /home/headless/Desktop/app && /bin/uv run main.py 2>&1 &
+# Start launch.py with logs to stdout (visible in docker logs)
+echo "Starting launch.py..."
+cd /home/headless/Desktop/app && /bin/uv run launch.py 2>&1 &
 APP_PID=$!
-echo "main.py started (PID $APP_PID)"
+echo "launch.py started (PID $APP_PID)"
 
 # Wait for any child to exit (keeps container running)
 wait -n 2>/dev/null || wait

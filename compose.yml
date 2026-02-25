@@ -1,5 +1,5 @@
 services:
-  livellm-computer:
+  livellm-browser:
     build:
       context: .
       dockerfile: Dockerfile
@@ -10,16 +10,14 @@ services:
       - "5901:5901"
       # noVNC web interface
       - "6901:6901"
-      # FastAPI Controller
-      - "8000:8000"
+      # FastAPI Launcher
+      - "9000:9000"
     environment:
       - VNC_PW=headless
       - VNC_RESOLUTION=1920x1080
       - DISPLAY=:1
     volumes:
       # Mount profiles directory from host with read/write access
-      # Create your profile directory on host: mkdir -p ./profiles/myprofile
-      # Then set PROFILE_NAME=myprofile to use it
       - profiles_volume:/home/headless/Desktop/app/profiles:rw
     restart: unless-stopped
     stop_grace_period: 10s
@@ -33,9 +31,27 @@ services:
           cpus: '0.5'
           memory: '2gb'
 
+  livellm-controller:
+    build:
+      context: .
+      dockerfile: Dockerfile.controller
+    image: kamasalyamov/livellm-controller:2.0.1
+    container_name: livellm-controller-2.0.1
+    ports:
+      # FastAPI Controller
+      - "8000:8000"
+    environment:
+      - LAUNCHER_URL=http://livellm-browser:9000
+      - LAUNCHER_HOST=livellm-browser
+    depends_on:
+      - livellm-browser
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: '2gb'
+
 volumes:
   profiles_volume:
     driver: local
-
-
-

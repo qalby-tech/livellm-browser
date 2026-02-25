@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from patchright.async_api import async_playwright
 
-from core.browser import browser_manager, cleanup_profile_locks, PROFILES_DIR, DEFAULT_BROWSER_ID
+from core.browser import browser_manager, DEFAULT_BROWSER_ID
 from routes import health, browsers, search, content, interact, attribute
 
 
@@ -30,12 +30,7 @@ logger.addHandler(_handler)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Prepare default profile directory
-    default_profile = PROFILES_DIR / DEFAULT_BROWSER_ID
-    cleanup_profile_locks(default_profile)
-    default_profile.mkdir(parents=True, exist_ok=True)
-    
-    # Start Playwright + browser manager
+    # Start Playwright + remote browser manager
     playwright = await async_playwright().start()
     try:
         await browser_manager.start(playwright)

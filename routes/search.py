@@ -12,7 +12,7 @@ from models.responses import (
     SearchResponse, SearchResult, SearchMetadata,
     RatingMetadata, WikiResult, AiReview,
     NewsResponse, NewsResult,
-    ImagesResponse, VideosResponse, MediaResult
+    ImagesResponse, VideosResponse, MediaResult, MediaTags
 )
 
 logger = logging.getLogger(__name__)
@@ -361,10 +361,29 @@ async def _parse_video_results(
             icon_element = await result_div.query_selector('img[src]')
             icon = await icon_element.get_attribute('src') if icon_element else None
 
+            # Tags format example: "Source · Author · Date"
+            tags_data = await result_div.evaluate(
+                '(element) => {'
+                '  const dotSpan = Array.from(element.querySelectorAll("span")).find(s => s.textContent && s.textContent.trim() === "·");'
+                '  if (dotSpan && dotSpan.parentElement) {'
+                '    const text = dotSpan.parentElement.textContent;'
+                '    const clean = text.split("·").map(t => t.trim()).filter(t => t);'
+                '    if (clean.length === 0) return null;'
+                '    if (clean.length === 1) return { source: clean[0], author: null, date: null };'
+                '    if (clean.length === 2) return { source: clean[0], author: null, date: clean[1] };'
+                '    return { source: clean[0], author: clean[1], date: clean[2] };'
+                '  }'
+                '  return null;'
+                '}'
+            )
+            
+            tags = MediaTags(**tags_data) if tags_data else None
+
             results.append(MediaResult(
                 link=link,
                 title=title,
                 icon=icon,
+                tags=tags,
             ))
         except Exception:
             continue

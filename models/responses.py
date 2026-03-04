@@ -83,3 +83,8 @@ class ImagesResponse(BaseModel):
 
 class VideosResponse(BaseModel):
     results: List[MediaResult]
+
+
+class SearchHintsResponse(BaseModel):
+    query: str = Field(..., description="The original query")
+    hints: List[str] = Field(default_factory=list, description="List of autocomplete suggestions")

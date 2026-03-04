@@ -7,12 +7,13 @@ from fastapi import APIRouter, HTTPException
 from patchright.async_api import Page, ElementHandle
 
 from core.dependencies import PageDep
-from models.requests import SearchRequest
+from models.requests import SearchRequest, SearchHintsRequest
 from models.responses import (
     SearchResponse, SearchResult, SearchMetadata,
     RatingMetadata, WikiResult, AiReview,
     NewsResponse, NewsResult,
-    ImagesResponse, VideosResponse, MediaResult, MediaTags
+    ImagesResponse, VideosResponse, MediaResult, MediaTags,
+    SearchHintsResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -514,6 +515,73 @@ async def search_images(request: SearchRequest, page: PageDep) -> ImagesResponse
         return ImagesResponse(results=results)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to search images: {str(e)}")
+
+
+@router.post("/search_hints")
+async def search_hints(request: SearchHintsRequest, page: PageDep) -> SearchHintsResponse:
+    """
+    Get Google autocomplete suggestions (search hints) for a query.
+
+    Navigates to Google, types the query into the search box, waits for
+    autocomplete suggestions to appear, and extracts them.
+    """
+    try:
+        await page.goto("https://www.google.com", wait_until="commit")
+        await asyncio.sleep(request.idle)
+
+        # Find the search input (Google uses textarea on modern layout, input as fallback)
+        search_input = page.locator('textarea[name="q"], input[name="q"]').first
+        await search_input.click()
+        await search_input.fill(request.query)
+
+        # Wait for autocomplete suggestions to load
+        await asyncio.sleep(request.wait)
+
+        # Extract hints from the autocomplete dropdown via aria-label on role="option" elements
+        hints = await page.evaluate("""
+            () => {
+                const hints = [];
+
+                // Strategy 1: role="listbox" > role="option" (standard Google autocomplete)
+                const options = document.querySelectorAll('[role="listbox"] [role="option"]');
+                for (const opt of options) {
+                    // Prefer aria-label for clean text
+                    const label = opt.getAttribute('aria-label');
+                    if (label) {
+                        hints.push(label);
+                        continue;
+                    }
+                    // Fallback to visible text from the main suggestion span
+                    const spans = opt.querySelectorAll('span');
+                    const texts = [];
+                    for (const span of spans) {
+                        if (span.closest('[role="img"]') || span.querySelector('span')) continue;
+                        const t = span.textContent.trim();
+                        if (t && !texts.includes(t)) texts.push(t);
+                    }
+                    if (texts.length > 0) {
+                        hints.push(texts.join(' '));
+                    }
+                }
+
+                if (hints.length > 0) return hints;
+
+                // Strategy 2: datalist-based suggestions (some Google variants)
+                const datalist = document.querySelector('datalist');
+                if (datalist) {
+                    for (const opt of datalist.querySelectorAll('option')) {
+                        const val = opt.getAttribute('value') || opt.textContent.trim();
+                        if (val) hints.push(val);
+                    }
+                }
+
+                return hints;
+            }
+        """)
+
+        return SearchHintsResponse(query=request.query, hints=hints)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get search hints: {str(e)}")
 
 
 @router.post("/search_videos")

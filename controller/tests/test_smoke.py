@@ -1,5 +1,5 @@
 """
-Smoke tests for livellm-browser FastAPI controller.
+Smoke tests for livellm-controller FastAPI controller.
 
 Run with: uv run pytest tests/ -v
 """

@@ -8,6 +8,6 @@ ENV UV_NO_DEV=1
 
 # Sync the project into a new environment, asserting the lockfile is up to date
 WORKDIR /app
-RUN uv sync --locked
+RUN uv sync
 # Presuming there is a `my_app` command provided by the project
 CMD ["uv", "run", "main.py"]

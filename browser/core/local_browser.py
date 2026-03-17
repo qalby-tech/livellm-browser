@@ -1,6 +1,7 @@
 import asyncio
 import os
 import shutil
+import time
 import uuid
 import logging
 import socket
@@ -101,26 +102,38 @@ def inject_extension_into_profile(extension_id: str, cache_path: Path, profile_p
     host_permissions = manifest.get("host_permissions", [])
     optional_permissions = manifest.get("optional_permissions", [])
 
+    # Extract scriptable hosts from content_scripts[].matches
+    scriptable_hosts = []
+    for cs in manifest.get("content_scripts", []):
+        scriptable_hosts.extend(cs.get("matches", []))
+    scriptable_hosts = sorted(set(scriptable_hosts))
+
+    # Chrome timestamps are microseconds since Windows epoch (Jan 1, 1601)
+    chrome_timestamp = str(int((time.time() + 11644473600) * 1_000_000))
+
+    # creation_flags bitmask: 4 = FROM_WEBSTORE
+    creation_flags = 4
+
     ext_settings[extension_id] = {
         "active_permissions": {
             "api": permissions,
             "explicit_host": host_permissions,
             "manifest_permissions": [],
-            "scriptable_host": []
+            "scriptable_host": scriptable_hosts
         },
         "commands": {},
         "content_settings": [],
-        "creation_flags": 38,
+        "creation_flags": creation_flags,
         "from_webstore": True,
         "granted_permissions": {
             "api": permissions + optional_permissions,
             "explicit_host": host_permissions,
             "manifest_permissions": [],
-            "scriptable_host": []
+            "scriptable_host": scriptable_hosts
         },
         "incognito_content_settings": [],
         "incognito_preferences": {},
-        "install_time": "13370000000000000",
+        "install_time": chrome_timestamp,
         "location": 1,
         "manifest": manifest,
         "path": f"{extension_id}/{version}_0",
@@ -169,13 +182,51 @@ def remove_extension_from_profile(extension_id: str, profile_path: Path):
         secure_prefs.unlink()
 
 
+def set_extension_enabled(extension_id: str, profile_path: Path, enabled: bool):
+    """Toggle an extension's enabled state in Preferences (state: 1=enabled, 0=disabled)."""
+    default_dir = profile_path / "Default"
+    prefs_path = default_dir / "Preferences"
+    if not prefs_path.exists():
+        raise FileNotFoundError(f"Preferences file not found in {default_dir}")
+
+    with open(prefs_path, "r", encoding="utf-8") as f:
+        prefs = json.load(f)
+
+    settings = prefs.get("extensions", {}).get("settings", {})
+    if extension_id not in settings:
+        raise KeyError(f"Extension {extension_id} not found in Preferences")
+
+    settings[extension_id]["state"] = 1 if enabled else 0
+
+    with open(prefs_path, "w", encoding="utf-8") as f:
+        json.dump(prefs, f, ensure_ascii=False)
+
+    secure_prefs = default_dir / "Secure Preferences"
+    if secure_prefs.exists():
+        secure_prefs.unlink()
+
+    state_str = "enabled" if enabled else "disabled"
+    logger.info(f"Extension {extension_id} {state_str} in Preferences")
+
+
 def list_profile_extensions(profile_path: Path) -> list[dict]:
-    """List extensions installed in a profile."""
+    """List extensions installed in a profile, including their enabled/disabled state."""
     default_dir = profile_path / "Default"
     ext_base = default_dir / "Extensions"
     results = []
     if not ext_base.exists():
         return results
+
+    # Read Preferences to get state info
+    prefs_path = default_dir / "Preferences"
+    ext_settings = {}
+    if prefs_path.exists():
+        try:
+            with open(prefs_path, "r", encoding="utf-8") as f:
+                prefs = json.load(f)
+            ext_settings = prefs.get("extensions", {}).get("settings", {})
+        except (json.JSONDecodeError, IOError):
+            pass
 
     for ext_dir in ext_base.iterdir():
         if not ext_dir.is_dir():
@@ -189,13 +240,15 @@ def list_profile_extensions(profile_path: Path) -> list[dict]:
                 try:
                     with open(manifest_path, "r", encoding="utf-8") as f:
                         manifest = json.load(f)
+                    state = ext_settings.get(extension_id, {}).get("state", 1)
                     results.append({
                         "id": extension_id,
                         "name": manifest.get("name", ""),
                         "version": manifest.get("version", ""),
+                        "enabled": state == 1,
                     })
                 except (json.JSONDecodeError, IOError):
-                    results.append({"id": extension_id, "name": "", "version": ""})
+                    results.append({"id": extension_id, "name": "", "version": "", "enabled": False})
     return results
 
 
@@ -253,8 +306,8 @@ class LocalBrowserManager:
         await self.create_browser(profile_uid=DEFAULT_BROWSER_ID)
         logger.info("Browser manager started with default browser")
 
-    async def create_browser(self, profile_uid: Optional[str] = None, proxy=None, extensions: Optional[List[str]] = None) -> tuple[str, LocalBrowserInfo]:
-        """Create a new browser instance, optionally with extensions pre-installed."""
+    async def create_browser(self, profile_uid: Optional[str] = None, proxy=None, extensions: Optional[List[str]] = None, cookies: Optional[List[dict]] = None) -> tuple[str, LocalBrowserInfo]:
+        """Create a new browser instance, optionally with extensions and cookies pre-loaded."""
         if not self.playwright:
             raise RuntimeError("Browser manager not started")
 
@@ -352,6 +405,13 @@ class LocalBrowserManager:
         cdp_proxy = CDPProxy(bind_port=proxy_port, target_port=chrome_port, ws_endpoint=ws_endpoint)
         await cdp_proxy.start()
 
+        if cookies:
+            try:
+                await context.add_cookies(cookies)
+                logger.info(f"Loaded {len(cookies)} cookies into browser '{browser_id}'")
+            except Exception as e:
+                logger.error(f"Failed to load cookies into browser '{browser_id}': {e}")
+
         browser_info = LocalBrowserInfo(browser, context, proxy_port, ws_endpoint, cdp_proxy, profile_path, is_ephemeral, proxy_config)
         self.browsers[browser_id] = browser_info
 
@@ -398,12 +458,13 @@ class LocalBrowserManager:
         logger.info(f"Closed browser '{browser_id}'")
         return True
 
-    async def restart_browser(self, browser_id: str, inject_extensions: Optional[List[tuple]] = None, remove_extensions: Optional[List[str]] = None) -> LocalBrowserInfo:
+    async def restart_browser(self, browser_id: str, inject_extensions: Optional[List[tuple]] = None, remove_extensions: Optional[List[str]] = None, toggle_extensions: Optional[List[tuple]] = None) -> LocalBrowserInfo:
         """
         Close a browser and relaunch it with the same profile.
         The CDP proxy port stays the same — only the Chrome target is updated.
         inject_extensions: list of (extension_id, cache_path) tuples to add AFTER Chrome exits.
         remove_extensions: list of extension_ids to remove AFTER Chrome exits.
+        toggle_extensions: list of (extension_id, enabled) tuples to enable/disable AFTER Chrome exits.
         """
         if browser_id not in self.browsers:
             raise KeyError(f"Browser with id '{browser_id}' not found")
@@ -439,6 +500,9 @@ class LocalBrowserManager:
         if remove_extensions:
             for ext_id in remove_extensions:
                 remove_extension_from_profile(ext_id, profile_path)
+        if toggle_extensions:
+            for ext_id, enabled in toggle_extensions:
+                set_extension_enabled(ext_id, profile_path, enabled)
 
         cleanup_profile_locks(profile_path)
 

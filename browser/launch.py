@@ -11,7 +11,7 @@ from patchright.async_api import async_playwright
 from core.local_browser import (
     local_browser_manager, PROFILES_DIR, DEFAULT_BROWSER_ID,
     cleanup_profile_locks, download_extension, inject_extension_into_profile,
-    remove_extension_from_profile, list_profile_extensions,
+    remove_extension_from_profile, list_profile_extensions, set_extension_enabled,
 )
 
 class ProxySettings(BaseModel):
@@ -24,6 +24,7 @@ class CreateBrowserRequest(BaseModel):
     profile_uid: Optional[str] = None
     proxy: Optional[ProxySettings] = None
     extensions: Optional[list[str]] = None
+    cookies: Optional[list[dict]] = None
 
 class BrowserResponse(BaseModel):
     browser_id: str
@@ -89,7 +90,8 @@ async def create_browser(request: CreateBrowserRequest = CreateBrowserRequest())
         browser_id, info = await local_browser_manager.create_browser(
             profile_uid=request.profile_uid,
             proxy=request.proxy,
-            extensions=request.extensions
+            extensions=request.extensions,
+            cookies=request.cookies
         )
         return BrowserResponse(
             browser_id=browser_id,
@@ -206,6 +208,34 @@ async def delete_extension(browser_id: str, extension_id: str) -> BrowserRespons
         )
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Browser '{browser_id}' not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+class ToggleExtensionRequest(BaseModel):
+    enabled: bool
+
+@app.patch("/browsers/{browser_id:path}/extensions/{extension_id}")
+async def toggle_extension(browser_id: str, extension_id: str, request: ToggleExtensionRequest) -> BrowserResponse:
+    """Enable or disable an extension without removing it. Restarts the browser automatically."""
+    try:
+        info = local_browser_manager.get_browser(browser_id)
+        if not info.profile_path:
+            raise HTTPException(status_code=400, detail="Cannot toggle extensions on an ephemeral browser without a profile.")
+
+        new_info = await local_browser_manager.restart_browser(
+            browser_id,
+            toggle_extensions=[(extension_id, request.enabled)]
+        )
+        return BrowserResponse(
+            browser_id=browser_id,
+            cdp_port=new_info.proxy_port,
+            ws_endpoint=new_info.ws_endpoint,
+            profile_path=str(new_info.profile_path) if new_info.profile_path else None
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Browser or extension '{extension_id}' not found")
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

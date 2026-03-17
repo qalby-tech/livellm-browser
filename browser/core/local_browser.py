@@ -4,19 +4,200 @@ import shutil
 import uuid
 import logging
 import socket
-# import urllib.request
 import httpx
 import json
+import zipfile
+import io
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional, Any, List
 
 from patchright.async_api import Playwright, Browser, BrowserContext, Page
 from core.cdp_proxy import CDPProxy
 
 logger = logging.getLogger(__name__)
 
-PROFILES_DIR = Path("/home/headless/Desktop/app/profiles")
+PROFILES_DIR = Path(os.environ.get("PROFILES_DIR", "/home/headless/Desktop/app/profiles"))
+EXTENSIONS_CACHE_DIR = Path(os.environ.get("EXTENSIONS_CACHE_DIR", "/home/headless/Desktop/app/extensions_cache"))
 DEFAULT_BROWSER_ID = "default"
+
+
+async def download_extension(extension_id: str) -> Path:
+    """Download a Chrome extension CRX from the Web Store and unpack it to a cache directory."""
+    EXTENSIONS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    ext_path = EXTENSIONS_CACHE_DIR / extension_id
+
+    manifest_file = ext_path / "manifest.json"
+    if ext_path.exists() and manifest_file.exists():
+        return ext_path
+
+    logger.info(f"Downloading extension {extension_id}...")
+    url = (
+        "https://clients2.google.com/service/update2/crx"
+        "?response=redirect&os=win&arch=x86-64&os_arch=x86-64&nacl_arch=x86-64"
+        "&prod=chromecrx&prodchannel=&prodversion=114.0.5735.199&lang=en-US&acceptformat=crx3"
+        f"&x=id%3D{extension_id}%26installsource%3Dondemand%26uc"
+    )
+
+    async with httpx.AsyncClient() as client:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+        }
+        response = await client.get(url, headers=headers, follow_redirects=True)
+        response.raise_for_status()
+
+        content = response.content
+        if not content:
+            raise ValueError(f"Empty response for extension {extension_id}")
+
+        zip_start = content.find(b'PK\x03\x04')
+        if zip_start == -1:
+            raise ValueError(f"Not a valid CRX/ZIP file for extension {extension_id}")
+
+        ext_path.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(content[zip_start:])) as zf:
+            zf.extractall(ext_path)
+
+        # Chrome rejects side-loaded extensions that contain _metadata
+        metadata_dir = ext_path / "_metadata"
+        if metadata_dir.exists():
+            shutil.rmtree(metadata_dir)
+
+    logger.info(f"Extension {extension_id} cached at {ext_path}")
+    return ext_path
+
+
+def inject_extension_into_profile(extension_id: str, cache_path: Path, profile_path: Path):
+    """
+    Copy an unpacked extension into a Chrome profile's Extensions folder
+    and register it in the Preferences file so Chrome actually loads it.
+    """
+    with open(cache_path / "manifest.json", "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    version = manifest.get("version", "1.0.0")
+
+    default_dir = profile_path / "Default"
+    default_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Copy extension files into Default/Extensions/<id>/<version>_0/
+    target_dir = default_dir / "Extensions" / extension_id / f"{version}_0"
+    if not target_dir.exists():
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(cache_path, target_dir)
+        logger.info(f"Copied extension {extension_id} v{version} into profile")
+
+    # 2. Register the extension in Default/Preferences
+    prefs_path = default_dir / "Preferences"
+    prefs = {}
+    if prefs_path.exists():
+        try:
+            with open(prefs_path, "r", encoding="utf-8") as f:
+                prefs = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            prefs = {}
+
+    ext_settings = prefs.setdefault("extensions", {}).setdefault("settings", {})
+
+    permissions = manifest.get("permissions", [])
+    host_permissions = manifest.get("host_permissions", [])
+    optional_permissions = manifest.get("optional_permissions", [])
+
+    ext_settings[extension_id] = {
+        "active_permissions": {
+            "api": permissions,
+            "explicit_host": host_permissions,
+            "manifest_permissions": [],
+            "scriptable_host": []
+        },
+        "commands": {},
+        "content_settings": [],
+        "creation_flags": 38,
+        "from_webstore": True,
+        "granted_permissions": {
+            "api": permissions + optional_permissions,
+            "explicit_host": host_permissions,
+            "manifest_permissions": [],
+            "scriptable_host": []
+        },
+        "incognito_content_settings": [],
+        "incognito_preferences": {},
+        "install_time": "13370000000000000",
+        "location": 1,
+        "manifest": manifest,
+        "path": f"{extension_id}/{version}_0",
+        "state": 1,
+        "was_installed_by_default": False,
+        "was_installed_by_oem": False
+    }
+
+    with open(prefs_path, "w", encoding="utf-8") as f:
+        json.dump(prefs, f, ensure_ascii=False)
+    logger.info(f"Registered extension {extension_id} in Preferences")
+
+    # 3. Remove Secure Preferences so Chrome regenerates it
+    #    (otherwise HMAC mismatch causes Chrome to strip our changes)
+    secure_prefs = default_dir / "Secure Preferences"
+    if secure_prefs.exists():
+        secure_prefs.unlink()
+        logger.info("Removed Secure Preferences (will be regenerated by Chrome)")
+
+
+def remove_extension_from_profile(extension_id: str, profile_path: Path):
+    """Remove an extension from a Chrome profile's Extensions folder and Preferences."""
+    default_dir = profile_path / "Default"
+
+    ext_dir = default_dir / "Extensions" / extension_id
+    if ext_dir.exists():
+        shutil.rmtree(ext_dir)
+        logger.info(f"Removed extension files for {extension_id}")
+
+    prefs_path = default_dir / "Preferences"
+    if prefs_path.exists():
+        try:
+            with open(prefs_path, "r", encoding="utf-8") as f:
+                prefs = json.load(f)
+            settings = prefs.get("extensions", {}).get("settings", {})
+            if extension_id in settings:
+                del settings[extension_id]
+                with open(prefs_path, "w", encoding="utf-8") as f:
+                    json.dump(prefs, f, ensure_ascii=False)
+                logger.info(f"Unregistered extension {extension_id} from Preferences")
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"Could not update Preferences: {e}")
+
+    secure_prefs = default_dir / "Secure Preferences"
+    if secure_prefs.exists():
+        secure_prefs.unlink()
+
+
+def list_profile_extensions(profile_path: Path) -> list[dict]:
+    """List extensions installed in a profile."""
+    default_dir = profile_path / "Default"
+    ext_base = default_dir / "Extensions"
+    results = []
+    if not ext_base.exists():
+        return results
+
+    for ext_dir in ext_base.iterdir():
+        if not ext_dir.is_dir():
+            continue
+        extension_id = ext_dir.name
+        for version_dir in ext_dir.iterdir():
+            if not version_dir.is_dir():
+                continue
+            manifest_path = version_dir / "manifest.json"
+            if manifest_path.exists():
+                try:
+                    with open(manifest_path, "r", encoding="utf-8") as f:
+                        manifest = json.load(f)
+                    results.append({
+                        "id": extension_id,
+                        "name": manifest.get("name", ""),
+                        "version": manifest.get("version", ""),
+                    })
+                except (json.JSONDecodeError, IOError):
+                    results.append({"id": extension_id, "name": "", "version": ""})
+    return results
+
 
 def get_free_port():
     s = socket.socket()
@@ -24,6 +205,7 @@ def get_free_port():
     port = s.getsockname()[1]
     s.close()
     return port
+
 
 def cleanup_profile_locks(profile_path: Path):
     """Remove Chrome lock files from a profile directory to prevent startup errors."""
@@ -44,15 +226,19 @@ def cleanup_profile_locks(profile_path: Path):
             except Exception as e:
                 logger.warning(f"Failed to remove lock file {lock_file}: {e}")
 
+
 class LocalBrowserInfo:
     """Container for browser, context, and its associated pages."""
-    def __init__(self, browser: Browser, context: BrowserContext, proxy_port: int, ws_endpoint: str, cdp_proxy: CDPProxy, profile_path: Optional[Path] = None):
+    def __init__(self, browser: Browser, context: BrowserContext, proxy_port: int, ws_endpoint: str, cdp_proxy: CDPProxy, profile_path: Optional[Path] = None, is_ephemeral: bool = False, proxy_config: Optional[dict] = None):
         self.browser = browser
         self.context = context
         self.proxy_port = proxy_port
         self.ws_endpoint = ws_endpoint
         self.cdp_proxy = cdp_proxy
         self.profile_path = profile_path
+        self.is_ephemeral = is_ephemeral
+        self.proxy_config = proxy_config
+
 
 class LocalBrowserManager:
     """Manages multiple browser instances with persistent and ephemeral profiles."""
@@ -67,13 +253,12 @@ class LocalBrowserManager:
         await self.create_browser(profile_uid=DEFAULT_BROWSER_ID)
         logger.info("Browser manager started with default browser")
 
-    async def create_browser(self, profile_uid: Optional[str] = None, proxy=None) -> tuple[str, LocalBrowserInfo]:
-        """
-        Create a new browser instance.
-        """
+    async def create_browser(self, profile_uid: Optional[str] = None, proxy=None, extensions: Optional[List[str]] = None) -> tuple[str, LocalBrowserInfo]:
+        """Create a new browser instance, optionally with extensions pre-installed."""
         if not self.playwright:
             raise RuntimeError("Browser manager not started")
 
+        is_ephemeral = False
         if profile_uid:
             browser_id = profile_uid
             profile_path = PROFILES_DIR / profile_uid
@@ -81,11 +266,26 @@ class LocalBrowserManager:
             is_persistent = True
         else:
             browser_id = str(uuid.uuid4())
-            profile_path = None
-            is_persistent = False
+            is_ephemeral = True
+            if extensions:
+                profile_path = PROFILES_DIR / browser_id
+                is_persistent = True
+            else:
+                profile_path = None
+                is_persistent = False
 
         if browser_id in self.browsers:
             raise ValueError(f"Browser with id '{browser_id}' already exists")
+
+        # Download and inject extensions into the profile BEFORE Chrome launches
+        if extensions and profile_path:
+            profile_path.mkdir(parents=True, exist_ok=True)
+            for ext_id in extensions:
+                try:
+                    cache_path = await download_extension(ext_id)
+                    inject_extension_into_profile(ext_id, cache_path, profile_path)
+                except Exception as e:
+                    logger.error(f"Failed to inject extension {ext_id}: {e}")
 
         # Build proxy config
         proxy_config = None
@@ -142,8 +342,6 @@ class LocalBrowserManager:
                 data: dict[str, Any] = response.json()
                 full_ws_url: str = data.get("webSocketDebuggerUrl", "")
                 if full_ws_url:
-                    #   "webSocketDebuggerUrl": "ws://localhost:9222/devtools/browser/c72f5f19-4b99-4607-bee7-0ec9805a018c"
-                    # Extract the path (e.g., /devtools/browser/abc-def)
                     ws_endpoint = "/" + full_ws_url.replace("ws://", "").split("/", 1)[1]
             except Exception:
                 pass
@@ -151,10 +349,10 @@ class LocalBrowserManager:
         if not ws_endpoint:
             logger.warning(f"Could not retrieve WS endpoint from Chrome on port {chrome_port}")
 
-        cdp_proxy = CDPProxy(bind_port=proxy_port, target_port=chrome_port)
+        cdp_proxy = CDPProxy(bind_port=proxy_port, target_port=chrome_port, ws_endpoint=ws_endpoint)
         await cdp_proxy.start()
 
-        browser_info = LocalBrowserInfo(browser, context, proxy_port, ws_endpoint, cdp_proxy, profile_path)
+        browser_info = LocalBrowserInfo(browser, context, proxy_port, ws_endpoint, cdp_proxy, profile_path, is_ephemeral, proxy_config)
         self.browsers[browser_id] = browser_info
 
         kind = "persistent" if is_persistent else "ephemeral"
@@ -173,12 +371,12 @@ class LocalBrowserManager:
             return False
 
         browser_info = self.browsers[browser_id]
-        
+
         try:
             await browser_info.cdp_proxy.stop()
         except Exception as e:
             logger.warning(f"Error stopping CDP proxy: {e}")
-            
+
         try:
             await browser_info.context.close()
         except Exception as e:
@@ -189,9 +387,110 @@ class LocalBrowserManager:
         except Exception as e:
             logger.warning(f"Error closing browser: {e}")
 
+        if browser_info.is_ephemeral and browser_info.profile_path and browser_info.profile_path.exists():
+            try:
+                shutil.rmtree(browser_info.profile_path)
+                logger.info(f"Cleaned up ephemeral profile at {browser_info.profile_path}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up ephemeral profile: {e}")
+
         del self.browsers[browser_id]
         logger.info(f"Closed browser '{browser_id}'")
         return True
+
+    async def restart_browser(self, browser_id: str, inject_extensions: Optional[List[tuple]] = None, remove_extensions: Optional[List[str]] = None) -> LocalBrowserInfo:
+        """
+        Close a browser and relaunch it with the same profile.
+        The CDP proxy port stays the same — only the Chrome target is updated.
+        inject_extensions: list of (extension_id, cache_path) tuples to add AFTER Chrome exits.
+        remove_extensions: list of extension_ids to remove AFTER Chrome exits.
+        """
+        if browser_id not in self.browsers:
+            raise KeyError(f"Browser with id '{browser_id}' not found")
+
+        old_info = self.browsers[browser_id]
+        profile_path = old_info.profile_path
+        proxy_config = old_info.proxy_config
+        is_ephemeral = old_info.is_ephemeral
+        cdp_proxy = old_info.cdp_proxy
+        proxy_port = old_info.proxy_port
+
+        if not profile_path:
+            raise ValueError("Cannot restart an ephemeral browser without a profile.")
+
+        # Shut down Chrome but keep the CDP proxy alive
+        try:
+            await old_info.context.close()
+        except Exception as e:
+            logger.warning(f"Error closing context during restart: {e}")
+        try:
+            if old_info.browser:
+                await old_info.browser.close()
+        except Exception as e:
+            logger.warning(f"Error closing browser during restart: {e}")
+
+        del self.browsers[browser_id]
+        logger.info(f"Stopped browser '{browser_id}' for restart (proxy on :{proxy_port} kept alive)")
+
+        # Modify extensions AFTER Chrome has exited (so it can't overwrite Preferences)
+        if inject_extensions:
+            for ext_id, cache_path in inject_extensions:
+                inject_extension_into_profile(ext_id, cache_path, profile_path)
+        if remove_extensions:
+            for ext_id in remove_extensions:
+                remove_extension_from_profile(ext_id, profile_path)
+
+        cleanup_profile_locks(profile_path)
+
+        chrome_port = get_free_port()
+
+        launch_kwargs = {
+            "headless": False,
+            "channel": "chrome",
+            "args": [
+                "--start-maximized",
+                "--ignore-gpu-blocklist",
+                "--enable-webgl",
+                "--enable-gpu",
+                f"--remote-debugging-port={chrome_port}",
+                "--remote-allow-origins=*",
+            ],
+        }
+        if proxy_config:
+            launch_kwargs["proxy"] = proxy_config
+
+        launch_kwargs["user_data_dir"] = str(profile_path)
+        launch_kwargs["no_viewport"] = True
+        context = await self.playwright.chromium.launch_persistent_context(**launch_kwargs)
+        browser = context.browser
+        if browser is None:
+            browser = context.browser
+        if browser is None:
+            raise RuntimeError(f"Failed to get browser object for {browser_id}")
+
+        ws_endpoint = ""
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(f"http://127.0.0.1:{chrome_port}/json/version", timeout=10.0)
+                response.raise_for_status()
+                data: dict[str, Any] = response.json()
+                full_ws_url: str = data.get("webSocketDebuggerUrl", "")
+                if full_ws_url:
+                    ws_endpoint = "/" + full_ws_url.replace("ws://", "").split("/", 1)[1]
+            except Exception:
+                pass
+
+        if not ws_endpoint:
+            logger.warning(f"Could not retrieve WS endpoint from Chrome on port {chrome_port}")
+
+        # Retarget the existing proxy to the new Chrome instance
+        cdp_proxy.retarget(chrome_port, ws_endpoint)
+
+        browser_info = LocalBrowserInfo(browser, context, proxy_port, ws_endpoint, cdp_proxy, profile_path, is_ephemeral, proxy_config)
+        self.browsers[browser_id] = browser_info
+
+        logger.info(f"Restarted browser '{browser_id}' (proxy :{proxy_port} -> Chrome :{chrome_port})")
+        return browser_info
 
     async def shutdown(self, timeout: float = 25.0):
         logger.info("Starting browser shutdown...")
@@ -202,7 +501,7 @@ class LocalBrowserManager:
                     await info.cdp_proxy.stop()
                 except Exception as e:
                     logger.warning(f"Error stopping proxy for browser {browser_id}: {e}")
-                    
+
                 try:
                     await asyncio.wait_for(info.context.close(), timeout=5.0)
                 except (asyncio.TimeoutError, Exception) as e:

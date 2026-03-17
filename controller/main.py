@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from patchright.async_api import async_playwright
 
-from core.browser import browser_manager, DEFAULT_BROWSER_ID
+from core.browser import browser_manager
 from routes import health, browsers, search, content, interact, attribute
 
 
@@ -30,18 +30,18 @@ logger.addHandler(_handler)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start Playwright + remote browser manager
+    # Start Playwright — no auto-connections; the operator (or API calls)
+    # will register browsers via POST /browsers.
     playwright = await async_playwright().start()
-    try:
-        await browser_manager.start(playwright)
-    except Exception as e:
-        logger.error(f"Failed to start browser manager: {e}")
-    
+    await browser_manager.start(playwright)
+
     app.state.playwright = playwright
     app.state.browser_manager = browser_manager
-    
+
+    logger.info("Controller started — waiting for browser registrations via POST /browsers")
+
     yield
-    
+
     # Graceful shutdown
     logger.info("Application shutting down, cleaning up resources...")
     try:
@@ -61,7 +61,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Controller API",
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
     root_path="/parser",
 )

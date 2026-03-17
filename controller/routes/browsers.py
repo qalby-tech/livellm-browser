@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException
 
 from core.browser import browser_manager
 from core.dependencies import BrowserInfoDep, SessionIdDep, BrowserIdDep
-from models.requests import CreateBrowserRequest, StartSessionRequest
+from models.requests import ConnectBrowserRequest, StartSessionRequest
 from models.responses import BrowserResponse
 
 logger = logging.getLogger(__name__)
@@ -15,11 +15,11 @@ router = APIRouter(tags=["Browsers & Sessions"])
 
 @router.get("/browsers")
 async def list_browsers() -> List[BrowserResponse]:
-    """List all active browsers."""
+    """List all connected browsers."""
     return [
         BrowserResponse(
             browser_id=bid,
-            profile_path=str(info.profile_path) if info.profile_path else None,
+            ws_url=info.ws_url,
             session_count=len(info.pages),
         )
         for bid, info in browser_manager.browsers.items()
@@ -27,32 +27,44 @@ async def list_browsers() -> List[BrowserResponse]:
 
 
 @router.post("/browsers")
-async def create_browser(request: CreateBrowserRequest = CreateBrowserRequest()) -> BrowserResponse:
-    """Create a new browser instance (persistent with profile_uid, or ephemeral)."""
+async def connect_browser(request: ConnectBrowserRequest) -> BrowserResponse:
+    """
+    Connect to a remote browser via its CDP WebSocket URL.
+
+    Idempotent: if the same ``browser_id`` + ``ws_url`` pair is already
+    connected the existing connection is returned.  If the ``browser_id``
+    exists but with a **different** URL, the old connection is dropped and
+    replaced.
+    """
     try:
-        browser_id, browser_info = await browser_manager.create_browser(
-            profile_uid=request.profile_uid,
-            proxy=request.proxy,
+        info = await browser_manager.connect_browser(
+            browser_id=request.browser_id,
+            ws_url=request.ws_url,
         )
-        return BrowserResponse(
-            browser_id=browser_id,
-            profile_path=str(browser_info.profile_path) if browser_info.profile_path else None,
-            session_count=0,
+    except ValueError:
+        # Already connected with a different URL → reconnect
+        await browser_manager.disconnect_browser(request.browser_id)
+        info = await browser_manager.connect_browser(
+            browser_id=request.browser_id,
+            ws_url=request.ws_url,
         )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to connect: {e}")
+
+    return BrowserResponse(
+        browser_id=request.browser_id,
+        ws_url=info.ws_url,
+        session_count=len(info.pages),
+    )
 
 
 @router.delete("/browsers/{browser_id:path}")
-async def delete_browser(browser_id: str) -> dict:
-    """Close and remove a browser instance. Cannot delete the default browser."""
-    try:
-        success = await browser_manager.close_browser(browser_id)
-        if success:
-            return {"status": "success", "message": f"Browser '{browser_id}' closed"}
-        raise HTTPException(status_code=404, detail=f"Browser '{browser_id}' not found")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+async def disconnect_browser(browser_id: str) -> dict:
+    """Disconnect a browser and close all its sessions."""
+    success = await browser_manager.disconnect_browser(browser_id)
+    if success:
+        return {"status": "success", "message": f"Browser '{browser_id}' disconnected"}
+    raise HTTPException(status_code=404, detail=f"Browser '{browser_id}' not connected")
 
 
 @router.post("/start_session")
@@ -60,17 +72,23 @@ async def start_session(
     request: StartSessionRequest = StartSessionRequest(),
     browser_id: BrowserIdDep = None,
 ) -> dict:
-    """Start a new session (page) in a browser and return the session ID."""
-    bid = browser_id or request.browser_id or browser_manager.get_default_browser_id()
+    """Start a new session (page) in a connected browser and return the session ID."""
+    bid = browser_id or request.browser_id
+    if not bid:
+        bid = browser_manager.first_browser_id()
+        if not bid:
+            raise HTTPException(
+                status_code=404,
+                detail="No browsers connected. Register one first via POST /browsers.",
+            )
 
     try:
         browser_info = browser_manager.get_browser(bid)
     except KeyError:
-        logger.info(f"Browser '{bid}' not found, creating it automatically")
-        try:
-            _, browser_info = await browser_manager.create_browser(profile_uid=bid)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to create browser '{bid}': {str(e)}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Browser '{bid}' not connected. Register it first via POST /browsers.",
+        )
 
     session_id = str(uuid.uuid4())
     page = await browser_info.context.new_page()

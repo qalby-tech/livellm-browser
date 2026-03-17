@@ -20,19 +20,26 @@ async def get_browser_info(
 ) -> BrowserInfo:
     """
     Resolve browser info from X-Browser-Id header.
-    Defaults to the default browser. Auto-creates if not found.
+    Falls back to the first connected browser.  Returns 404 if none available.
     """
     manager: BrowserManager = request.app.state.browser_manager
-    bid = browser_id or manager.get_default_browser_id()
+
+    bid = browser_id
+    if not bid:
+        bid = manager.first_browser_id()
+        if not bid:
+            raise HTTPException(
+                status_code=404,
+                detail="No browsers connected. Register one first via POST /browsers.",
+            )
+
     try:
         return manager.get_browser(bid)
     except KeyError:
-        logger.info(f"Browser '{bid}' not found, creating it automatically")
-        try:
-            _, browser_info = await manager.create_browser(profile_uid=bid)
-            return browser_info
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to create browser '{bid}': {str(e)}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Browser '{bid}' not connected. Register it first via POST /browsers.",
+        )
 
 
 BrowserInfoDep = Annotated[BrowserInfo, Depends(get_browser_info)]

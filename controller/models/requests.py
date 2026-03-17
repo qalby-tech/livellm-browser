@@ -16,6 +16,19 @@ class OutputAction(str, Enum):
 
 # ==================== API Request Models ====================
 
+class ConnectBrowserRequest(BaseModel):
+    """Connect to a remote browser via its CDP WebSocket URL."""
+    browser_id: str = Field(..., description="Unique identifier for this browser connection")
+    ws_url: str = Field(..., description="CDP WebSocket URL (e.g. ws://10.0.0.5:34567/devtools/browser/abc-def)")
+
+
+class StartSessionRequest(BaseModel):
+    """Start a new session (browser tab) in a specific browser."""
+    browser_id: Optional[str] = Field(
+        default=None, description="Browser to create session in. Uses first connected browser if omitted.",
+    )
+
+
 class SearchRequest(BaseModel):
     """Google search with structured result parsing and optional wiki panel extraction."""
     query: str = Field(..., description="The search query string")
@@ -44,30 +57,6 @@ class ContentRequest(BaseModel):
     steps: int = Field(default=8, ge=0, description="Number of scroll steps (0 = no scroll, 4-12 recommended)")
     step_delay: float = Field(default=1.5, description="Delay between scroll steps in seconds")
     step_pixels: int = Field(default=1500, description="Pixels to scroll per step")
-
-
-class ProxySettings(BaseModel):
-    """Proxy configuration for a browser instance."""
-    server: str = Field(..., description="Proxy server URL (e.g., 'http://myproxy.com:3128')")
-    username: Optional[str] = Field(default=None, description="Proxy authentication username")
-    password: Optional[str] = Field(default=None, description="Proxy authentication password")
-    bypass: Optional[str] = Field(default=None, description="Comma-separated hosts to bypass proxy")
-
-
-class CreateBrowserRequest(BaseModel):
-    """Create a new browser instance with optional persistent profile and proxy."""
-    profile_uid: Optional[str] = Field(
-        default=None,
-        description="Profile UID for persistent profile in profiles/{uid}. If omitted, creates an ephemeral session.",
-    )
-    proxy: Optional[ProxySettings] = Field(default=None, description="Proxy settings for the browser.")
-
-
-class StartSessionRequest(BaseModel):
-    """Start a new session (browser tab) in a specific browser."""
-    browser_id: Optional[str] = Field(
-        default=None, description="Browser to create session in. Defaults to default browser.",
-    )
 
 
 # ==================== Action Models ====================

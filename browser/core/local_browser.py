@@ -4,10 +4,11 @@ import shutil
 import uuid
 import logging
 import socket
-import urllib.request
+# import urllib.request
+import httpx
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 from patchright.async_api import Playwright, Browser, BrowserContext, Page
 from core.cdp_proxy import CDPProxy
@@ -113,7 +114,6 @@ class LocalBrowserManager:
                 "--enable-webgl",
                 "--enable-gpu",
                 f"--remote-debugging-port={chrome_port}",
-                "--remote-debugging-address=0.0.0.0",
                 "--remote-allow-origins=*",
             ],
         }
@@ -135,20 +135,18 @@ class LocalBrowserManager:
             raise RuntimeError(f"Failed to get browser object for {browser_id}")
 
         ws_endpoint = ""
-        for _ in range(50):
+        async with httpx.AsyncClient() as client:
             try:
-                # Use urllib to fetch the WebSocket endpoint from Chrome's HTTP debugger
-                req = urllib.request.Request(f"http://127.0.0.1:{chrome_port}/json/version")
-                with urllib.request.urlopen(req, timeout=1.0) as response:
-                    data = json.loads(response.read().decode())
-                    full_ws_url = data.get("webSocketDebuggerUrl")
-                    if full_ws_url:
-                        # Extract the path (e.g., /devtools/browser/abc-def)
-                        ws_endpoint = "/" + "/".join(full_ws_url.split("/")[3:])
-                        break
+                response = await client.get(f"http://127.0.0.1:{chrome_port}/json/version", timeout=10.0)
+                response.raise_for_status()
+                data: dict[str, Any] = response.json()
+                full_ws_url: str = data.get("webSocketDebuggerUrl", "")
+                if full_ws_url:
+                    #   "webSocketDebuggerUrl": "ws://localhost:9222/devtools/browser/c72f5f19-4b99-4607-bee7-0ec9805a018c"
+                    # Extract the path (e.g., /devtools/browser/abc-def)
+                    ws_endpoint = "/" + full_ws_url.replace("ws://", "").split("/", 1)[1]
             except Exception:
                 pass
-            await asyncio.sleep(0.2)
 
         if not ws_endpoint:
             logger.warning(f"Could not retrieve WS endpoint from Chrome on port {chrome_port}")

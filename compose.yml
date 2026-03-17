@@ -25,10 +25,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1'
+          cpus: '2'
           memory: '4gb'
         reservations:
-          cpus: '0.5'
+          cpus: '1'
           memory: '2gb'
 
   livellm-controller:
@@ -40,9 +40,6 @@ services:
     ports:
       # FastAPI Controller
       - "8000:8000"
-    environment:
-      - LAUNCHER_URL=http://livellm-browser:9000
-      - LAUNCHER_HOST=livellm-browser
     depends_on:
       - livellm-browser
     restart: unless-stopped
@@ -51,6 +48,43 @@ services:
         limits:
           cpus: '1'
           memory: '2gb'
+
+  register-browser:
+    image: curlimages/curl:latest
+    container_name: register-browser
+    depends_on:
+      - livellm-browser
+      - livellm-controller
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Waiting for browser service..."
+        until curl -sf http://livellm-browser:9000/browsers > /dev/null 2>&1; do
+          sleep 2
+        done
+
+        echo "Waiting for controller..."
+        until curl -sf http://livellm-controller:8000/ping > /dev/null 2>&1; do
+          sleep 2
+        done
+
+        BROWSER_JSON=$$(curl -sf http://livellm-browser:9000/browsers)
+        echo "Discovered browsers: $$BROWSER_JSON"
+
+        BROWSER_ID=$$(echo "$$BROWSER_JSON" | sed -n 's/.*"browser_id" *: *"\([^"]*\)".*/\1/p' | head -1)
+        CDP_PORT=$$(echo "$$BROWSER_JSON"   | sed -n 's/.*"cdp_port" *: *\([0-9]*\).*/\1/p'       | head -1)
+        WS_EP=$$(echo "$$BROWSER_JSON"      | sed -n 's/.*"ws_endpoint" *: *"\([^"]*\)".*/\1/p'   | head -1)
+
+        WS_URL="ws://livellm-browser:$${CDP_PORT}$${WS_EP}"
+        echo "Registering browser_id=$$BROWSER_ID ws_url=$$WS_URL"
+
+        curl -sf -X POST http://livellm-controller:8000/parser/browsers \
+          -H "Content-Type: application/json" \
+          -d "{\"browser_id\": \"$$BROWSER_ID\", \"ws_url\": \"$$WS_URL\"}"
+
+        echo ""
+        echo "Done — browser registered."
 
 volumes:
   profiles_volume:

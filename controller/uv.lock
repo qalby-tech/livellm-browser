@@ -221,7 +221,6 @@ source = { virtual = "." }
 dependencies = [
     { name = "beautifulsoup4" },
     { name = "fastapi" },
-    { name = "httpx" },
     { name = "lxml" },
     { name = "patchright" },
     { name = "pydantic" },
@@ -239,7 +238,6 @@ dev = [
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.12.0" },
     { name = "fastapi", specifier = ">=0.121.3" },
-    { name = "httpx", specifier = ">=0.27.0" },
     { name = "lxml", specifier = ">=5.0.0" },
     { name = "patchright", specifier = "==1.56.0" },
     { name = "pydantic", specifier = ">=2.12.4" },

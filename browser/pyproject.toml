@@ -9,4 +9,6 @@ dependencies = [
     "pydantic>=2.12.4",
     "uvicorn>=0.38.0",
     "patchright==1.56.0",
+    "httpx>=0.28.1",
 ]
+# patchright version is actually critical

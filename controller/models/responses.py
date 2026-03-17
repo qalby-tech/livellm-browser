@@ -9,7 +9,7 @@ class PingResponse(BaseModel):
 
 class BrowserResponse(BaseModel):
     browser_id: str
-    profile_path: Optional[str]
+    ws_url: str
     session_count: int
 
 

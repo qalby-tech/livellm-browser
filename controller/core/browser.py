@@ -41,22 +41,26 @@ class BrowserManager:
         """
         Connect to a remote browser over CDP.
 
-        If ``browser_id`` is already connected **with the same URL**, the
-        existing connection is returned (idempotent).  If the URL differs,
-        ``ValueError`` is raised — disconnect first.
+        If ``browser_id`` is already connected **with the same URL** and the
+        connection is still alive, the existing connection is returned.
+        If the connection is dead (e.g. browser restarted), it auto-reconnects.
+        If the URL differs, ``ValueError`` is raised — disconnect first.
         """
         if not self.playwright:
             raise RuntimeError("Browser manager not started")
 
         if browser_id in self.browsers:
             existing = self.browsers[browser_id]
-            if existing.ws_url == ws_url:
+            if existing.ws_url == ws_url and existing.browser.is_connected():
                 logger.info(f"Browser '{browser_id}' already connected (idempotent)")
                 return existing
-            raise ValueError(
-                f"Browser '{browser_id}' already connected with a different URL. "
-                "Disconnect it first."
-            )
+            if existing.ws_url != ws_url:
+                raise ValueError(
+                    f"Browser '{browser_id}' already connected with a different URL. "
+                    "Disconnect it first."
+                )
+            logger.info(f"Browser '{browser_id}' connection is dead, reconnecting...")
+            await self.disconnect_browser(browser_id)
 
         logger.info(f"Connecting to browser '{browser_id}' via {ws_url}")
         browser = await self.playwright.chromium.connect_over_cdp(ws_url)

@@ -21,6 +21,7 @@ async def get_browser_info(
     """
     Resolve browser info from X-Browser-Id header.
     Falls back to the first connected browser.  Returns 404 if none available.
+    Auto-reconnects if the browser connection died (e.g. after a restart).
     """
     manager: BrowserManager = request.app.state.browser_manager
 
@@ -34,12 +35,25 @@ async def get_browser_info(
             )
 
     try:
-        return manager.get_browser(bid)
+        info = manager.get_browser(bid)
     except KeyError:
         raise HTTPException(
             status_code=404,
             detail=f"Browser '{bid}' not connected. Register it first via POST /browsers.",
         )
+
+    if not info.browser.is_connected():
+        logger.info(f"Browser '{bid}' connection is dead, auto-reconnecting...")
+        try:
+            info = await manager.connect_browser(bid, info.ws_url)
+        except Exception as e:
+            logger.error(f"Failed to reconnect browser '{bid}': {e}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Browser '{bid}' disconnected and reconnection failed: {e}",
+            )
+
+    return info
 
 
 BrowserInfoDep = Annotated[BrowserInfo, Depends(get_browser_info)]

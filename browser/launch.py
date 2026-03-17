@@ -8,10 +8,10 @@ from pydantic import BaseModel
 import uvicorn
 from patchright.async_api import async_playwright
 
+from core.const import PROFILES_DIR, DEFAULT_BROWSER_ID, STABLE_WS_PREFIX
 from core.local_browser import (
-    local_browser_manager, PROFILES_DIR, DEFAULT_BROWSER_ID,
-    cleanup_profile_locks, download_extension, inject_extension_into_profile,
-    remove_extension_from_profile, list_profile_extensions, set_extension_enabled,
+    local_browser_manager,
+    cleanup_profile_locks, download_extension, list_profile_extensions
 )
 
 class ProxySettings(BaseModel):
@@ -30,6 +30,7 @@ class BrowserResponse(BaseModel):
     browser_id: str
     cdp_port: int
     ws_endpoint: str
+    ws_stable_endpoint: str
     profile_path: Optional[str] = None
 
 class ExtensionsRequest(BaseModel):
@@ -79,7 +80,8 @@ async def list_browsers() -> list[BrowserResponse]:
             browser_id=bid,
             cdp_port=info.proxy_port,
             ws_endpoint=info.ws_endpoint,
-            profile_path=str(info.profile_path) if info.profile_path else None
+            ws_stable_endpoint=f"{STABLE_WS_PREFIX}/{bid}",
+            profile_path=str(info.profile_path) if info.profile_path else None,
         )
         for bid, info in local_browser_manager.browsers.items()
     ]
@@ -97,7 +99,8 @@ async def create_browser(request: CreateBrowserRequest = CreateBrowserRequest())
             browser_id=browser_id,
             cdp_port=info.proxy_port,
             ws_endpoint=info.ws_endpoint,
-            profile_path=str(info.profile_path) if info.profile_path else None
+            ws_stable_endpoint=f"{STABLE_WS_PREFIX}/{browser_id}",
+            profile_path=str(info.profile_path) if info.profile_path else None,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -121,7 +124,8 @@ async def restart_browser(browser_id: str) -> BrowserResponse:
             browser_id=browser_id,
             cdp_port=info.proxy_port,
             ws_endpoint=info.ws_endpoint,
-            profile_path=str(info.profile_path) if info.profile_path else None
+            ws_stable_endpoint=f"{STABLE_WS_PREFIX}/{browser_id}",
+            profile_path=str(info.profile_path) if info.profile_path else None,
         )
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Browser '{browser_id}' not found")
@@ -184,7 +188,8 @@ async def add_extensions(browser_id: str, request: ExtensionsRequest) -> Browser
             browser_id=browser_id,
             cdp_port=new_info.proxy_port,
             ws_endpoint=new_info.ws_endpoint,
-            profile_path=str(new_info.profile_path) if new_info.profile_path else None
+            ws_stable_endpoint=f"{STABLE_WS_PREFIX}/{browser_id}",
+            profile_path=str(new_info.profile_path) if new_info.profile_path else None,
         )
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Browser '{browser_id}' not found")
@@ -204,7 +209,8 @@ async def delete_extension(browser_id: str, extension_id: str) -> BrowserRespons
             browser_id=browser_id,
             cdp_port=new_info.proxy_port,
             ws_endpoint=new_info.ws_endpoint,
-            profile_path=str(new_info.profile_path) if new_info.profile_path else None
+            ws_stable_endpoint=f"{STABLE_WS_PREFIX}/{browser_id}",
+            profile_path=str(new_info.profile_path) if new_info.profile_path else None,
         )
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Browser '{browser_id}' not found")
@@ -230,7 +236,8 @@ async def toggle_extension(browser_id: str, extension_id: str, request: ToggleEx
             browser_id=browser_id,
             cdp_port=new_info.proxy_port,
             ws_endpoint=new_info.ws_endpoint,
-            profile_path=str(new_info.profile_path) if new_info.profile_path else None
+            ws_stable_endpoint=f"{STABLE_WS_PREFIX}/{browser_id}",
+            profile_path=str(new_info.profile_path) if new_info.profile_path else None,
         )
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Browser or extension '{extension_id}' not found")

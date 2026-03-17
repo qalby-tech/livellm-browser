@@ -2,6 +2,8 @@ import asyncio
 import re
 import logging
 
+from core.const import STABLE_WS_PREFIX
+
 logger = logging.getLogger(__name__)
 
 class CDPProxy:
@@ -50,7 +52,7 @@ class CDPProxy:
                         # Rewrite the request path to current ws_endpoint
                         if self.ws_endpoint:
                             text_data = re.sub(
-                                r'^(GET\s+)/devtools/browser/[^\s]+',
+                                rf'^(GET\s+){re.escape(STABLE_WS_PREFIX)}/[^\s]+',
                                 rf'\g<1>{self.ws_endpoint}',
                                 text_data,
                                 count=1

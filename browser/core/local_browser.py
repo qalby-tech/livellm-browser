@@ -14,12 +14,9 @@ from typing import Optional, Any, List
 
 from patchright.async_api import Playwright, Browser, BrowserContext, Page
 from core.cdp_proxy import CDPProxy
+from core.const import PROFILES_DIR, EXTENSIONS_CACHE_DIR, DEFAULT_BROWSER_ID, STABLE_WS_PREFIX
 
 logger = logging.getLogger(__name__)
-
-PROFILES_DIR = Path(os.environ.get("PROFILES_DIR", "/home/headless/Desktop/app/profiles"))
-EXTENSIONS_CACHE_DIR = Path(os.environ.get("EXTENSIONS_CACHE_DIR", "/home/headless/Desktop/app/extensions_cache"))
-DEFAULT_BROWSER_ID = "default"
 
 
 async def download_extension(extension_id: str) -> Path:

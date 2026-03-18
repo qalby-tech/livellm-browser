@@ -7,12 +7,13 @@ from fastapi import APIRouter, HTTPException
 from patchright.async_api import Page, ElementHandle
 
 from core.dependencies import PageDep
-from models.requests import SearchRequest
+from models.requests import SearchRequest, SearchHintsRequest
 from models.responses import (
     SearchResponse, SearchResult, SearchMetadata,
     RatingMetadata, WikiResult, AiReview,
     NewsResponse, NewsResult,
-    ImagesResponse, VideosResponse, MediaResult
+    ImagesResponse, VideosResponse, MediaResult, MediaTags,
+    SearchHintsResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -361,10 +362,26 @@ async def _parse_video_results(
             icon_element = await result_div.query_selector('img[src]')
             icon = await icon_element.get_attribute('src') if icon_element else None
 
+            tags_data = await result_div.evaluate(
+                '(el) => {'
+                '  const cite = el.querySelector("cite");'
+                '  if (!cite) return null;'
+                '  const text = cite.closest("span")?.parentElement?.innerText || cite.innerText;'
+                '  if (!text) return null;'
+                '  const clean = text.split("·").map(t => t.trim()).filter(t => t);'
+                '  if (clean.length === 0) return null;'
+                '  if (clean.length === 1) return { source: clean[0], author: null, date: null };'
+                '  if (clean.length === 2) return { source: clean[0], author: null, date: clean[1] };'
+                '  return { source: clean[0], author: clean[1], date: clean[2] };'
+                '}'
+            )
+            tags = MediaTags(**tags_data) if tags_data else None
+
             results.append(MediaResult(
                 link=link,
                 title=title,
                 icon=icon,
+                tags=tags,
             ))
         except Exception:
             continue
@@ -495,6 +512,66 @@ async def search_images(request: SearchRequest, page: PageDep) -> ImagesResponse
         return ImagesResponse(results=results)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to search images: {str(e)}")
+
+
+@router.post("/search_hints")
+async def search_hints(request: SearchHintsRequest, page: PageDep) -> SearchHintsResponse:
+    """
+    Get Google autocomplete suggestions (search hints) for a query.
+
+    Navigates to Google, types the query into the search box, waits for
+    autocomplete suggestions to appear, and extracts them.
+    """
+    try:
+        await page.goto("https://www.google.com", wait_until="commit")
+        await asyncio.sleep(request.idle)
+
+        search_input = page.locator('textarea[name="q"], input[name="q"]').first
+        await search_input.click()
+        await search_input.fill(request.query)
+
+        await asyncio.sleep(request.wait)
+
+        hints = await page.evaluate("""
+            () => {
+                const hints = [];
+
+                const options = document.querySelectorAll('[role="listbox"] [role="option"]');
+                for (const opt of options) {
+                    const label = opt.getAttribute('aria-label');
+                    if (label) {
+                        hints.push(label);
+                        continue;
+                    }
+                    const spans = opt.querySelectorAll('span');
+                    const texts = [];
+                    for (const span of spans) {
+                        if (span.closest('[role="img"]') || span.querySelector('span')) continue;
+                        const t = span.textContent.trim();
+                        if (t && !texts.includes(t)) texts.push(t);
+                    }
+                    if (texts.length > 0) {
+                        hints.push(texts.join(' '));
+                    }
+                }
+
+                if (hints.length > 0) return hints;
+
+                const datalist = document.querySelector('datalist');
+                if (datalist) {
+                    for (const opt of datalist.querySelectorAll('option')) {
+                        const val = opt.getAttribute('value') || opt.textContent.trim();
+                        if (val) hints.push(val);
+                    }
+                }
+
+                return hints;
+            }
+        """)
+
+        return SearchHintsResponse(query=request.query, hints=hints)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get search hints: {str(e)}")
 
 
 @router.post("/search_videos")

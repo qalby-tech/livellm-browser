@@ -33,9 +33,11 @@ jobs:
           version: "latest"
       
       - name: Install dependencies
+        working-directory: controller
         run: uv sync --all-extras
             
       - name: Run tests
+        working-directory: controller
         run: uv run pytest tests/ -v --tb=short
 
   build-and-push:
@@ -62,31 +64,44 @@ jobs:
       - name: Extract version from pyproject.toml
         id: version
         run: |
-          VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
-          if [ "${{ github.ref }}" = "refs/heads/develop" ]; then
-            VERSION="dev-${VERSION}"
-          fi
+          VERSION=$(grep '^version = ' controller/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
           echo "Extracted version: $VERSION"
-      
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=${{ steps.version.outputs.VERSION }}
-      
-      - name: Build and push Docker image
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          if [ "${{ github.ref }}" = "refs/heads/develop" ]; then
+            echo "BROWSER_TAG=${IMAGE}:dev-${VERSION}" >> $GITHUB_OUTPUT
+            echo "CONTROLLER_TAG=${IMAGE}:dev-controller-${VERSION}" >> $GITHUB_OUTPUT
+          else
+            echo "BROWSER_TAG=${IMAGE}:${VERSION}" >> $GITHUB_OUTPUT
+            echo "CONTROLLER_TAG=${IMAGE}:controller-${VERSION}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and push browser image
         uses: docker/build-push-action@v5
         with:
-          context: .
+          context: ./browser
+          file: ./browser/Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ steps.tags.outputs.BROWSER_TAG }}
+          cache-from: type=gha,scope=browser
+          cache-to: type=gha,mode=max,scope=browser
+
+      - name: Build and push controller image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./controller
+          file: ./controller/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.CONTROLLER_TAG }}
+          cache-from: type=gha,scope=controller
+          cache-to: type=gha,mode=max,scope=controller
   
   update-chart:
     needs: build-and-push
@@ -101,11 +116,12 @@ jobs:
       - name: Extract version from pyproject.toml
         id: version
         run: |
-          VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          VERSION=$(grep '^version = ' controller/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
           if [ "${{ github.ref }}" = "refs/heads/develop" ]; then
-            VERSION="dev-${VERSION}"
+            echo "VERSION=dev-${VERSION}" >> $GITHUB_OUTPUT
+          else
+            echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
           fi
-          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
           echo "Extracted version: $VERSION"
 
       - name: Determine chart branch

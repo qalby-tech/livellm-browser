@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from pydantic import BaseModel, Field
 from typing import Literal, List, Optional
 
@@ -62,10 +64,18 @@ class NewsResponse(BaseModel):
     results: List[NewsResult]
 
 
+class MediaTags(BaseModel):
+    source: Optional[str] = None
+    author: Optional[str] = None
+    date: Optional[str] = None
+
+
 class MediaResult(BaseModel):
     link: str
     title: str
     icon: Optional[str] = Field(None, description="Base64-encoded icon/thumbnail data URL")
+    tags: Optional[MediaTags] = None
+    search_date: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Datetime when the result was parsed")
 
 
 class ImagesResponse(BaseModel):
@@ -74,3 +84,8 @@ class ImagesResponse(BaseModel):
 
 class VideosResponse(BaseModel):
     results: List[MediaResult]
+
+
+class SearchHintsResponse(BaseModel):
+    query: str = Field(..., description="The original query")
+    hints: List[str] = Field(default_factory=list, description="List of autocomplete suggestions")

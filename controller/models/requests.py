@@ -37,6 +37,13 @@ class SearchRequest(BaseModel):
     max_pages: int = Field(default=10, ge=1, description="Maximum number of Google result pages to paginate through")
 
 
+class SearchHintsRequest(BaseModel):
+    """Get Google autocomplete suggestions (search hints) for a query."""
+    query: str = Field(..., description="The search query to get hints for")
+    idle: float = Field(default=1.0, description="Idle time in seconds after page loads")
+    wait: float = Field(default=1.5, description="Time in seconds to wait for suggestions to appear after typing")
+
+
 class ContentRequest(BaseModel):
     """
     Get page content with automatic scrolling.

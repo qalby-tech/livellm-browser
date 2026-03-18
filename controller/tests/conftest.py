@@ -19,18 +19,15 @@ def mock_page():
     page.close = AsyncMock()
     page.screenshot = AsyncMock(return_value=b"fake_png_bytes")
 
-    # Mock locator for xpath selectors
     mock_locator = MagicMock()
     mock_locator.count = AsyncMock(return_value=0)
     page.locator = MagicMock(return_value=mock_locator)
 
-    # Mock mouse for interact actions
     page.mouse = MagicMock()
     page.mouse.move = AsyncMock()
     page.mouse.click = AsyncMock()
     page.mouse.wheel = AsyncMock()
 
-    # Mock context for login action
     page.context = MagicMock()
     page.context.set_extra_http_headers = AsyncMock()
 
@@ -42,6 +39,7 @@ def mock_browser():
     """Create a mock Browser object."""
     browser = AsyncMock()
     browser.close = AsyncMock()
+    browser.is_connected = MagicMock(return_value=True)
     return browser
 
 
@@ -57,46 +55,36 @@ def mock_browser_context(mock_page, mock_browser):
 
 
 @pytest.fixture
-def mock_playwright(mock_browser_context):
+def mock_playwright(mock_browser_context, mock_browser):
     """Create a mock Playwright object."""
     playwright = AsyncMock()
-    playwright.chromium.launch_persistent_context = AsyncMock(return_value=mock_browser_context)
+    playwright.chromium.connect_over_cdp = AsyncMock(return_value=mock_browser)
+    mock_browser.contexts = [mock_browser_context]
     playwright.stop = AsyncMock()
     return playwright
 
 
 @pytest.fixture
 def mock_browser_manager(mock_playwright, mock_browser_context, mock_browser, mock_page):
-    """Create a mock BrowserManager object."""
-    from pathlib import Path
+    """Create a mock BrowserManager matching develop branch's CDP-based architecture."""
+    from core.browser import BrowserInfo
 
-    # Create a mock BrowserInfo
-    browser_info = MagicMock()
-    browser_info.browser = mock_browser
-    browser_info.context = mock_browser_context
-    browser_info.profile_path = Path("./profiles/default")
+    browser_info = BrowserInfo(mock_browser, mock_browser_context, ws_url="ws://localhost:9222/devtools/browser/test")
     browser_info.pages = {}
 
-    # Create mock browser manager
     manager = MagicMock()
     manager.playwright = mock_playwright
-    manager.browsers = {"./profiles/default": browser_info}
+    manager.browsers = {"test-browser": browser_info}
 
-    async def mock_create_browser(profile_uid=None, proxy=None):
-        new_browser_info = MagicMock()
-        new_browser_info.browser = mock_browser
-        new_browser_info.context = mock_browser_context
-        browser_id = profile_uid if profile_uid else "test-uuid"
-        new_browser_info.profile_path = Path(f"./profiles/{browser_id}")
-        new_browser_info.pages = {}
-        manager.browsers[browser_id] = new_browser_info
-        return browser_id, new_browser_info
+    async def mock_connect_browser(browser_id, ws_url):
+        new_info = BrowserInfo(mock_browser, mock_browser_context, ws_url=ws_url)
+        manager.browsers[browser_id] = new_info
+        return new_info
 
-    manager.create_browser = mock_create_browser
+    manager.connect_browser = mock_connect_browser
+    manager.disconnect_browser = AsyncMock(return_value=True)
     manager.get_browser = MagicMock(return_value=browser_info)
-    manager.get_default_browser = MagicMock(return_value=browser_info)
-    manager.get_default_browser_id = MagicMock(return_value="./profiles/default")
-    manager.close_browser = AsyncMock(return_value=True)
+    manager.first_browser_id = MagicMock(return_value="test-browser")
     manager.shutdown = AsyncMock()
 
     return manager
@@ -113,17 +101,15 @@ def client(mock_playwright, mock_browser_context, mock_page, mock_browser_manage
         from main import app
         from core.browser import browser_manager
 
-        # Pre-configure app state
         app.state.playwright = mock_playwright
         app.state.browser_manager = mock_browser_manager
 
-        # Patch the global browser_manager singleton
         with patch.object(browser_manager, 'playwright', mock_playwright), \
              patch.object(browser_manager, 'browsers', mock_browser_manager.browsers), \
-             patch.object(browser_manager, 'create_browser', mock_browser_manager.create_browser), \
+             patch.object(browser_manager, 'connect_browser', mock_browser_manager.connect_browser), \
+             patch.object(browser_manager, 'disconnect_browser', mock_browser_manager.disconnect_browser), \
              patch.object(browser_manager, 'get_browser', mock_browser_manager.get_browser), \
-             patch.object(browser_manager, 'get_default_browser', mock_browser_manager.get_default_browser), \
-             patch.object(browser_manager, 'get_default_browser_id', mock_browser_manager.get_default_browser_id):
+             patch.object(browser_manager, 'first_browser_id', mock_browser_manager.first_browser_id):
 
             with TestClient(app) as test_client:
                 yield test_client

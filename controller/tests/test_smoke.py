@@ -339,7 +339,7 @@ class TestOpenAPISchema:
         assert response.status_code == 200
         schema = response.json()
         assert schema["info"]["title"] == "Controller API"
-        assert schema["info"]["version"] == "0.3.0"
+        assert schema["info"]["version"] == "0.4.0"
 
     def test_docs_endpoint_available(self, client: TestClient):
         response = client.get("/docs")
@@ -471,81 +471,35 @@ class TestInteractEndpoint:
 
 
 class TestBrowserManagement:
-    """Tests for browser management endpoints."""
+    """Tests for browser management endpoints (CDP connect/disconnect model)."""
 
     def test_list_browsers(self, client: TestClient):
         response = client.get("/browsers")
         assert response.status_code == 200
-        assert isinstance(response.json(), list)
+        data = response.json()
+        assert isinstance(data, list)
+        if len(data) > 0:
+            assert "browser_id" in data[0]
+            assert "ws_url" in data[0]
+            assert "session_count" in data[0]
 
-    def test_create_browser_without_params(self, client: TestClient):
-        response = client.post("/browsers", json={})
+    def test_connect_browser(self, client: TestClient):
+        response = client.post(
+            "/browsers",
+            json={"browser_id": "my-browser", "ws_url": "ws://localhost:9222/devtools/browser/abc"},
+        )
         assert response.status_code == 200
         data = response.json()
-        assert "browser_id" in data
-        assert "profile_path" in data
+        assert data["browser_id"] == "my-browser"
+        assert "ws_url" in data
 
-    def test_create_browser_with_profile_uid(self, client: TestClient):
-        response = client.post("/browsers", json={"profile_uid": "test-profile-uid"})
-        assert response.status_code == 200
-        assert response.json()["browser_id"] == "test-profile-uid"
-
-    def test_create_browser_with_proxy(self, client: TestClient):
-        response = client.post(
-            "/browsers",
-            json={"proxy": {"server": "http://proxy.example.com:8080"}},
-        )
-        assert response.status_code == 200
-
-    def test_create_browser_with_proxy_auth(self, client: TestClient):
-        response = client.post(
-            "/browsers",
-            json={
-                "proxy": {
-                    "server": "http://proxy.example.com:8080",
-                    "username": "proxyuser",
-                    "password": "proxypass",
-                },
-            },
-        )
-        assert response.status_code == 200
-
-    def test_create_browser_with_proxy_bypass(self, client: TestClient):
-        response = client.post(
-            "/browsers",
-            json={"proxy": {"server": "http://proxy.example.com:8080", "bypass": "localhost,*.local,192.168.*"}},
-        )
-        assert response.status_code == 200
-
-    def test_create_browser_with_socks_proxy(self, client: TestClient):
-        response = client.post(
-            "/browsers",
-            json={"proxy": {"server": "socks5://127.0.0.1:1080"}},
-        )
-        assert response.status_code == 200
-
-    def test_create_browser_with_all_proxy_options(self, client: TestClient):
-        response = client.post(
-            "/browsers",
-            json={
-                "profile_uid": "proxied-browser-uid",
-                "proxy": {
-                    "server": "http://proxy.example.com:8080",
-                    "username": "user",
-                    "password": "pass",
-                    "bypass": "localhost,*.internal.com",
-                },
-            },
-        )
-        assert response.status_code == 200
-        assert response.json()["browser_id"] == "proxied-browser-uid"
-
-    def test_proxy_requires_server(self, client: TestClient):
-        response = client.post(
-            "/browsers",
-            json={"proxy": {"username": "user", "password": "pass"}},
-        )
+    def test_connect_browser_requires_fields(self, client: TestClient):
+        response = client.post("/browsers", json={})
         assert response.status_code == 422
+
+    def test_disconnect_browser(self, client: TestClient):
+        response = client.delete("/browsers/test-browser")
+        assert response.status_code == 200
 
 
 class TestAttributeEndpoint:

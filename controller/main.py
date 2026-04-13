@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI):
     app.state.playwright = playwright
     app.state.browser_manager = browser_manager
 
-    # Auto-discover browsers from Redis on startup
+    # Initial Redis discovery (immediate connect on startup)
     try:
         browsers = await redis_controller_state.get_all_browsers()
         for browser_id, ws_url in browsers.items():
@@ -59,20 +59,23 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to auto-discover browsers from Redis: {e}")
 
-    logger.info("Controller started — browsers discovered from Redis")
+    # Start background Redis sync (continuously reconciles browsers)
+    await redis_controller_state.start_sync(browser_manager)
+
+    logger.info("Controller started — browser discovery via Redis (sync every 10s)")
 
     yield
 
     # Graceful shutdown
     logger.info("Application shutting down, cleaning up resources...")
     try:
-        await browser_manager.shutdown(timeout=25.0)
-    except Exception as e:
-        logger.error(f"Error during browser shutdown: {e}")
-    try:
         await redis_controller_state.disconnect()
     except Exception as e:
         logger.warning(f"Error disconnecting from Redis: {e}")
+    try:
+        await browser_manager.shutdown(timeout=25.0)
+    except Exception as e:
+        logger.error(f"Error during browser shutdown: {e}")
     # Use manager's playwright (may have been restarted during recovery)
     pw = browser_manager.playwright or playwright
     try:

@@ -1,6 +1,6 @@
 [project]
 name = "livellm-controller"
-version = "2.1.1"
+version = "2.1.2"
 description = "Controller API that connects to livellm-browser over CDP"
 readme = "README.md"
 requires-python = "==3.9.*"
@@ -11,6 +11,7 @@ dependencies = [
     "patchright==1.56.0",
     "beautifulsoup4>=4.12.0",
     "lxml>=5.0.0",
+    "redis>=5.0.0",
 ]
 
 [dependency-groups]

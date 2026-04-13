@@ -6,6 +6,7 @@ from fastapi import Depends, Header, HTTPException, Request
 from patchright.async_api import Page
 
 from core.browser import BrowserInfo, BrowserManager
+from core.redis_state import redis_controller_state
 
 logger = logging.getLogger(__name__)
 
@@ -37,15 +38,30 @@ async def get_browser_info(
     try:
         info = manager.get_browser(bid)
     except KeyError:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Browser '{bid}' not connected. Register it first via POST /browsers.",
-        )
+        # Try to auto-discover from Redis
+        ws_url = await redis_controller_state.get_browser_ws_url(bid)
+        if ws_url:
+            logger.info(f"Auto-discovered browser '{bid}' from Redis, connecting...")
+            try:
+                info = await manager.connect_browser(bid, ws_url)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Browser '{bid}' found in Redis but connection failed: {e}",
+                )
+        else:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Browser '{bid}' not found. Ensure the browser is running.",
+            )
 
     if not info.browser.is_connected():
         logger.info(f"Browser '{bid}' connection is dead, auto-reconnecting...")
+        # Try Redis first for a fresh WS URL
+        fresh_ws_url = await redis_controller_state.get_browser_ws_url(bid)
+        reconnect_url = fresh_ws_url or info.ws_url
         try:
-            info = await manager.recover_connection(bid, info.ws_url)
+            info = await manager.recover_connection(bid, reconnect_url)
         except Exception as e:
             logger.error(f"Failed to reconnect browser '{bid}': {e}")
             raise HTTPException(

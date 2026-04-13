@@ -15,6 +15,7 @@ from typing import Optional, Any, List
 from patchright.async_api import Playwright, Browser, BrowserContext, Page
 from core.cdp_proxy import CDPProxy
 from core.const import PROFILES_DIR, EXTENSIONS_CACHE_DIR, DEFAULT_BROWSER_ID, STABLE_WS_PREFIX
+from core.redis_state import redis_browser_state
 
 logger = logging.getLogger(__name__)
 
@@ -414,6 +415,10 @@ class LocalBrowserManager:
 
         kind = "persistent" if is_persistent else "ephemeral"
         logger.info(f"Created {kind} browser '{browser_id}' on proxy port {proxy_port}" + (f" with profile at {profile_path}" if is_persistent else ""))
+
+        # Register with Redis so the controller can discover this browser
+        await redis_browser_state.register_browser(browser_id, proxy_port)
+
         return browser_id, browser_info
 
     def get_browser(self, browser_id: str) -> LocalBrowserInfo:
@@ -453,6 +458,10 @@ class LocalBrowserManager:
 
         del self.browsers[browser_id]
         logger.info(f"Closed browser '{browser_id}'")
+
+        # Unregister from Redis
+        await redis_browser_state.unregister_browser(browser_id)
+
         return True
 
     async def restart_browser(self, browser_id: str, inject_extensions: Optional[List[tuple]] = None, remove_extensions: Optional[List[str]] = None, toggle_extensions: Optional[List[tuple]] = None) -> LocalBrowserInfo:
@@ -551,10 +560,18 @@ class LocalBrowserManager:
         self.browsers[browser_id] = browser_info
 
         logger.info(f"Restarted browser '{browser_id}' (proxy :{proxy_port} -> Chrome :{chrome_port})")
+
+        # Re-register in Redis (WS URL may have changed)
+        await redis_browser_state.register_browser(browser_id, proxy_port)
+
         return browser_info
 
     async def shutdown(self, timeout: float = 25.0):
         logger.info("Starting browser shutdown...")
+
+        # Unregister all browsers from Redis
+        await redis_browser_state.unregister_all()
+
         async def _shutdown_task():
             for browser_id in list(self.browsers.keys()):
                 info = self.browsers[browser_id]

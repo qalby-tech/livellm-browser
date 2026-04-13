@@ -1,4 +1,11 @@
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: livellm-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
   livellm-browser:
     build:
       context: ./browser
@@ -16,9 +23,13 @@ services:
       - VNC_PW=headless
       - VNC_RESOLUTION=1920x1080
       - DISPLAY=:1
+      - REDIS_URL=redis://redis:6379/0
+      - BROWSER_ADDRESS=livellm-browser
     volumes:
       # Mount profiles directory from host with read/write access
       - profiles_volume:/home/headless/Desktop/app/profiles:rw
+    depends_on:
+      - redis
     restart: unless-stopped
     stop_grace_period: 10s
     shm_size: '4gb'
@@ -40,7 +51,10 @@ services:
     ports:
       # FastAPI Controller
       - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
     depends_on:
+      - redis
       - livellm-browser
     restart: unless-stopped
     deploy:
@@ -48,42 +62,6 @@ services:
         limits:
           cpus: '1'
           memory: '2gb'
-
-  register-browser:
-    image: curlimages/curl:latest
-    container_name: register-browser
-    depends_on:
-      - livellm-browser
-      - livellm-controller
-    restart: "no"
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        echo "Waiting for browser service..."
-        until curl -sf http://livellm-browser:9000/browsers > /dev/null 2>&1; do
-          sleep 2
-        done
-
-        echo "Waiting for controller..."
-        until curl -sf http://livellm-controller:8000/ping > /dev/null 2>&1; do
-          sleep 2
-        done
-
-        BROWSER_JSON=$$(curl -sf http://livellm-browser:9000/browsers)
-        echo "Discovered browsers: $$BROWSER_JSON"
-
-        BROWSER_ID=$$(echo "$$BROWSER_JSON" | sed -n 's/.*"browser_id" *: *"\([^"]*\)".*/\1/p' | head -1)
-        CDP_PORT=$$(echo "$$BROWSER_JSON"   | sed -n 's/.*"cdp_port" *: *\([0-9]*\).*/\1/p'       | head -1)
-
-        WS_URL="ws://livellm-browser:$${CDP_PORT}/devtools/browser/default"
-        echo "Registering browser_id=$$BROWSER_ID ws_url=$$WS_URL"
-
-        curl -sf -X POST http://livellm-controller:8000/parser/browsers \
-          -H "Content-Type: application/json" \
-          -d "{\"browser_id\": \"$$BROWSER_ID\", \"ws_url\": \"$$WS_URL\"}"
-
-        echo ""
-        echo "Done — browser registered."
 
 volumes:
   profiles_volume:

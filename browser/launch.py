@@ -13,6 +13,7 @@ from core.local_browser import (
     local_browser_manager,
     cleanup_profile_locks, download_extension, list_profile_extensions
 )
+from core.redis_state import redis_browser_state
 
 class ProxySettings(BaseModel):
     server: str
@@ -48,6 +49,12 @@ async def lifespan(app: FastAPI):
     cleanup_profile_locks(default_profile)
     default_profile.mkdir(parents=True, exist_ok=True)
 
+    # Connect to Redis for browser state publishing
+    try:
+        await redis_browser_state.connect()
+    except Exception as e:
+        logger.warning(f"Failed to connect to Redis (browser discovery will not work): {e}")
+
     playwright = await async_playwright().start()
     try:
         await local_browser_manager.start(playwright)
@@ -63,6 +70,10 @@ async def lifespan(app: FastAPI):
         await local_browser_manager.shutdown(timeout=25.0)
     except Exception as e:
         logger.error(f"Error during browser shutdown: {e}")
+    try:
+        await redis_browser_state.disconnect()
+    except Exception as e:
+        logger.warning(f"Error disconnecting from Redis: {e}")
     try:
         await asyncio.wait_for(playwright.stop(), timeout=5.0)
     except Exception as e:

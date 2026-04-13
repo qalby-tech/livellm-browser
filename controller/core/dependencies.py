@@ -45,7 +45,7 @@ async def get_browser_info(
     if not info.browser.is_connected():
         logger.info(f"Browser '{bid}' connection is dead, auto-reconnecting...")
         try:
-            info = await manager.connect_browser(bid, info.ws_url)
+            info = await manager.recover_connection(bid, info.ws_url)
         except Exception as e:
             logger.error(f"Failed to reconnect browser '{bid}': {e}")
             raise HTTPException(
@@ -86,7 +86,25 @@ async def get_or_create_page(
             page = None
 
     if page is None:
-        page = await browser_info.context.new_page()
+        try:
+            page = await browser_info.context.new_page()
+        except Exception as e:
+            logger.warning(
+                f"Failed to create page for session {session_id}: {e} — attempting recovery"
+            )
+            manager: BrowserManager = request.app.state.browser_manager
+            try:
+                browser_info = await manager.recover_connection(
+                    browser_info.browser_id, browser_info.ws_url
+                )
+                pages = browser_info.pages
+            except Exception as recover_err:
+                logger.error(f"Recovery failed: {recover_err}")
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Browser connection lost and recovery failed: {recover_err}",
+                )
+            page = await browser_info.context.new_page()
         pages[session_id] = page
         logger.info(f"Created new page for session {session_id} (ad-hoc={is_ad_hoc})")
 

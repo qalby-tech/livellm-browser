@@ -10,10 +10,11 @@ logger = logging.getLogger(__name__)
 class BrowserInfo:
     """Container for a connected browser, its context, and active pages."""
 
-    def __init__(self, browser: Browser, context: BrowserContext, ws_url: str = ""):
+    def __init__(self, browser: Browser, context: BrowserContext, ws_url: str = "", browser_id: str = ""):
         self.browser = browser
         self.context = context
         self.ws_url = ws_url
+        self.browser_id = browser_id
         self.pages: dict[str, Page] = {}
 
 
@@ -29,6 +30,7 @@ class BrowserManager:
     def __init__(self):
         self.playwright: Optional[Playwright] = None
         self.browsers: dict[str, BrowserInfo] = {}
+        self._reconnect_lock = asyncio.Lock()
 
     async def start(self, playwright: Playwright):
         """Initialise with a Playwright instance. No auto-connections."""
@@ -66,7 +68,7 @@ class BrowserManager:
         browser = await self.playwright.chromium.connect_over_cdp(ws_url)
         context = browser.contexts[0] if browser.contexts else await browser.new_context()
 
-        info = BrowserInfo(browser, context, ws_url=ws_url)
+        info = BrowserInfo(browser, context, ws_url=ws_url, browser_id=browser_id)
         self.browsers[browser_id] = info
         logger.info(f"Connected to browser '{browser_id}'")
         return info
@@ -103,6 +105,109 @@ class BrowserManager:
     def first_browser_id(self) -> Optional[str]:
         """Return the ID of the first connected browser, or None."""
         return next(iter(self.browsers), None)
+
+    # ── recovery ────────────────────────────────────────────
+
+    async def recover_connection(self, browser_id: str, ws_url: str) -> BrowserInfo:
+        """
+        Recover a broken browser connection.
+
+        Uses a lock so that concurrent requests don't all try to recover at
+        the same time.  Two recovery levels are attempted:
+
+        * Level 1 – disconnect the stale entry and reconnect via the
+          **existing** Playwright driver.
+        * Level 2 – if the driver pipe is broken, restart the entire
+          Playwright driver process and reconnect every browser.
+        """
+        async with self._reconnect_lock:
+            # Another request may have already recovered while we waited
+            if browser_id in self.browsers:
+                existing = self.browsers[browser_id]
+                if existing.browser.is_connected():
+                    try:
+                        # Actually probe the connection (is_connected can lie)
+                        _ = existing.browser.version
+                        return existing
+                    except Exception:
+                        pass  # stale, proceed with recovery
+
+            # ── Level 1: simple reconnect with same Playwright driver ──
+            try:
+                return await self._reconnect_same_driver(browser_id, ws_url)
+            except Exception as e:
+                logger.warning(
+                    f"Level-1 reconnect failed for '{browser_id}': {e}"
+                )
+
+            # ── Level 2: restart Playwright driver entirely ──
+            return await self._restart_playwright_and_reconnect(browser_id)
+
+    async def _reconnect_same_driver(
+        self, browser_id: str, ws_url: str
+    ) -> BrowserInfo:
+        """Disconnect stale entry and open a fresh CDP connection."""
+        try:
+            await asyncio.wait_for(
+                self.disconnect_browser(browser_id), timeout=10.0
+            )
+        except Exception as e:
+            logger.warning(f"Error disconnecting '{browser_id}': {e}")
+            self.browsers.pop(browser_id, None)
+
+        browser = await self.playwright.chromium.connect_over_cdp(ws_url)
+        context = (
+            browser.contexts[0] if browser.contexts
+            else await browser.new_context()
+        )
+        info = BrowserInfo(browser, context, ws_url=ws_url, browser_id=browser_id)
+        self.browsers[browser_id] = info
+        logger.info(f"Reconnected browser '{browser_id}' (same driver)")
+        return info
+
+    async def _restart_playwright_and_reconnect(
+        self, browser_id: str
+    ) -> BrowserInfo:
+        """Restart the Playwright driver process and reconnect every browser."""
+        logger.warning("Restarting Playwright driver for full recovery")
+
+        saved = {bid: info.ws_url for bid, info in self.browsers.items()}
+        self.browsers.clear()
+
+        if self.playwright:
+            try:
+                await asyncio.wait_for(self.playwright.stop(), timeout=5.0)
+            except Exception:
+                pass
+
+        from patchright.async_api import async_playwright
+        self.playwright = await async_playwright().start()
+        logger.info("Playwright driver restarted")
+
+        new_info: Optional[BrowserInfo] = None
+        for bid, url in saved.items():
+            try:
+                browser = await self.playwright.chromium.connect_over_cdp(url)
+                context = (
+                    browser.contexts[0] if browser.contexts
+                    else await browser.new_context()
+                )
+                info = BrowserInfo(browser, context, ws_url=url, browser_id=bid)
+                self.browsers[bid] = info
+                if bid == browser_id:
+                    new_info = info
+                logger.info(f"Reconnected '{bid}' after Playwright restart")
+            except Exception as e:
+                logger.error(
+                    f"Failed to reconnect '{bid}' after Playwright restart: {e}"
+                )
+
+        if new_info is None:
+            raise RuntimeError(
+                f"Failed to recover browser '{browser_id}' "
+                "after Playwright restart"
+            )
+        return new_info
 
     # ── lifecycle ────────────────────────────────────────────
 

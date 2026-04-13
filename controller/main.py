@@ -48,8 +48,10 @@ async def lifespan(app: FastAPI):
         await browser_manager.shutdown(timeout=25.0)
     except Exception as e:
         logger.error(f"Error during browser shutdown: {e}")
+    # Use manager's playwright (may have been restarted during recovery)
+    pw = browser_manager.playwright or playwright
     try:
-        await asyncio.wait_for(playwright.stop(), timeout=5.0)
+        await asyncio.wait_for(pw.stop(), timeout=5.0)
     except asyncio.TimeoutError:
         logger.warning("Timeout stopping playwright, continuing shutdown")
     except Exception as e:

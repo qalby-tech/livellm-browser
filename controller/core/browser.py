@@ -174,11 +174,21 @@ class BrowserManager:
         saved = {bid: info.ws_url for bid, info in self.browsers.items()}
         self.browsers.clear()
 
-        if self.playwright:
+        old_pw = self.playwright
+        self.playwright = None
+
+        # Stop the old Playwright driver — best-effort; if the pipe is
+        # broken the process may already be dead.
+        if old_pw is not None:
             try:
-                await asyncio.wait_for(self.playwright.stop(), timeout=5.0)
+                await asyncio.wait_for(old_pw.stop(), timeout=5.0)
             except Exception:
-                pass
+                logger.warning(
+                    "Old Playwright driver did not stop cleanly (expected if pipe broke)"
+                )
+
+        # Brief pause to let the OS reclaim sockets / pipes
+        await asyncio.sleep(0.5)
 
         from patchright.async_api import async_playwright
         self.playwright = await async_playwright().start()
@@ -187,7 +197,10 @@ class BrowserManager:
         new_info: Optional[BrowserInfo] = None
         for bid, url in saved.items():
             try:
-                browser = await self.playwright.chromium.connect_over_cdp(url)
+                browser = await asyncio.wait_for(
+                    self.playwright.chromium.connect_over_cdp(url),
+                    timeout=15.0,
+                )
                 context = (
                     browser.contexts[0] if browser.contexts
                     else await browser.new_context()

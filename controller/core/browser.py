@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import os
+import signal
 from typing import Optional
 
 from patchright.async_api import Playwright, Browser, BrowserContext, Page
@@ -31,11 +33,34 @@ class BrowserManager:
         self.playwright: Optional[Playwright] = None
         self.browsers: dict[str, BrowserInfo] = {}
         self._reconnect_lock = asyncio.Lock()
+        self._playwright_pid: Optional[int] = None
 
     async def start(self, playwright: Playwright):
         """Initialise with a Playwright instance. No auto-connections."""
         self.playwright = playwright
+        self._track_playwright_pid()
         logger.info("Browser manager started (agnostic mode — waiting for registrations)")
+
+    def _track_playwright_pid(self):
+        try:
+            if self.playwright and hasattr(self.playwright, '_impl_obj'):
+                obj = self.playwright._impl_obj
+                if hasattr(obj, '_browser'):
+                    transport = getattr(obj._browser, '_transport', None)
+                    if transport and hasattr(transport, '_proc'):
+                        self._playwright_pid = transport._proc.pid
+                        logger.info(f"Tracking Playwright driver PID: {self._playwright_pid}")
+        except Exception:
+            pass
+
+    def _kill_playwright_process(self):
+        if self._playwright_pid:
+            try:
+                os.kill(self._playwright_pid, signal.SIGKILL)
+                logger.warning(f"Force-killed old Playwright driver PID {self._playwright_pid}")
+            except (ProcessLookupError, PermissionError):
+                pass
+            self._playwright_pid = None
 
     # ── connect / disconnect ─────────────────────────────────
 
@@ -177,21 +202,21 @@ class BrowserManager:
         old_pw = self.playwright
         self.playwright = None
 
-        # Stop the old Playwright driver — best-effort; if the pipe is
-        # broken the process may already be dead.
         if old_pw is not None:
             try:
                 await asyncio.wait_for(old_pw.stop(), timeout=5.0)
             except Exception:
                 logger.warning(
-                    "Old Playwright driver did not stop cleanly (expected if pipe broke)"
+                    "Old Playwright driver did not stop cleanly, force-killing"
                 )
+                self._kill_playwright_process()
 
         # Brief pause to let the OS reclaim sockets / pipes
         await asyncio.sleep(0.5)
 
         from patchright.async_api import async_playwright
         self.playwright = await async_playwright().start()
+        self._track_playwright_pid()
         logger.info("Playwright driver restarted")
 
         new_info: Optional[BrowserInfo] = None
@@ -243,6 +268,24 @@ class BrowserManager:
         except asyncio.TimeoutError:
             logger.error(f"Shutdown timed out after {timeout}s, forcing cleanup")
             self.browsers.clear()
+
+    async def cleanup_stale_pages(self):
+        """Close pages that are no longer responsive to reclaim memory."""
+        for bid, info in list(self.browsers.items()):
+            stale_sessions = []
+            for session_id, page in list(info.pages.items()):
+                try:
+                    _ = page.url
+                except Exception:
+                    stale_sessions.append(session_id)
+            for session_id in stale_sessions:
+                page = info.pages.pop(session_id, None)
+                if page:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                    logger.info(f"Cleaned up stale page for session {session_id} in browser '{bid}'")
 
 
 # Global singleton

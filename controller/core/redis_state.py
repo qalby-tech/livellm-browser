@@ -99,6 +99,11 @@ class RedisControllerState:
             while True:
                 await asyncio.sleep(SYNC_INTERVAL)
                 await self._sync_browsers()
+                if self._browser_manager:
+                    try:
+                        await self._browser_manager.cleanup_stale_pages()
+                    except Exception as e:
+                        logger.debug(f"Sync: stale page cleanup failed: {e}")
         except asyncio.CancelledError:
             pass
 

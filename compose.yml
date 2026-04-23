@@ -53,6 +53,7 @@ services:
       - "8000:8000"
     environment:
       - REDIS_URL=redis://redis:6379/0
+      - NODE_OPTIONS=--max-old-space-size=3072
     depends_on:
       - redis
       - livellm-browser
@@ -61,7 +62,7 @@ services:
       resources:
         limits:
           cpus: '1'
-          memory: '2gb'
+          memory: '4gb'
 
 volumes:
   profiles_volume:

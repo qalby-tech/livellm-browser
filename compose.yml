@@ -25,6 +25,7 @@ services:
       - DISPLAY=:1
       - REDIS_URL=redis://redis:6379/0
       - BROWSER_ADDRESS=livellm-browser
+      - NODE_OPTIONS=--max-old-space-size=6144
     volumes:
       # Mount profiles directory from host with read/write access
       - profiles_volume:/home/headless/Desktop/app/profiles:rw
@@ -37,10 +38,10 @@ services:
       resources:
         limits:
           cpus: '2'
-          memory: '4gb'
+          memory: '8gb'
         reservations:
           cpus: '1'
-          memory: '2gb'
+          memory: '4gb'
 
   livellm-controller:
     build:

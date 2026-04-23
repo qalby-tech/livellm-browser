@@ -27,6 +27,30 @@ _handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s 
 logger.addHandler(_handler)
 
 
+# ==================== Background Tasks ====================
+
+STALE_PAGE_CLEANUP_INTERVAL = 60  # seconds between cleanup sweeps
+
+
+async def _stale_page_cleanup_loop():
+    """Periodically close pages that are no longer responsive.
+
+    Patchright's Node.js driver leaks memory when pages accumulate — each
+    open page holds references in the driver process.  Left unchecked the
+    driver eventually OOM-crashes (``FATAL ERROR: Ineffective mark-compacts
+    near heap limit``), killing every connection.
+    """
+    try:
+        while True:
+            await asyncio.sleep(STALE_PAGE_CLEANUP_INTERVAL)
+            try:
+                await browser_manager.cleanup_stale_pages()
+            except Exception as e:
+                logger.warning(f"Stale page cleanup failed: {e}")
+    except asyncio.CancelledError:
+        pass
+
+
 # ==================== Lifespan ====================
 
 @asynccontextmanager
@@ -62,12 +86,21 @@ async def lifespan(app: FastAPI):
     # Start background Redis sync (continuously reconciles browsers)
     await redis_controller_state.start_sync(browser_manager)
 
+    # Start periodic stale page cleanup to prevent memory leaks in the
+    # Patchright Node.js driver (which OOM-crashes if pages accumulate).
+    stale_cleanup_task = asyncio.create_task(_stale_page_cleanup_loop())
+
     logger.info("Controller started — browser discovery via Redis (sync every 10s)")
 
     yield
 
     # Graceful shutdown
     logger.info("Application shutting down, cleaning up resources...")
+    stale_cleanup_task.cancel()
+    try:
+        await stale_cleanup_task
+    except asyncio.CancelledError:
+        pass
     try:
         await redis_controller_state.disconnect()
     except Exception as e:

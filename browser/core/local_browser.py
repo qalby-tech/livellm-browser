@@ -251,11 +251,43 @@ def list_profile_extensions(profile_path: Path) -> list[dict]:
 
 
 def get_free_port():
-    s = socket.socket()
+    """Return a free TCP port, keeping the socket held until the caller uses it."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(('', 0))
     port = s.getsockname()[1]
-    s.close()
-    return port
+    # Keep the socket open to prevent TOCTOU races.  The caller should pass
+    # the socket (or close it right before binding) so the port isn't stolen.
+    return port, s
+
+
+async def wait_for_chrome_cdp(chrome_port: int, timeout: float = 15.0) -> str:
+    """Poll Chrome's /json/version endpoint until it responds.
+
+    Returns the ``webSocketDebuggerUrl`` path (e.g. ``/devtools/browser/…``),
+    or an empty string if Chrome never became ready.
+    """
+    import httpx
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"http://127.0.0.1:{chrome_port}/json/version",
+                    timeout=3.0,
+                )
+                resp.raise_for_status()
+                data: dict[str, Any] = resp.json()
+                full_ws_url: str = data.get("webSocketDebuggerUrl", "")
+                if full_ws_url:
+                    ws_endpoint = "/" + full_ws_url.replace("ws://", "").split("/", 1)[1]
+                    logger.info(f"Chrome CDP ready on :{chrome_port} (ws: {ws_endpoint})")
+                    return ws_endpoint
+        except Exception:
+            await asyncio.sleep(0.5)
+    logger.warning(f"Chrome CDP on :{chrome_port} did not become ready within {timeout}s")
+    return ""
 
 
 def cleanup_profile_locks(profile_path: Path):
@@ -353,8 +385,8 @@ class LocalBrowserManager:
         browser = None
         context = None
 
-        chrome_port = get_free_port()
-        proxy_port = get_free_port()
+        chrome_port, chrome_sock = get_free_port()
+        proxy_port, proxy_sock = get_free_port()
 
         launch_kwargs = {
             "headless": False,
@@ -371,6 +403,11 @@ class LocalBrowserManager:
         if proxy_config:
             launch_kwargs["proxy"] = proxy_config
 
+        # Release the held sockets — Chrome has now bound to chrome_port, and
+        # we're about to bind proxy_port for the CDP proxy.
+        chrome_sock.close()
+        proxy_sock.close()
+
         if is_persistent:
             launch_kwargs["user_data_dir"] = str(profile_path)
             launch_kwargs["no_viewport"] = True
@@ -385,17 +422,8 @@ class LocalBrowserManager:
         if browser is None:
             raise RuntimeError(f"Failed to get browser object for {browser_id}")
 
-        ws_endpoint = ""
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(f"http://127.0.0.1:{chrome_port}/json/version", timeout=10.0)
-                response.raise_for_status()
-                data: dict[str, Any] = response.json()
-                full_ws_url: str = data.get("webSocketDebuggerUrl", "")
-                if full_ws_url:
-                    ws_endpoint = "/" + full_ws_url.replace("ws://", "").split("/", 1)[1]
-            except Exception:
-                pass
+        # Wait for Chrome's CDP port to become fully ready (with retries)
+        ws_endpoint = await wait_for_chrome_cdp(chrome_port, timeout=15.0)
 
         if not ws_endpoint:
             logger.warning(f"Could not retrieve WS endpoint from Chrome on port {chrome_port}")
@@ -512,7 +540,7 @@ class LocalBrowserManager:
 
         cleanup_profile_locks(profile_path)
 
-        chrome_port = get_free_port()
+        chrome_port, chrome_sock = get_free_port()
 
         launch_kwargs = {
             "headless": False,
@@ -529,6 +557,9 @@ class LocalBrowserManager:
         if proxy_config:
             launch_kwargs["proxy"] = proxy_config
 
+        # Release the held socket — Chrome has now bound to chrome_port
+        chrome_sock.close()
+
         launch_kwargs["user_data_dir"] = str(profile_path)
         launch_kwargs["no_viewport"] = True
         context = await self.playwright.chromium.launch_persistent_context(**launch_kwargs)
@@ -538,17 +569,8 @@ class LocalBrowserManager:
         if browser is None:
             raise RuntimeError(f"Failed to get browser object for {browser_id}")
 
-        ws_endpoint = ""
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(f"http://127.0.0.1:{chrome_port}/json/version", timeout=10.0)
-                response.raise_for_status()
-                data: dict[str, Any] = response.json()
-                full_ws_url: str = data.get("webSocketDebuggerUrl", "")
-                if full_ws_url:
-                    ws_endpoint = "/" + full_ws_url.replace("ws://", "").split("/", 1)[1]
-            except Exception:
-                pass
+        # Wait for Chrome's CDP port to become fully ready (with retries)
+        ws_endpoint = await wait_for_chrome_cdp(chrome_port, timeout=15.0)
 
         if not ws_endpoint:
             logger.warning(f"Could not retrieve WS endpoint from Chrome on port {chrome_port}")

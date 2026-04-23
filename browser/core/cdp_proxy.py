@@ -17,10 +17,19 @@ class CDPProxy:
     The proxy survives browser restarts via retarget() — the bind port stays the same,
     only the Chrome target port and ws_endpoint are updated.
     """
-    def __init__(self, bind_port: int, target_port: int, ws_endpoint: str = ""):
+    def __init__(
+        self,
+        bind_port: int,
+        target_port: int,
+        ws_endpoint: str = "",
+        connect_retries: int = 5,
+        connect_retry_delay: float = 1.0,
+    ):
         self.bind_port = bind_port
         self.target_port = target_port
         self.ws_endpoint = ws_endpoint
+        self.connect_retries = connect_retries
+        self.connect_retry_delay = connect_retry_delay
         self.server = None
         self._clients = set()
 
@@ -32,10 +41,33 @@ class CDPProxy:
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self._clients.add(writer)
-        try:
-            remote_reader, remote_writer = await asyncio.open_connection('127.0.0.1', self.target_port)
-        except Exception as e:
-            logger.error(f"Proxy failed to connect to Chrome at 127.0.0.1:{self.target_port}: {e}")
+
+        # Retry connecting to Chrome — it may still be starting up or
+        # momentarily unavailable after a restart.
+        remote_reader = None
+        remote_writer = None
+        last_error: Exception | None = None
+        for attempt in range(1, self.connect_retries + 1):
+            try:
+                remote_reader, remote_writer = await asyncio.open_connection(
+                    '127.0.0.1', self.target_port
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt < self.connect_retries:
+                    logger.debug(
+                        f"Proxy connect attempt {attempt}/{self.connect_retries} "
+                        f"to 127.0.0.1:{self.target_port} failed: {exc}, "
+                        f"retrying in {self.connect_retry_delay}s…"
+                    )
+                    await asyncio.sleep(self.connect_retry_delay)
+
+        if remote_writer is None:
+            logger.error(
+                f"Proxy failed to connect to Chrome at 127.0.0.1:{self.target_port} "
+                f"after {self.connect_retries} attempts: {last_error}"
+            )
             writer.close()
             self._clients.discard(writer)
             return

@@ -312,4 +312,4 @@ curl -X POST http://localhost:8000/parser/search_videos \
 
 ## Running on Kubernetes
 
-For cluster deployments, use the [livellm-browser-operator](https://github.com/XvKuoMing/livellm-browser-operator) and its Helm chart. The operator manages `Browser` and `Controller` CRs, wires Redis automatically, and propagates desired state (extensions, cookies, proxy) to running pods. Both Deployment templates default `NODE_OPTIONS=--max-old-space-size=4096` for the Playwright/patchright Node driver — override via `spec.env` on the CR or `DEFAULT_*_ENV` on the operator.
+For cluster deployments, use the [livellm-browser-operator](https://github.com/XvKuoMing/livellm-browser-operator) and its Helm chart. The operator manages `Browser` and `Controller` CRs, wires Redis automatically, and propagates desired state (extensions, cookies, proxy) to running pods. The controller pod's `NODE_OPTIONS` is auto-sized from its memory limit (`min(limit/2, 4096)` MiB); the browser pod is left alone so Chrome keeps the memory budget. Override per-CR via `spec.env`, cluster-wide via `DEFAULT_*_ENV`.

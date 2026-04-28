@@ -6,17 +6,22 @@ from typing import Optional
 
 from patchright.async_api import Playwright, Browser, BrowserContext, Page
 
+from core.config import settings
+
 logger = logging.getLogger(__name__)
+
+MAX_PAGES_PER_BROWSER = settings.max_pages_per_browser
 
 
 class BrowserInfo:
-    """Container for a connected browser, its context, and active pages."""
+    """Container for a connected browser, its default context, and active pages."""
 
     def __init__(self, browser: Browser, context: BrowserContext, ws_url: str = "", browser_id: str = ""):
         self.browser = browser
         self.context = context
         self.ws_url = ws_url
         self.browser_id = browser_id
+        # Named session pages (created via start_session)
         self.pages: dict[str, Page] = {}
 
 
@@ -71,7 +76,7 @@ class BrowserManager:
         If ``browser_id`` is already connected **with the same URL** and the
         connection is still alive, the existing connection is returned.
         If the connection is dead (e.g. browser restarted), it auto-reconnects.
-        If the URL differs, ``ValueError`` is raised — disconnect first.
+        If the URL differs, the old connection is dropped and a new one opened.
         """
         if not self.playwright:
             raise RuntimeError("Browser manager not started")
@@ -82,11 +87,12 @@ class BrowserManager:
                 logger.info(f"Browser '{browser_id}' already connected (idempotent)")
                 return existing
             if existing.ws_url != ws_url:
-                raise ValueError(
-                    f"Browser '{browser_id}' already connected with a different URL. "
-                    "Disconnect it first."
+                logger.info(
+                    f"Browser '{browser_id}' ws_url changed "
+                    f"({existing.ws_url} -> {ws_url}), reconnecting"
                 )
-            logger.info(f"Browser '{browser_id}' connection is dead, reconnecting...")
+            else:
+                logger.info(f"Browser '{browser_id}' connection is dead, reconnecting...")
             await self.disconnect_browser(browser_id)
 
         logger.info(f"Connecting to browser '{browser_id}' via {ws_url}")
@@ -99,7 +105,7 @@ class BrowserManager:
         return info
 
     async def disconnect_browser(self, browser_id: str) -> bool:
-        """Disconnect a browser and close all its pages."""
+        """Disconnect a browser and close all its session pages."""
         if browser_id not in self.browsers:
             return False
 
@@ -128,8 +134,17 @@ class BrowserManager:
         return self.browsers[browser_id]
 
     def first_browser_id(self) -> Optional[str]:
-        """Return the ID of the first connected browser, or None."""
         return next(iter(self.browsers), None)
+
+    def least_loaded_browser_id(self) -> Optional[str]:
+        best_id: Optional[str] = None
+        best_count = float("inf")
+        for bid, info in self.browsers.items():
+            count = len(info.pages)
+            if count < best_count and count < MAX_PAGES_PER_BROWSER:
+                best_count = count
+                best_id = bid
+        return best_id
 
     # ── recovery ────────────────────────────────────────────
 
@@ -149,13 +164,10 @@ class BrowserManager:
             # Another request may have already recovered while we waited
             if browser_id in self.browsers:
                 existing = self.browsers[browser_id]
-                if existing.browser.is_connected():
-                    try:
-                        # Actually probe the connection (is_connected can lie)
-                        _ = existing.browser.version
-                        return existing
-                    except Exception:
-                        pass  # stale, proceed with recovery
+                # Only short-circuit if the URL also matches — ws_url drift
+                # (browser pod restart with new IP/port) means we MUST reconnect.
+                if existing.ws_url == ws_url and existing.browser.is_connected():
+                    return existing
 
             # ── Level 1: simple reconnect with same Playwright driver ──
             try:
@@ -166,7 +178,7 @@ class BrowserManager:
                 )
 
             # ── Level 2: restart Playwright driver entirely ──
-            return await self._restart_playwright_and_reconnect(browser_id)
+            return await self._restart_playwright_and_reconnect(browser_id, ws_url)
 
     async def _reconnect_same_driver(
         self, browser_id: str, ws_url: str
@@ -191,12 +203,14 @@ class BrowserManager:
         return info
 
     async def _restart_playwright_and_reconnect(
-        self, browser_id: str
+        self, browser_id: str, fresh_ws_url: Optional[str] = None
     ) -> BrowserInfo:
         """Restart the Playwright driver process and reconnect every browser."""
         logger.warning("Restarting Playwright driver for full recovery")
 
         saved = {bid: info.ws_url for bid, info in self.browsers.items()}
+        if fresh_ws_url:
+            saved[browser_id] = fresh_ws_url
         self.browsers.clear()
 
         old_pw = self.playwright
@@ -256,6 +270,11 @@ class BrowserManager:
         async def _shutdown():
             for bid in list(self.browsers.keys()):
                 info = self.browsers[bid]
+                for page in list(info.pages.values()):
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
                 try:
                     await info.browser.close()
                 except Exception:
@@ -268,24 +287,6 @@ class BrowserManager:
         except asyncio.TimeoutError:
             logger.error(f"Shutdown timed out after {timeout}s, forcing cleanup")
             self.browsers.clear()
-
-    async def cleanup_stale_pages(self):
-        """Close pages that are no longer responsive to reclaim memory."""
-        for bid, info in list(self.browsers.items()):
-            stale_sessions = []
-            for session_id, page in list(info.pages.items()):
-                try:
-                    _ = page.url
-                except Exception:
-                    stale_sessions.append(session_id)
-            for session_id in stale_sessions:
-                page = info.pages.pop(session_id, None)
-                if page:
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
-                    logger.info(f"Cleaned up stale page for session {session_id} in browser '{bid}'")
 
 
 # Global singleton

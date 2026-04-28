@@ -2,10 +2,13 @@ import uuid
 import logging
 from typing import List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from core.browser import browser_manager
-from core.dependencies import BrowserInfoDep, SessionIdDep, BrowserIdDep
+from core.dependencies import (
+    BrowserInfoDep, SessionIdDep, BrowserIdDep, get_browser_info,
+)
+from core.redis_state import redis_controller_state
 from models.requests import ConnectBrowserRequest, StartSessionRequest
 from models.responses import BrowserResponse
 
@@ -69,35 +72,46 @@ async def disconnect_browser(browser_id: str) -> dict:
 
 @router.post("/start_session")
 async def start_session(
-    request: StartSessionRequest = StartSessionRequest(),
+    request: Request,
+    body: StartSessionRequest = StartSessionRequest(),
     browser_id: BrowserIdDep = None,
 ) -> dict:
-    """Start a new session (page) in a connected browser and return the session ID."""
-    bid = browser_id or request.browser_id
-    if not bid:
-        bid = browser_manager.first_browser_id()
-        if not bid:
-            raise HTTPException(
-                status_code=404,
-                detail="No browsers connected. Register one first via POST /browsers.",
-            )
+    """Start a new session (page) in a connected browser and return the session ID.
+
+    Routes through the same Redis-backed resolution as the rest of the API,
+    so a stale local connection (e.g. browser pod restarted with a new IP)
+    is auto-recovered before we try to open a page.
+    """
+    bid = browser_id or body.browser_id
+    try:
+        browser_info = await get_browser_info(request=request, browser_id=bid)
+    except HTTPException:
+        raise
 
     try:
-        browser_info = browser_manager.get_browser(bid)
-    except KeyError:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Browser '{bid}' not connected. Register it first via POST /browsers.",
-        )
+        page = await browser_info.context.new_page()
+    except Exception as e:
+        logger.warning(f"start_session: failed to open page, attempting recovery: {e}")
+        fresh_ws_url = await redis_controller_state.get_browser_ws_url(browser_info.browser_id)
+        reconnect_url = fresh_ws_url or browser_info.ws_url
+        try:
+            browser_info = await browser_manager.recover_connection(
+                browser_info.browser_id, reconnect_url
+            )
+            page = await browser_info.context.new_page()
+        except Exception as recover_err:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to start session after recovery: {recover_err}",
+            )
 
     session_id = str(uuid.uuid4())
-    page = await browser_info.context.new_page()
     browser_info.pages[session_id] = page
-    logger.info(f"Started new session: {session_id} in browser '{bid}'")
+    logger.info(f"Started new session: {session_id} in browser '{browser_info.browser_id}'")
 
     return {
         "session_id": session_id,
-        "browser_id": bid,
+        "browser_id": browser_info.browser_id,
         "message": "Session created. Use X-Session-Id and X-Browser-Id headers in subsequent requests.",
     }
 

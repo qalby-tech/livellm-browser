@@ -55,7 +55,6 @@ async def _stale_page_cleanup_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Connect to Redis for browser discovery
     try:
         await redis_controller_state.connect()
     except Exception as e:

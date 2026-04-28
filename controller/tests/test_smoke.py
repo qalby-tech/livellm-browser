@@ -3,7 +3,6 @@ Smoke tests for livellm-controller FastAPI controller.
 
 Run with: uv run pytest tests/ -v
 """
-import pytest
 from fastapi.testclient import TestClient
 
 

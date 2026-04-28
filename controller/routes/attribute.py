@@ -44,6 +44,11 @@ async def get_attributes(request: AttributeRequest, page: PageDep) -> JSONRespon
 
         html = await page.content()
 
+        try:
+            await page.evaluate("window.stop()")
+        except Exception:
+            pass
+
         selector_dicts = [
             {
                 "name": s.name,

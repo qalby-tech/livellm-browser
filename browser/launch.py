@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel
 import uvicorn
 from patchright.async_api import async_playwright
@@ -14,6 +15,7 @@ from core.local_browser import (
     cleanup_profile_locks, download_extension, list_profile_extensions
 )
 from core.redis_state import redis_browser_state
+
 
 class ProxySettings(BaseModel):
     server: str
@@ -43,17 +45,72 @@ _handler = logging.StreamHandler()
 _handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
 logger.addHandler(_handler)
 
+def _proxy_config_from_desired(desired_proxy: Optional[dict]) -> Optional[dict]:
+    if not desired_proxy or not desired_proxy.get("server"):
+        return None
+    cfg = {"server": desired_proxy["server"]}
+    for key in ("username", "password", "bypass"):
+        val = desired_proxy.get(key)
+        if val:
+            cfg[key] = val
+    return cfg
+
+
+async def handle_desired_state_change(browser_id: str, desired: dict):
+    desired_extensions = desired.get("extensions", [])
+    desired_cookies = desired.get("cookies", [])
+    desired_proxy_cfg = _proxy_config_from_desired(desired.get("proxy"))
+
+    try:
+        info = local_browser_manager.get_browser(browser_id)
+    except KeyError:
+        return
+
+    current_extensions = [ext["id"] for ext in list_profile_extensions(info.profile_path)] if info.profile_path else []
+    missing = [e for e in desired_extensions if e not in current_extensions]
+    proxy_changed = desired_proxy_cfg != info.proxy_config
+
+    if missing or desired_cookies or proxy_changed:
+        ext_pairs = []
+        for ext_id in missing:
+            try:
+                cache_path = await download_extension(ext_id)
+                ext_pairs.append((ext_id, cache_path))
+            except Exception as e:
+                logger.error(f"Failed to download extension {ext_id}: {e}")
+
+        logger.info(
+            f"Applying desired state for '{browser_id}': "
+            f"{len(ext_pairs)} extensions, {len(desired_cookies)} cookies, "
+            f"proxy_changed={proxy_changed}"
+        )
+        new_info = await local_browser_manager.restart_browser(
+            browser_id,
+            inject_extensions=ext_pairs,
+            proxy_config=desired_proxy_cfg if proxy_changed else None,
+            clear_proxy=proxy_changed and desired_proxy_cfg is None,
+        )
+
+        if desired_cookies:
+            try:
+                await new_info.context.add_cookies(desired_cookies)
+                logger.info(f"Injected {len(desired_cookies)} cookies into browser '{browser_id}'")
+            except Exception as e:
+                logger.error(f"Failed to inject cookies into '{browser_id}': {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     default_profile = PROFILES_DIR / DEFAULT_BROWSER_ID
     cleanup_profile_locks(default_profile)
     default_profile.mkdir(parents=True, exist_ok=True)
 
-    # Connect to Redis for browser state publishing
     try:
         await redis_browser_state.connect()
     except Exception as e:
         logger.warning(f"Failed to connect to Redis (browser discovery will not work): {e}")
+
+    redis_browser_state.on_desired_state_change(handle_desired_state_change)
 
     playwright = await async_playwright().start()
     try:
@@ -81,6 +138,19 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown complete")
 
 app = FastAPI(title="Browser Launcher API", lifespan=lifespan)
+
+
+@app.get("/health")
+async def health():
+    if not local_browser_manager.browsers:
+        return Response(status_code=503, content="No browsers")
+    for bid, info in local_browser_manager.browsers.items():
+        try:
+            if not info.browser.is_connected():
+                return Response(status_code=503, content=f"Browser {bid} disconnected")
+        except Exception as e:
+            return Response(status_code=503, content=f"Browser {bid} error: {e}")
+    return {"status": "ok"}
 
 # ── Browser CRUD ──
 

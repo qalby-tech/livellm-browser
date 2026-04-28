@@ -154,9 +154,13 @@ curl -X POST http://localhost:8000/parser/browsers \
 
 If the browser restarts (e.g. after installing an extension), the controller **auto-reconnects** on the next request — no manual re-registration needed.
 
+> **Redis is the source of truth.** Browser pods publish their CDP `ws_url` to Redis (`livellm:browsers`); the controller resolves it on every request and reconciles drift on a 10-second sync loop. A browser pod that restarts with a new IP/port is picked up automatically — there is no in-memory connection cache to invalidate.
+
 ### Sessions
 
-A session is a browser tab. Create one explicitly, or omit `X-Session-Id` to get an ad-hoc tab that closes after the request.
+A session is a browser tab. Create one explicitly, or omit `X-Session-Id` to get an ad-hoc tab that is created for the request and closed on the way out.
+
+After extraction, every page operation issues `window.stop()` so Chrome stops streaming bytes back over CDP into the Node driver heap — important for large/heavy pages that would otherwise keep loading resources after the response was already returned.
 
 ```bash
 # Start a persistent session
@@ -303,3 +307,9 @@ curl -X POST http://localhost:8000/parser/search_videos \
 | `POST` | `/search_news` | Google news search |
 | `POST` | `/search_images` | Google image search |
 | `POST` | `/search_videos` | Google video search |
+
+---
+
+## Running on Kubernetes
+
+For cluster deployments, use the [livellm-browser-operator](https://github.com/XvKuoMing/livellm-browser-operator) and its Helm chart. The operator manages `Browser` and `Controller` CRs, wires Redis automatically, and propagates desired state (extensions, cookies, proxy) to running pods. Both Deployment templates default `NODE_OPTIONS=--max-old-space-size=4096` for the Playwright/patchright Node driver — override via `spec.env` on the CR or `DEFAULT_*_ENV` on the operator.

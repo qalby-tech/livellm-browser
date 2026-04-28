@@ -44,13 +44,22 @@ async def get_content(request: ContentRequest, page: PageDep) -> Response:
         if request.output_action in (OutputAction.screenshot, OutputAction.screenshot_full):
             full = request.output_action == OutputAction.screenshot_full
             screenshot_bytes = await page.screenshot(full_page=full, type="png")
-            return Response(content=screenshot_bytes, media_type="image/png")
+            response = Response(content=screenshot_bytes, media_type="image/png")
         elif request.output_action == OutputAction.html:
             content = await page.content()
-            return Response(content=content, media_type="text/html")
+            response = Response(content=content, media_type="text/html")
         else:
             content = await page.inner_text("body")
-            return Response(content=content, media_type="text/plain")
+            response = Response(content=content, media_type="text/plain")
+
+        # Halt any in-flight resource downloads so Chrome stops streaming
+        # bytes back over CDP into the Node driver heap.
+        try:
+            await page.evaluate("window.stop()")
+        except Exception:
+            pass
+
+        return response
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get content: {str(e)}")

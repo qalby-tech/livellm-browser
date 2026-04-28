@@ -444,8 +444,7 @@ class LocalBrowserManager:
         kind = "persistent" if is_persistent else "ephemeral"
         logger.info(f"Created {kind} browser '{browser_id}' on proxy port {proxy_port}" + (f" with profile at {profile_path}" if is_persistent else ""))
 
-        # Register with Redis so the controller can discover this browser
-        await redis_browser_state.register_browser(browser_id, proxy_port)
+        await redis_browser_state.register_browser(browser_id, proxy_port, cdp_port=chrome_port, extensions=extensions or [])
 
         return browser_id, browser_info
 
@@ -492,20 +491,25 @@ class LocalBrowserManager:
 
         return True
 
-    async def restart_browser(self, browser_id: str, inject_extensions: Optional[List[tuple]] = None, remove_extensions: Optional[List[str]] = None, toggle_extensions: Optional[List[tuple]] = None) -> LocalBrowserInfo:
+    async def restart_browser(self, browser_id: str, inject_extensions: Optional[List[tuple]] = None, remove_extensions: Optional[List[str]] = None, toggle_extensions: Optional[List[tuple]] = None, proxy_config: Optional[dict] = None, clear_proxy: bool = False) -> LocalBrowserInfo:
         """
         Close a browser and relaunch it with the same profile.
         The CDP proxy port stays the same — only the Chrome target is updated.
         inject_extensions: list of (extension_id, cache_path) tuples to add AFTER Chrome exits.
         remove_extensions: list of extension_ids to remove AFTER Chrome exits.
         toggle_extensions: list of (extension_id, enabled) tuples to enable/disable AFTER Chrome exits.
+        proxy_config: when set, replaces the upstream HTTP proxy used by the relaunched Chrome.
+        clear_proxy: when True, drops any existing proxy config (proxy_config is ignored).
         """
         if browser_id not in self.browsers:
             raise KeyError(f"Browser with id '{browser_id}' not found")
 
         old_info = self.browsers[browser_id]
         profile_path = old_info.profile_path
-        proxy_config = old_info.proxy_config
+        if clear_proxy:
+            proxy_config = None
+        elif proxy_config is None:
+            proxy_config = old_info.proxy_config
         is_ephemeral = old_info.is_ephemeral
         cdp_proxy = old_info.cdp_proxy
         proxy_port = old_info.proxy_port

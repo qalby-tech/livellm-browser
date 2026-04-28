@@ -10,7 +10,6 @@ import logging
 from typing import Dict, List, Optional
 
 from bs4 import BeautifulSoup
-from lxml import etree as lxml_etree
 from lxml import html as lxml_html
 
 logger = logging.getLogger(__name__)

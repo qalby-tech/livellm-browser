@@ -1,4 +1,3 @@
-import uuid
 import logging
 from typing import Annotated, Optional, AsyncGenerator
 
@@ -9,8 +8,6 @@ from core.browser import BrowserInfo, BrowserManager
 from core.redis_state import redis_controller_state
 
 logger = logging.getLogger(__name__)
-
-MAX_PAGE_RECOVERY_ATTEMPTS = 3
 
 # Header dependencies
 BrowserIdDep = Annotated[Optional[str], Header(alias="X-Browser-Id")]
@@ -23,57 +20,56 @@ async def get_browser_info(
 ) -> BrowserInfo:
     """
     Resolve browser info from X-Browser-Id header.
-    Falls back to the first connected browser.  Returns 404 if none available.
-    Auto-reconnects if the browser connection died (e.g. after a restart).
+
+    Source of truth for ws_url is Redis. On every request we cheaply check for
+    drift (browser pod restarted with a new IP/port) and reconnect if needed,
+    so that local state can never silently lag behind cluster state.
     """
     manager: BrowserManager = request.app.state.browser_manager
 
     bid = browser_id
     if not bid:
-        bid = manager.first_browser_id()
+        bid = manager.least_loaded_browser_id() or manager.first_browser_id()
         if not bid:
             raise HTTPException(
                 status_code=404,
                 detail="No browsers connected. Register one first via POST /browsers.",
             )
 
+    fresh_ws_url = await redis_controller_state.get_browser_ws_url(bid)
+
     try:
         info = manager.get_browser(bid)
     except KeyError:
-        # Try to auto-discover from Redis
-        ws_url = await redis_controller_state.get_browser_ws_url(bid)
-        if ws_url:
-            logger.info(f"Auto-discovered browser '{bid}' from Redis, connecting...")
-            try:
-                info = await manager.connect_browser(bid, ws_url)
-            except Exception as e:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Browser '{bid}' found in Redis but connection failed: {e}",
-                )
-        else:
+        if not fresh_ws_url:
             raise HTTPException(
                 status_code=404,
                 detail=f"Browser '{bid}' not found. Ensure the browser is running.",
             )
-
-    # Check browser connection — is_connected() alone can lie when the
-    # Playwright driver pipe is dying.  Also probe the context.
-    needs_recovery = False
-    if not info.browser.is_connected():
-        needs_recovery = True
-    else:
-        # Extra probe: verify the context is still responsive
+        logger.info(f"Auto-discovered browser '{bid}' from Redis, connecting...")
         try:
-            _ = info.browser.version
-        except Exception:
-            needs_recovery = True
+            info = await manager.connect_browser(bid, fresh_ws_url)
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Browser '{bid}' found in Redis but connection failed: {e}",
+            )
+        return info
+
+    # Check for ws_url drift (e.g. browser pod restarted with new IP/port).
+    drifted = bool(fresh_ws_url) and fresh_ws_url != info.ws_url
+
+    needs_recovery = drifted or not info.browser.is_connected()
 
     if needs_recovery:
-        logger.info(f"Browser '{bid}' connection is dead, auto-reconnecting...")
-        # Try Redis first for a fresh WS URL
-        fresh_ws_url = await redis_controller_state.get_browser_ws_url(bid)
         reconnect_url = fresh_ws_url or info.ws_url
+        if drifted:
+            logger.info(
+                f"Browser '{bid}' ws_url drift "
+                f"({info.ws_url} -> {fresh_ws_url}), reconnecting..."
+            )
+        else:
+            logger.info(f"Browser '{bid}' connection is dead, auto-reconnecting...")
         try:
             info = await manager.recover_connection(bid, reconnect_url)
         except Exception as e:
@@ -95,87 +91,58 @@ async def get_or_create_page(
     session_id: SessionIdDep = None,
 ) -> AsyncGenerator[Page, None]:
     """
-    Get or create a page for the given session.
-    If no session_id header is provided, creates an ad-hoc session (closed after request).
+    Get a page for the request.
+
+    • **Named session** (``X-Session-Id`` provided) — returns the existing
+      session page, or creates a new one in the default context.
+    • **Ad-hoc** (no session header) — creates a fresh page just for this
+      request and closes it on the way out.
     """
-    is_ad_hoc = False
-    if session_id is None:
-        session_id = str(uuid.uuid4())
-        is_ad_hoc = True
+    is_ad_hoc = session_id is None
+    page: Optional[Page] = None
 
-    request.state.session_id = session_id
-    pages = browser_info.pages
-    page = None
-
-    if session_id in pages:
-        page = pages[session_id]
+    # ── Named session: reuse existing page ──
+    if not is_ad_hoc and session_id in browser_info.pages:
+        page = browser_info.pages[session_id]
         try:
             _ = page.url
         except Exception:
-            logger.info(f"Page for session {session_id} was closed, creating new one")
+            logger.info(f"Session page {session_id} was closed, creating new one")
             page = None
 
     if page is None:
         manager: BrowserManager = request.app.state.browser_manager
-        last_error: Optional[Exception] = None
-
-        for attempt in range(1, MAX_PAGE_RECOVERY_ATTEMPTS + 1):
-            try:
-                page = await browser_info.context.new_page()
-                break  # success
-            except Exception as e:
-                last_error = e
-                logger.warning(
-                    f"Failed to create page for session {session_id} "
-                    f"(attempt {attempt}/{MAX_PAGE_RECOVERY_ATTEMPTS}): {e}"
-                )
-                if attempt == MAX_PAGE_RECOVERY_ATTEMPTS:
-                    break  # exhausted retries
-
-                # Fetch a fresh WS URL from Redis before recovery
-                fresh_ws_url = await redis_controller_state.get_browser_ws_url(
-                    browser_info.browser_id
-                )
-                reconnect_url = fresh_ws_url or browser_info.ws_url
-
-                try:
-                    browser_info = await manager.recover_connection(
-                        browser_info.browser_id, reconnect_url
-                    )
-                    pages = browser_info.pages
-                except Exception as recover_err:
-                    logger.error(f"Recovery attempt {attempt} failed: {recover_err}")
-                    if attempt == MAX_PAGE_RECOVERY_ATTEMPTS:
-                        raise HTTPException(
-                            status_code=502,
-                            detail=(
-                                f"Browser connection lost and recovery failed: "
-                                f"{recover_err}"
-                            ),
-                        )
-
-        if page is None:
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"Failed to create page for session {session_id} after "
-                    f"{MAX_PAGE_RECOVERY_ATTEMPTS} attempts: {last_error}"
-                ),
+        try:
+            page = await browser_info.context.new_page()
+        except Exception as e:
+            logger.warning(f"Failed to create page, attempting recovery: {e}")
+            fresh_ws_url = await redis_controller_state.get_browser_ws_url(
+                browser_info.browser_id
             )
+            reconnect_url = fresh_ws_url or browser_info.ws_url
+            try:
+                browser_info = await manager.recover_connection(
+                    browser_info.browser_id, reconnect_url
+                )
+                page = await browser_info.context.new_page()
+            except Exception as recover_err:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Failed to create page after recovery: {recover_err}",
+                )
 
-        pages[session_id] = page
-        logger.info(f"Created new page for session {session_id} (ad-hoc={is_ad_hoc})")
+        if not is_ad_hoc:
+            browser_info.pages[session_id] = page
+            logger.info(f"Created new page for session {session_id}")
 
     try:
         yield page
     finally:
         if is_ad_hoc:
             try:
-                pages.pop(session_id, None)
                 await page.close()
-                logger.info(f"Closed ad-hoc page for session {session_id}")
             except Exception as e:
-                logger.warning(f"Error closing ad-hoc page for session {session_id}: {e}")
+                logger.warning(f"Error closing ad-hoc page: {e}")
 
 
 PageDep = Annotated[Page, Depends(get_or_create_page)]

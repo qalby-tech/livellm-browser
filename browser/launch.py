@@ -113,10 +113,7 @@ async def lifespan(app: FastAPI):
     redis_browser_state.on_desired_state_change(handle_desired_state_change)
 
     playwright = await async_playwright().start()
-    try:
-        await local_browser_manager.start(playwright)
-    except Exception as e:
-        logger.error(f"Failed to start local browser manager: {e}")
+    await local_browser_manager.start(playwright)
 
     app.state.playwright = playwright
 

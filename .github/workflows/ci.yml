@@ -61,24 +61,27 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
       
-      - name: Extract version from pyproject.toml
+      - name: Extract versions from pyproject.toml
         id: version
         run: |
-          VERSION=$(grep '^version = ' controller/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
-          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-          echo "Extracted version: $VERSION"
+          BROWSER_VERSION=$(grep '^version = ' browser/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          CONTROLLER_VERSION=$(grep '^version = ' controller/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "BROWSER_VERSION=$BROWSER_VERSION" >> $GITHUB_OUTPUT
+          echo "CONTROLLER_VERSION=$CONTROLLER_VERSION" >> $GITHUB_OUTPUT
+          echo "Browser version: $BROWSER_VERSION, Controller version: $CONTROLLER_VERSION"
 
       - name: Compute image tags
         id: tags
         run: |
-          VERSION="${{ steps.version.outputs.VERSION }}"
+          BROWSER_VERSION="${{ steps.version.outputs.BROWSER_VERSION }}"
+          CONTROLLER_VERSION="${{ steps.version.outputs.CONTROLLER_VERSION }}"
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           if [ "${{ github.ref }}" = "refs/heads/develop" ]; then
-            echo "BROWSER_TAG=${IMAGE}:dev-${VERSION}" >> $GITHUB_OUTPUT
-            echo "CONTROLLER_TAG=${IMAGE}:dev-controller-${VERSION}" >> $GITHUB_OUTPUT
+            echo "BROWSER_TAG=${IMAGE}:dev-${BROWSER_VERSION}" >> $GITHUB_OUTPUT
+            echo "CONTROLLER_TAG=${IMAGE}:dev-controller-${CONTROLLER_VERSION}" >> $GITHUB_OUTPUT
           else
-            echo "BROWSER_TAG=${IMAGE}:${VERSION}" >> $GITHUB_OUTPUT
-            echo "CONTROLLER_TAG=${IMAGE}:controller-${VERSION}" >> $GITHUB_OUTPUT
+            echo "BROWSER_TAG=${IMAGE}:${BROWSER_VERSION}" >> $GITHUB_OUTPUT
+            echo "CONTROLLER_TAG=${IMAGE}:controller-${CONTROLLER_VERSION}" >> $GITHUB_OUTPUT
           fi
 
       - name: Build and push browser image

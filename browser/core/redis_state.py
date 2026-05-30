@@ -65,7 +65,9 @@ class RedisBrowserState:
         entry = {
             "ws_url": ws_url,
             "proxy_port": str(proxy_port),
-            "cdp_port": str(cdp_port),
+            # cdp_port must be a JSON number — the Go browser-operator
+            # unmarshals it into an int and crash-loops on a quoted string.
+            "cdp_port": int(cdp_port),
             "registered_at": str(int(time.time())),
             "extensions": extensions or [],
         }
@@ -140,7 +142,8 @@ class RedisBrowserState:
                         entry = {
                             "ws_url": ws_url,
                             "proxy_port": str(info["proxy_port"]),
-                            "cdp_port": str(info.get("cdp_port", 0)),
+                            # JSON number — see register_browser.
+                            "cdp_port": int(info.get("cdp_port", 0) or 0),
                             "registered_at": str(int(time.time())),
                             "extensions": info.get("extensions", []),
                         }

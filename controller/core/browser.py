@@ -273,6 +273,35 @@ class BrowserManager:
 
     # ── lifecycle ────────────────────────────────────────────
 
+    async def cleanup_stale_pages(self) -> int:
+        """Close session pages that are no longer usable.
+
+        Patchright's Node driver leaks memory as dead/zombie pages accumulate
+        (each holds driver-side references), eventually OOM-crashing it. We drop
+        pages whose handle is closed or whose context is gone. Returns the count.
+        """
+        closed = 0
+        for info in list(self.browsers.values()):
+            for sid, page in list(info.pages.items()):
+                dead = False
+                try:
+                    if page.is_closed():
+                        dead = True
+                    else:
+                        _ = page.url  # touch — raises if the page/context is gone
+                except Exception:
+                    dead = True
+                if dead:
+                    info.pages.pop(sid, None)
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                    closed += 1
+        if closed:
+            logger.info(f"Stale page cleanup: closed {closed} dead page(s)")
+        return closed
+
     async def shutdown(self, timeout: float = 25.0):
         """Disconnect all browsers."""
         logger.info("Starting browser manager shutdown…")

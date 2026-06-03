@@ -1,5 +1,7 @@
 import asyncio
+import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -44,14 +46,58 @@ _handler = logging.StreamHandler()
 _handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
 logger.addHandler(_handler)
 
+def _default_browser_config_from_env():
+    """Build the primary browser's startup config from environment variables.
+
+    In the managed platform the operator passes desired state declaratively
+    (instead of the old Redis desired-state channel): a browser's extensions,
+    proxy, and a mounted cookies file are set on the pod, so the default
+    browser is created with them at boot. All are optional.
+    """
+    extensions = None
+    exts_raw = os.environ.get("BROWSER_EXTENSIONS", "").strip()
+    if exts_raw:
+        try:
+            parsed = json.loads(exts_raw)
+            extensions = parsed if isinstance(parsed, list) else None
+        except json.JSONDecodeError:
+            extensions = [e.strip() for e in exts_raw.split(",") if e.strip()]
+
+    proxy = None
+    server = os.environ.get("BROWSER_PROXY_SERVER", "").strip()
+    if server:
+        proxy = ProxySettings(
+            server=server,
+            username=os.environ.get("BROWSER_PROXY_USERNAME") or None,
+            password=os.environ.get("BROWSER_PROXY_PASSWORD") or None,
+            bypass=os.environ.get("BROWSER_PROXY_BYPASS") or None,
+        )
+
+    cookies = None
+    cookies_file = os.environ.get("BROWSER_COOKIES_FILE", "").strip()
+    if cookies_file and os.path.exists(cookies_file):
+        try:
+            with open(cookies_file) as f:
+                loaded = json.load(f)
+            cookies = loaded if isinstance(loaded, list) else None
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Failed to read cookies file {cookies_file}: {e}")
+
+    return extensions, proxy, cookies
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     default_profile = PROFILES_DIR / DEFAULT_BROWSER_ID
     cleanup_profile_locks(default_profile)
     default_profile.mkdir(parents=True, exist_ok=True)
 
+    extensions, proxy, cookies = _default_browser_config_from_env()
+
     playwright = await async_playwright().start()
-    await local_browser_manager.start(playwright)
+    await local_browser_manager.start(
+        playwright, extensions=extensions, proxy=proxy, cookies=cookies
+    )
 
     app.state.playwright = playwright
 

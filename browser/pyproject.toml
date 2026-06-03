@@ -1,6 +1,6 @@
 [project]
 name = "livellm-browser"
-version = "2.2.0"
+version = "2.2.1"
 description = "Browser in docker with VNC and Chrome, exposing CDP over a launcher API"
 readme = "README.md"
 requires-python = "==3.9.*"

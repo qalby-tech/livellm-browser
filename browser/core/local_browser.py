@@ -329,10 +329,19 @@ class LocalBrowserManager:
         self.playwright: Optional[Playwright] = None
         self.browsers: dict[str, LocalBrowserInfo] = {}
 
-    async def start(self, playwright: Playwright):
-        """Initialize with a Playwright instance and create the default browser."""
+    async def start(self, playwright: Playwright, extensions: Optional[List[str]] = None, proxy=None, cookies: Optional[List[dict]] = None):
+        """Initialize with a Playwright instance and create the default browser.
+
+        Optional ``extensions``/``proxy``/``cookies`` configure the default
+        browser at boot (the operator passes these declaratively via env).
+        """
         self.playwright = playwright
-        await self.create_browser(profile_uid=DEFAULT_BROWSER_ID)
+        await self.create_browser(
+            profile_uid=DEFAULT_BROWSER_ID,
+            proxy=proxy,
+            extensions=extensions,
+            cookies=cookies,
+        )
         logger.info("Browser manager started with default browser")
 
     async def create_browser(self, profile_uid: Optional[str] = None, proxy=None, extensions: Optional[List[str]] = None, cookies: Optional[List[dict]] = None) -> tuple[str, LocalBrowserInfo]:

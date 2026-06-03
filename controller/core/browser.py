@@ -16,11 +16,13 @@ MAX_PAGES_PER_BROWSER = settings.max_pages_per_browser
 class BrowserInfo:
     """Container for a connected browser, its default context, and active pages."""
 
-    def __init__(self, browser: Browser, context: BrowserContext, ws_url: str = "", browser_id: str = ""):
+    def __init__(self, browser: Browser, context: BrowserContext, ws_url: str = "", browser_id: str = "", headers: Optional[dict] = None):
         self.browser = browser
         self.context = context
         self.ws_url = ws_url
         self.browser_id = browser_id
+        # Optional auth headers sent on CDP connect (BYO/remote browsers).
+        self.headers = headers or {}
         # Named session pages (created via start_session)
         self.pages: dict[str, Page] = {}
 
@@ -69,7 +71,7 @@ class BrowserManager:
 
     # ── connect / disconnect ─────────────────────────────────
 
-    async def connect_browser(self, browser_id: str, ws_url: str) -> BrowserInfo:
+    async def connect_browser(self, browser_id: str, ws_url: str, headers: Optional[dict] = None) -> BrowserInfo:
         """
         Connect to a remote browser over CDP.
 
@@ -77,6 +79,9 @@ class BrowserManager:
         connection is still alive, the existing connection is returned.
         If the connection is dead (e.g. browser restarted), it auto-reconnects.
         If the URL differs, the old connection is dropped and a new one opened.
+
+        ``headers`` are optional HTTP headers sent on the CDP connect, used for
+        BYO/remote browsers that require auth (e.g. an Authorization bearer).
         """
         if not self.playwright:
             raise RuntimeError("Browser manager not started")
@@ -96,10 +101,10 @@ class BrowserManager:
             await self.disconnect_browser(browser_id)
 
         logger.info(f"Connecting to browser '{browser_id}' via {ws_url}")
-        browser = await self.playwright.chromium.connect_over_cdp(ws_url)
+        browser = await self.playwright.chromium.connect_over_cdp(ws_url, headers=headers or None)
         context = browser.contexts[0] if browser.contexts else await browser.new_context()
 
-        info = BrowserInfo(browser, context, ws_url=ws_url, browser_id=browser_id)
+        info = BrowserInfo(browser, context, ws_url=ws_url, browser_id=browser_id, headers=headers or {})
         self.browsers[browser_id] = info
         logger.info(f"Connected to browser '{browser_id}'")
         return info
@@ -148,7 +153,7 @@ class BrowserManager:
 
     # ── recovery ────────────────────────────────────────────
 
-    async def recover_connection(self, browser_id: str, ws_url: str) -> BrowserInfo:
+    async def recover_connection(self, browser_id: str, ws_url: str, headers: Optional[dict] = None) -> BrowserInfo:
         """
         Recover a broken browser connection.
 
@@ -159,11 +164,16 @@ class BrowserManager:
           **existing** Playwright driver.
         * Level 2 – if the driver pipe is broken, restart the entire
           Playwright driver process and reconnect every browser.
+
+        ``headers`` defaults to the existing connection's headers (so BYO auth
+        survives a reconnect) when not provided by the caller.
         """
         async with self._reconnect_lock:
             # Another request may have already recovered while we waited
             if browser_id in self.browsers:
                 existing = self.browsers[browser_id]
+                if headers is None:
+                    headers = existing.headers
                 # Only short-circuit if the URL also matches — ws_url drift
                 # (browser pod restart with new IP/port) means we MUST reconnect.
                 if existing.ws_url == ws_url and existing.browser.is_connected():
@@ -171,17 +181,17 @@ class BrowserManager:
 
             # ── Level 1: simple reconnect with same Playwright driver ──
             try:
-                return await self._reconnect_same_driver(browser_id, ws_url)
+                return await self._reconnect_same_driver(browser_id, ws_url, headers)
             except Exception as e:
                 logger.warning(
                     f"Level-1 reconnect failed for '{browser_id}': {e}"
                 )
 
             # ── Level 2: restart Playwright driver entirely ──
-            return await self._restart_playwright_and_reconnect(browser_id, ws_url)
+            return await self._restart_playwright_and_reconnect(browser_id, ws_url, headers)
 
     async def _reconnect_same_driver(
-        self, browser_id: str, ws_url: str
+        self, browser_id: str, ws_url: str, headers: Optional[dict] = None
     ) -> BrowserInfo:
         """Disconnect stale entry and open a fresh CDP connection."""
         try:
@@ -192,25 +202,25 @@ class BrowserManager:
             logger.warning(f"Error disconnecting '{browser_id}': {e}")
             self.browsers.pop(browser_id, None)
 
-        browser = await self.playwright.chromium.connect_over_cdp(ws_url)
+        browser = await self.playwright.chromium.connect_over_cdp(ws_url, headers=headers or None)
         context = (
             browser.contexts[0] if browser.contexts
             else await browser.new_context()
         )
-        info = BrowserInfo(browser, context, ws_url=ws_url, browser_id=browser_id)
+        info = BrowserInfo(browser, context, ws_url=ws_url, browser_id=browser_id, headers=headers or {})
         self.browsers[browser_id] = info
         logger.info(f"Reconnected browser '{browser_id}' (same driver)")
         return info
 
     async def _restart_playwright_and_reconnect(
-        self, browser_id: str, fresh_ws_url: Optional[str] = None
+        self, browser_id: str, fresh_ws_url: Optional[str] = None, headers: Optional[dict] = None
     ) -> BrowserInfo:
         """Restart the Playwright driver process and reconnect every browser."""
         logger.warning("Restarting Playwright driver for full recovery")
 
-        saved = {bid: info.ws_url for bid, info in self.browsers.items()}
+        saved = {bid: (info.ws_url, info.headers) for bid, info in self.browsers.items()}
         if fresh_ws_url:
-            saved[browser_id] = fresh_ws_url
+            saved[browser_id] = (fresh_ws_url, headers if headers is not None else saved.get(browser_id, (None, {}))[1])
         self.browsers.clear()
 
         old_pw = self.playwright
@@ -234,17 +244,17 @@ class BrowserManager:
         logger.info("Playwright driver restarted")
 
         new_info: Optional[BrowserInfo] = None
-        for bid, url in saved.items():
+        for bid, (url, hdrs) in saved.items():
             try:
                 browser = await asyncio.wait_for(
-                    self.playwright.chromium.connect_over_cdp(url),
+                    self.playwright.chromium.connect_over_cdp(url, headers=hdrs or None),
                     timeout=15.0,
                 )
                 context = (
                     browser.contexts[0] if browser.contexts
                     else await browser.new_context()
                 )
-                info = BrowserInfo(browser, context, ws_url=url, browser_id=bid)
+                info = BrowserInfo(browser, context, ws_url=url, browser_id=bid, headers=hdrs or {})
                 self.browsers[bid] = info
                 if bid == browser_id:
                     new_info = info

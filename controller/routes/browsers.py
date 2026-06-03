@@ -96,7 +96,8 @@ async def start_session(
         reconnect_url = fresh_ws_url or browser_info.ws_url
         try:
             browser_info = await browser_manager.recover_connection(
-                browser_info.browser_id, reconnect_url
+                browser_info.browser_id, reconnect_url,
+                headers=browser_registry.get_browser_headers(browser_info.browser_id),
             )
             page = await browser_info.context.new_page()
         except Exception as recover_err:

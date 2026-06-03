@@ -29,10 +29,30 @@ class BrowserRegistry:
 
     def __init__(self, path: str = BROWSERS_CONFIG_PATH):
         self.path = path
-        self._cache: dict[str, str] = {}
+        # {browser_id: {"wsUrl": str, "headers": {name: value}}}
+        self._cache: dict[str, dict] = {}
         self._mtime: float = -1.0
 
-    def _load(self) -> dict[str, str]:
+    @staticmethod
+    def _normalize(value) -> Optional[dict]:
+        """Accept a plain ws_url string OR an object {wsUrl, headers}.
+
+        Returns a normalized {"wsUrl": str, "headers": dict} or None if invalid.
+        The object form carries optional auth headers for BYO/remote browsers
+        (e.g. {"wsUrl": "wss://…", "headers": {"Authorization": "Bearer …"}}).
+        """
+        if isinstance(value, str):
+            return {"wsUrl": value, "headers": {}} if value else None
+        if isinstance(value, dict):
+            ws = value.get("wsUrl") or value.get("ws_url") or ""
+            raw_headers = value.get("headers") or {}
+            headers = {}
+            if isinstance(raw_headers, dict):
+                headers = {str(k): str(v) for k, v in raw_headers.items() if v}
+            return {"wsUrl": str(ws), "headers": headers} if ws else None
+        return None
+
+    def _load(self) -> dict[str, dict]:
         try:
             st = os.stat(self.path)
         except FileNotFoundError:
@@ -52,7 +72,12 @@ class BrowserRegistry:
             with open(self.path) as f:
                 data = json.load(f)
             browsers = data.get("browsers", data) if isinstance(data, dict) else {}
-            self._cache = {str(k): str(v) for k, v in browsers.items() if v}
+            cache = {}
+            for k, v in browsers.items():
+                entry = self._normalize(v)
+                if entry:
+                    cache[str(k)] = entry
+            self._cache = cache
             self._mtime = st.st_mtime
             logger.info(
                 f"registry: loaded {len(self._cache)} browser(s) from {self.path}"
@@ -62,12 +87,18 @@ class BrowserRegistry:
         return self._cache
 
     def get_all_browsers(self) -> dict[str, str]:
-        """Return a copy of {browser_id: ws_url} from the registry file."""
-        return dict(self._load())
+        """Return {browser_id: ws_url} from the registry file."""
+        return {bid: e["wsUrl"] for bid, e in self._load().items()}
 
     def get_browser_ws_url(self, browser_id: str) -> Optional[str]:
         """Resolve a browser's CDP ws_url, or None if it isn't in the registry."""
-        return self._load().get(browser_id)
+        entry = self._load().get(browser_id)
+        return entry["wsUrl"] if entry else None
+
+    def get_browser_headers(self, browser_id: str) -> dict:
+        """Auth headers to send on CDP connect for this browser (may be empty)."""
+        entry = self._load().get(browser_id)
+        return dict(entry["headers"]) if entry else {}
 
 
 browser_registry = BrowserRegistry()

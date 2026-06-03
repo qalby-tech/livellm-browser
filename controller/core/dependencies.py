@@ -41,6 +41,7 @@ async def get_browser_info(
             )
 
     fresh_ws_url = browser_registry.get_browser_ws_url(bid)
+    fresh_headers = browser_registry.get_browser_headers(bid)
 
     try:
         info = manager.get_browser(bid)
@@ -52,7 +53,7 @@ async def get_browser_info(
             )
         logger.info(f"Auto-discovered browser '{bid}' from registry, connecting...")
         try:
-            info = await manager.connect_browser(bid, fresh_ws_url)
+            info = await manager.connect_browser(bid, fresh_ws_url, headers=fresh_headers)
         except Exception as e:
             raise HTTPException(
                 status_code=502,
@@ -75,7 +76,7 @@ async def get_browser_info(
         else:
             logger.info(f"Browser '{bid}' connection is dead, auto-reconnecting...")
         try:
-            info = await manager.recover_connection(bid, reconnect_url)
+            info = await manager.recover_connection(bid, reconnect_url, headers=fresh_headers)
         except Exception as e:
             logger.error(f"Failed to reconnect browser '{bid}': {e}")
             raise HTTPException(
@@ -126,7 +127,8 @@ async def get_or_create_page(
             reconnect_url = fresh_ws_url or browser_info.ws_url
             try:
                 browser_info = await manager.recover_connection(
-                    browser_info.browser_id, reconnect_url
+                    browser_info.browser_id, reconnect_url,
+                    headers=browser_registry.get_browser_headers(browser_info.browser_id),
                 )
                 page = await browser_info.context.new_page()
             except Exception as recover_err:

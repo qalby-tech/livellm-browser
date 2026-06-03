@@ -94,6 +94,11 @@ RUN chmod 666 /etc/passwd /etc/group && \
 COPY startup.sh /usr/local/bin/custom-startup.sh
 RUN chmod +x /usr/local/bin/custom-startup.sh
 
+# Redirect the noVNC web root (/) to the auto-connecting, scale-to-fit client so
+# the bare URL serves the live framebuffer instead of a directory listing.
+# websockify serves index.html for "/" when present.
+RUN printf '%s' '<!doctype html><meta charset="utf-8"><title>noVNC</title><meta http-equiv="refresh" content="0; url=vnc.html?autoconnect=true&resize=scale">' > /usr/share/novnc/index.html
+
 # Switch back to headless user
 USER "${HEADLESS_USER_ID}"
 

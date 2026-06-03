@@ -117,17 +117,41 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Browser Launcher API", lifespan=lifespan)
 
 
+def _default_ws_info():
+    """The single browser's stable CDP websocket (one pod = one browser)."""
+    info = local_browser_manager.browsers.get(DEFAULT_BROWSER_ID)
+    if not info:
+        return None
+    return {
+        "browser_id": DEFAULT_BROWSER_ID,
+        "cdp_port": info.proxy_port,
+        "ws_endpoint": info.ws_endpoint,
+        "ws_stable_endpoint": f"{STABLE_WS_PREFIX}/{DEFAULT_BROWSER_ID}",
+    }
+
+
+@app.get("/")
+async def root():
+    """Single discovery endpoint — returns this pod's browser and its stable CDP
+    websocket. One pod = one browser, so no per-browser routing is needed."""
+    ws = _default_ws_info()
+    if not ws:
+        return Response(status_code=503, content="No browser")
+    return ws
+
+
 @app.get("/health")
 async def health():
-    if not local_browser_manager.browsers:
-        return Response(status_code=503, content="No browsers")
-    for bid, info in local_browser_manager.browsers.items():
-        try:
-            if not info.browser.is_connected():
-                return Response(status_code=503, content=f"Browser {bid} disconnected")
-        except Exception as e:
-            return Response(status_code=503, content=f"Browser {bid} error: {e}")
-    return {"status": "ok"}
+    ws = _default_ws_info()
+    if not ws:
+        return Response(status_code=503, content="No browser")
+    info = local_browser_manager.browsers.get(DEFAULT_BROWSER_ID)
+    try:
+        if not info.browser.is_connected():
+            return Response(status_code=503, content="Browser disconnected")
+    except Exception as e:
+        return Response(status_code=503, content=f"Browser error: {e}")
+    return {"status": "ok", **ws}
 
 # ── Browser CRUD ──
 

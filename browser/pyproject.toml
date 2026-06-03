@@ -1,6 +1,6 @@
 [project]
 name = "livellm-browser"
-version = "2.1.7"
+version = "2.2.0"
 description = "Browser in docker with VNC and Chrome, exposing CDP over a launcher API"
 readme = "README.md"
 requires-python = "==3.9.*"
@@ -10,6 +10,5 @@ dependencies = [
     "uvicorn>=0.38.0",
     "patchright==1.56.0",
     "httpx>=0.28.1",
-    "redis>=5.0.0",
 ]
 # patchright version is actually critical

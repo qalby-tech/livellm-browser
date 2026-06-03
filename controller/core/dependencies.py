@@ -5,7 +5,7 @@ from fastapi import Depends, Header, HTTPException, Request
 from patchright.async_api import Page
 
 from core.browser import BrowserInfo, BrowserManager
-from core.redis_state import redis_controller_state
+from core.registry import browser_registry
 
 logger = logging.getLogger(__name__)
 
@@ -21,9 +21,10 @@ async def get_browser_info(
     """
     Resolve browser info from X-Browser-Id header.
 
-    Source of truth for ws_url is Redis. On every request we cheaply check for
-    drift (browser pod restarted with a new IP/port) and reconnect if needed,
-    so that local state can never silently lag behind cluster state.
+    Source of truth for ws_url is the file-backed registry (an operator-maintained
+    ConfigMap mapping browser_id -> stable Service ws_url). On every request we
+    cheaply re-read it and reconnect if the local connection is dead, so that
+    local state can never silently lag behind cluster state.
     """
     manager: BrowserManager = request.app.state.browser_manager
 
@@ -31,12 +32,15 @@ async def get_browser_info(
     if not bid:
         bid = manager.least_loaded_browser_id() or manager.first_browser_id()
         if not bid:
+            # Nothing connected yet — fall back to the first registered browser.
+            bid = next(iter(browser_registry.get_all_browsers()), None)
+        if not bid:
             raise HTTPException(
                 status_code=404,
-                detail="No browsers connected. Register one first via POST /browsers.",
+                detail="No browsers available. Register one first via POST /browsers.",
             )
 
-    fresh_ws_url = await redis_controller_state.get_browser_ws_url(bid)
+    fresh_ws_url = browser_registry.get_browser_ws_url(bid)
 
     try:
         info = manager.get_browser(bid)
@@ -46,13 +50,13 @@ async def get_browser_info(
                 status_code=404,
                 detail=f"Browser '{bid}' not found. Ensure the browser is running.",
             )
-        logger.info(f"Auto-discovered browser '{bid}' from Redis, connecting...")
+        logger.info(f"Auto-discovered browser '{bid}' from registry, connecting...")
         try:
             info = await manager.connect_browser(bid, fresh_ws_url)
         except Exception as e:
             raise HTTPException(
                 status_code=502,
-                detail=f"Browser '{bid}' found in Redis but connection failed: {e}",
+                detail=f"Browser '{bid}' found in registry but connection failed: {e}",
             )
         return info
 
@@ -116,7 +120,7 @@ async def get_or_create_page(
             page = await browser_info.context.new_page()
         except Exception as e:
             logger.warning(f"Failed to create page, attempting recovery: {e}")
-            fresh_ws_url = await redis_controller_state.get_browser_ws_url(
+            fresh_ws_url = browser_registry.get_browser_ws_url(
                 browser_info.browser_id
             )
             reconnect_url = fresh_ws_url or browser_info.ws_url

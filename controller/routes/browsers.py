@@ -8,7 +8,7 @@ from core.browser import browser_manager
 from core.dependencies import (
     BrowserInfoDep, SessionIdDep, BrowserIdDep, get_browser_info,
 )
-from core.redis_state import redis_controller_state
+from core.registry import browser_registry
 from models.requests import ConnectBrowserRequest, StartSessionRequest
 from models.responses import BrowserResponse
 
@@ -78,7 +78,7 @@ async def start_session(
 ) -> dict:
     """Start a new session (page) in a connected browser and return the session ID.
 
-    Routes through the same Redis-backed resolution as the rest of the API,
+    Routes through the same registry-backed resolution as the rest of the API,
     so a stale local connection (e.g. browser pod restarted with a new IP)
     is auto-recovered before we try to open a page.
     """
@@ -92,7 +92,7 @@ async def start_session(
         page = await browser_info.context.new_page()
     except Exception as e:
         logger.warning(f"start_session: failed to open page, attempting recovery: {e}")
-        fresh_ws_url = await redis_controller_state.get_browser_ws_url(browser_info.browser_id)
+        fresh_ws_url = browser_registry.get_browser_ws_url(browser_info.browser_id)
         reconnect_url = fresh_ws_url or browser_info.ws_url
         try:
             browser_info = await browser_manager.recover_connection(

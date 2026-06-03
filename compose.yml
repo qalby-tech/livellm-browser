@@ -1,11 +1,4 @@
 services:
-  redis:
-    image: redis:7-alpine
-    container_name: livellm-redis
-    ports:
-      - "6379:6379"
-    restart: unless-stopped
-
   livellm-browser:
     build:
       context: ./browser
@@ -19,18 +12,20 @@ services:
       - "6901:6901"
       # FastAPI Launcher
       - "9000:9000"
+      # CDP proxy — fixed port so the controller's ws_url is deterministic
+      - "9222:9222"
     environment:
       - VNC_PW=headless
       - VNC_RESOLUTION=1920x1080
       - DISPLAY=:1
-      - REDIS_URL=redis://redis:6379/0
-      - BROWSER_ADDRESS=livellm-browser
+      # Pin the primary browser's CDP proxy to a fixed port. In K8s the
+      # operator's Service targets this; in compose the controller's
+      # registry file points at it.
+      - CDP_PORT=9222
       - NODE_OPTIONS=--max-old-space-size=6144
     volumes:
       # Mount profiles directory from host with read/write access
       - profiles_volume:/home/headless/Desktop/app/profiles:rw
-    depends_on:
-      - redis
     restart: unless-stopped
     stop_grace_period: 10s
     shm_size: '4gb'
@@ -53,10 +48,15 @@ services:
       # FastAPI Controller
       - "8000:8000"
     environment:
-      - REDIS_URL=redis://redis:6379/0
       - NODE_OPTIONS=--max-old-space-size=3072
+      # File-backed browser registry (replaces Redis discovery). In K8s the
+      # operator writes this from the namespace's Browser CRs; here it's a
+      # static compose config pointing at the browser service.
+      - BROWSERS_CONFIG=/etc/livellm/browsers.json
+    configs:
+      - source: browsers_json
+        target: /etc/livellm/browsers.json
     depends_on:
-      - redis
       - livellm-browser
     restart: unless-stopped
     deploy:
@@ -64,6 +64,11 @@ services:
         limits:
           cpus: '1'
           memory: '4gb'
+
+configs:
+  browsers_json:
+    content: |
+      {"browsers": {"default": "ws://livellm-browser:9222/devtools/browser/default"}}
 
 volumes:
   profiles_volume:

@@ -8,20 +8,17 @@ Dockerized Chrome browser with a FastAPI control plane for programmatic browser 
 docker compose up --build
 ```
 
-This starts three services:
+This starts two services:
 
 | Service | Port | Description |
 |---------|------|-------------|
-| **Browser** | `9000` | Chrome instance manager (extensions, cookies, profiles) |
+| **Browser** | `9000` (launcher), `9222` (CDP), `6901` (noVNC) | Chrome instance manager (extensions, cookies, profiles); noVNC password `headless` |
 | **Controller** | `8000` | Playwright automation API (search, scrape, interact) |
-| **noVNC** | `6901` | Visual browser access in your web browser (password: `headless`) |
 
-On startup, the `register-browser` init container automatically:
-1. Waits for both services to be ready
-2. Discovers the default browser from the Browser service
-3. Registers it with the Controller via CDP WebSocket
-
-After that, the Controller is ready to use.
+The browser pins its CDP proxy to a fixed port (`CDP_PORT=9222`), and the
+controller is handed a static registry file (compose `configs.browsers_json`)
+pointing at `ws://livellm-browser:9222/...`. The controller warm-connects on
+startup and lazily on first request — no registration step, no Redis.
 
 ## How It Works
 
@@ -154,7 +151,7 @@ curl -X POST http://localhost:8000/parser/browsers \
 
 If the browser restarts (e.g. after installing an extension), the controller **auto-reconnects** on the next request — no manual re-registration needed.
 
-> **Redis is the source of truth.** Browser pods publish their CDP `ws_url` to Redis (`livellm:browsers`); the controller resolves it on every request and reconciles drift on a 10-second sync loop. A browser pod that restarts with a new IP/port is picked up automatically — there is no in-memory connection cache to invalidate.
+> **A file-backed registry is the source of truth.** Each browser is its own pod fronted by a stable Service, so its CDP `ws_url` is deterministic and never drifts — the in-pod CDP proxy keeps a **fixed port** (`CDP_PORT`, default 9222) and rewrites the ws path across Chrome restarts, while the Service keeps a stable DNS name across pod restarts. The operator writes the namespace's browsers into a ConfigMap (`{"browsers": {"<id>": "ws://<svc>:9222/devtools/browser/<id>"}}`) that the controller mounts at `BROWSERS_CONFIG` (default `/etc/livellm/browsers.json`) and re-reads on demand. The controller resolves `X-Browser-Id` against this map and reconnects only when a live connection dies. No Redis, no heartbeats.
 
 ### Sessions
 
@@ -312,4 +309,4 @@ curl -X POST http://localhost:8000/parser/search_videos \
 
 ## Running on Kubernetes
 
-For cluster deployments, use the [livellm-browser-operator](https://github.com/XvKuoMing/livellm-browser-operator) and its Helm chart. The operator manages `Browser` and `Controller` CRs, wires Redis automatically, and propagates desired state (extensions, cookies, proxy) to running pods. The controller pod's `NODE_OPTIONS` is auto-sized from its memory limit (`min(limit/2, 4096)` MiB); the browser pod is left alone so Chrome keeps the memory budget. Override per-CR via `spec.env`, cluster-wide via `DEFAULT_*_ENV`.
+For cluster deployments, use the [livellm-browser-operator](https://github.com/XvKuoMing/livellm-browser-operator) and its Helm chart. The operator manages `Browser` and `Controller` CRs: one pod per `Browser` (a stable Service + fixed CDP port), a per-namespace `Controller`, and the browser-registry ConfigMap that wires them together. It propagates desired state (extensions, cookies, proxy) to running pods via the launcher API. The controller pod's `NODE_OPTIONS` is auto-sized from its memory limit (`min(limit/2, 4096)` MiB); the browser pod is left alone so Chrome keeps the memory budget. Override per-CR via `spec.env`, cluster-wide via `DEFAULT_*_ENV`.

@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from patchright.async_api import async_playwright
 
 from core.browser import browser_manager
-from core.redis_state import redis_controller_state
+from core.registry import browser_registry
 from routes import health, browsers, search, content, interact, attribute
 
 
@@ -55,11 +55,6 @@ async def _stale_page_cleanup_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    try:
-        await redis_controller_state.connect()
-    except Exception as e:
-        logger.warning(f"Failed to connect to Redis: {e}")
-
     # Start Playwright
     playwright = await async_playwright().start()
     await browser_manager.start(playwright)
@@ -67,29 +62,28 @@ async def lifespan(app: FastAPI):
     app.state.playwright = playwright
     app.state.browser_manager = browser_manager
 
-    # Initial Redis discovery (immediate connect on startup)
+    # Warm-connect any browsers already in the registry (best-effort). Browsers
+    # are also auto-connected lazily on first request, so this is just an
+    # optimization — registry misses or connection failures are non-fatal.
     try:
-        browsers = await redis_controller_state.get_all_browsers()
+        browsers = browser_registry.get_all_browsers()
         for browser_id, ws_url in browsers.items():
             if browser_id not in browser_manager.browsers:
                 try:
                     await browser_manager.connect_browser(browser_id, ws_url)
-                    logger.info(f"Auto-connected browser '{browser_id}' from Redis: {ws_url}")
+                    logger.info(f"Warm-connected browser '{browser_id}' from registry: {ws_url}")
                 except Exception as e:
-                    logger.warning(f"Failed to auto-connect browser '{browser_id}': {e}")
+                    logger.warning(f"Failed to warm-connect browser '{browser_id}': {e}")
         if browsers:
-            logger.info(f"Auto-discovered {len(browsers)} browser(s) from Redis")
+            logger.info(f"Registry lists {len(browsers)} browser(s)")
     except Exception as e:
-        logger.warning(f"Failed to auto-discover browsers from Redis: {e}")
-
-    # Start background Redis sync (continuously reconciles browsers)
-    await redis_controller_state.start_sync(browser_manager)
+        logger.warning(f"Failed to warm-connect browsers from registry: {e}")
 
     # Start periodic stale page cleanup to prevent memory leaks in the
     # Patchright Node.js driver (which OOM-crashes if pages accumulate).
     stale_cleanup_task = asyncio.create_task(_stale_page_cleanup_loop())
 
-    logger.info("Controller started — browser discovery via Redis (sync every 10s)")
+    logger.info("Controller started — browser discovery via file registry")
 
     yield
 
@@ -100,10 +94,6 @@ async def lifespan(app: FastAPI):
         await stale_cleanup_task
     except asyncio.CancelledError:
         pass
-    try:
-        await redis_controller_state.disconnect()
-    except Exception as e:
-        logger.warning(f"Error disconnecting from Redis: {e}")
     try:
         await browser_manager.shutdown(timeout=25.0)
     except Exception as e:

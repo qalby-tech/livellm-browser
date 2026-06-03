@@ -86,6 +86,28 @@ def _default_browser_config_from_env():
     return extensions, proxy, cookies
 
 
+async def _browser_watchdog():
+    """Relaunch the default browser if the user closes it (or it crashes).
+
+    One pod = one browser; if the Chromium window is closed via noVNC the
+    browser disconnects but the in-pod CDP proxy keeps its fixed port. We detect
+    the dead connection and restart_browser() (which retargets the same proxy),
+    so the browser self-heals in-place without a pod restart.
+    """
+    while True:
+        await asyncio.sleep(10)
+        try:
+            info = local_browser_manager.browsers.get(DEFAULT_BROWSER_ID)
+            if info is None:
+                continue
+            if info.browser is None or not info.browser.is_connected():
+                logger.warning("Default browser is down — relaunching")
+                await local_browser_manager.restart_browser(DEFAULT_BROWSER_ID)
+                logger.info("Default browser relaunched")
+        except Exception as e:
+            logger.warning(f"Browser watchdog error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     default_profile = PROFILES_DIR / DEFAULT_BROWSER_ID
@@ -100,9 +122,15 @@ async def lifespan(app: FastAPI):
     )
 
     app.state.playwright = playwright
+    watchdog = asyncio.create_task(_browser_watchdog())
 
     yield
 
+    watchdog.cancel()
+    try:
+        await watchdog
+    except asyncio.CancelledError:
+        pass
     logger.info("Application shutting down, cleaning up resources...")
     try:
         await local_browser_manager.shutdown(timeout=25.0)

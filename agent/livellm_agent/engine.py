@@ -16,7 +16,7 @@ import logging
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
-from browser_use import Agent, BrowserSession, Tools
+from browser_use import Agent, BrowserProfile, BrowserSession, Tools
 
 from livellm_agent.config import Settings
 from livellm_agent.tools import ControllerTools
@@ -88,7 +88,12 @@ def build_session(s: Settings) -> BrowserSession:
     """
     if not s.cdp_ws_url:
         raise RuntimeError("no cdp_ws_url configured (operator must resolve the target)")
-    return BrowserSession(cdp_url=s.cdp_ws_url)
+    # Remote attach to a Chrome we don't own: keep_alive so teardown never tries
+    # to kill it; is_local False so no local-process assumptions fire. (NB: the
+    # browser must be EXCLUSIVE to this agent — a second CDP client creating/
+    # destroying targets steals browser-use's page focus and breaks state reads.)
+    profile = BrowserProfile(keep_alive=True, is_local=False)
+    return BrowserSession(cdp_url=s.cdp_ws_url, browser_profile=profile)
 
 
 def build_controller_tools(s: Settings) -> tuple[Optional[Tools], Optional[ControllerTools]]:
@@ -150,6 +155,8 @@ async def run_subgoal(
         tools=tools,
         enable_planning=False,                       # our layer plans; keep sub-goals focused
         use_vision="auto",                            # don't force screenshots on non-vision models
+        use_judge=False,                              # GLM/weak models return invalid JSON for the judge
+        use_thinking=False,                           # ditto the thinking schema; keep the action loop simple
         register_should_stop_callback=should_stop,    # async pause/cancel (clean stop)
     )
     history = await agent.run(max_steps=SUBGOAL_MAX_STEPS)

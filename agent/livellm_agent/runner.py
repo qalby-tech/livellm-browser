@@ -27,10 +27,7 @@ from livellm_agent.engine import (
     run_subgoal,
 )
 from livellm_agent.models import (
-    PlanReady,
-    RunDone,
     Step,
-    StepEvent,
     StepStatus,
     Task,
     TaskStatus,
@@ -77,7 +74,8 @@ class Runner:
         except ModelNotConfigured as e:
             logger.warning("task %s: %s", self.task.id, e)
             self.task.status = TaskStatus.failed
-            await self.control.send(RunDone(task_id=self.task.id, status=TaskStatus.failed))
+            await self.control.emit("run.done", {}, status=TaskStatus.failed.value,
+                                    message="model_not_configured")
             return
 
         self._session = build_session(settings)
@@ -111,7 +109,8 @@ class Runner:
         intents = await plan(settings, self.task.prompt)
         self.steps = [Step(idx=i, intent=t) for i, t in enumerate(intents)]
         self.task.trajectory = Trajectory(version=self._version, plan=self.steps)
-        await self.control.send(PlanReady(task_id=self.task.id, trajectory=self.task.trajectory))
+        await self.control.emit("plan.ready", self.task.trajectory, status=self.task.status.value,
+                                message=f"planned {len(self.steps)} step(s)")
 
     # ── execution ──────────────────────────────────────────────────────────
     async def _execute_from(self, i: int) -> None:
@@ -137,20 +136,26 @@ class Runner:
                 continue  # i unchanged
             i += 1
 
+    async def _emit_step(self, step: Step, phase: str) -> None:
+        await self.control.emit(
+            "step.event", self.task.trajectory, status=self.task.status.value,
+            message=f"step {step.idx} {phase}: {step.intent}",
+        )
+
     async def _run_step(self, step: Step) -> str:
         step.status = StepStatus.running
         step.started_at = _now()
-        await self.control.send(StepEvent(task_id=self.task.id, step=step, phase="started"))
+        await self._emit_step(step, "started")
 
         try:
             res = await run_subgoal(
                 self._session, self._llm, self._tools, step.intent, self._should_stop
             )
-        except Exception as e:
+        except Exception:
             logger.exception("step %d failed", step.idx)
             step.status = StepStatus.failed
             step.ended_at = _now()
-            await self.control.send(StepEvent(task_id=self.task.id, step=step, phase="failed"))
+            await self._emit_step(step, "failed")
             return "next"
 
         step.action_json = {"output": res.output, "success": res.success}
@@ -163,14 +168,14 @@ class Runner:
         step.screenshot_ref = self._save_screenshot(step, res.screenshot_b64)
         step.ended_at = _now()
         step.status = StepStatus.done if res.success else StepStatus.failed
-        await self.control.send(StepEvent(task_id=self.task.id, step=step, phase="done"))
+        await self._emit_step(step, "done")
 
         if self.task.mode.value != "review":
             return "next"
 
         # block for a human verdict
         step.status = StepStatus.review
-        await self.control.send(StepEvent(task_id=self.task.id, step=step, phase="review"))
+        await self._emit_step(step, "review")
         try:
             verdict = await self.control.wait_verdict(step.idx)
         except Exception:
@@ -199,7 +204,8 @@ class Runner:
             tail = [Step(idx=step.idx + k, intent=t) for k, t in enumerate(intents)]
             self.steps = self.steps[: step.idx] + tail
             self.task.trajectory = Trajectory(version=self._version, plan=self.steps)
-            await self.control.send(PlanReady(task_id=self.task.id, trajectory=self.task.trajectory))
+            await self.control.emit("plan.ready", self.task.trajectory, status=self.task.status.value,
+                                    message=f"reformed trajectory (v{self._version})")
             return "reform"
         return "next"
 
@@ -219,7 +225,7 @@ class Runner:
     async def _finish_pass(self) -> None:
         failed = any(s.status == StepStatus.failed for s in self.steps)
         self.task.status = TaskStatus.failed if failed else TaskStatus.done
-        trajectory_ref = None
+        trajectory_ref = ""
         if settings.artifact_endpoint and self.task.trajectory:
             try:
                 trajectory_ref = artifacts.store().put_trajectory(
@@ -227,12 +233,8 @@ class Runner:
                 )
             except Exception as e:
                 logger.warning("trajectory upload failed: %s", e)
-        # video_ref is None until the recorder lands (P1 cont.) — see docs.
-        await self.control.send(
-            RunDone(
-                task_id=self.task.id,
-                status=self.task.status,
-                video_ref=None,
-                trajectory_ref=trajectory_ref,
-            )
+        # video_ref stays empty until the recorder lands (deferred) — see docs.
+        await self.control.emit(
+            "run.done", self.task.trajectory, status=self.task.status.value,
+            message=f"task {self.task.status.value}", video_ref="", trajectory_ref=trajectory_ref or "",
         )

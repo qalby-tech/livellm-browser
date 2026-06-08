@@ -1,14 +1,13 @@
-"""Data model for tasks, trajectories, steps and the control protocol.
+"""Data model for tasks, trajectories, steps and verdicts.
 
-These mirror the `browser_agent` Postgres schema (owned by tenant-api) and the
-cloud_gateways control-channel messages described in
-docs/browser-agent-architecture.md. The agent runtime is stateless about
-durable storage — it emits/consumes these shapes; tenant-api persists them.
+These mirror the browser_agent_tasks shape owned by tenant-api (the trajectory
+is persisted as a JSONB snapshot). The agent runtime is stateless about durable
+storage — it emits trajectory snapshots; tenant-api persists them.
 """
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Literal, Optional, Union
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
@@ -94,47 +93,10 @@ class Verdict(BaseModel):
     at: datetime = Field(default_factory=_now)
 
 
-# ── control protocol (cloud_gateways WS) ─────────────────────────────────────
-# agent → UI
-class PlanReady(BaseModel):
-    type: Literal["plan.ready"] = "plan.ready"
-    task_id: str
-    trajectory: Trajectory
-
-
-class StepEvent(BaseModel):
-    # one shape for started / review / done — `phase` disambiguates.
-    type: Literal["step.event"] = "step.event"
-    task_id: str
-    step: Step
-    phase: Literal["started", "review", "done", "failed"]
-
-
-class RunDone(BaseModel):
-    type: Literal["run.done"] = "run.done"
-    task_id: str
-    status: TaskStatus
-    video_ref: Optional[str] = None
-    trajectory_ref: Optional[str] = None
-
-
-AgentEvent = Union[PlanReady, StepEvent, RunDone]
-
-
-# UI → agent
-class VerdictMsg(BaseModel):
-    type: Literal["verdict"] = "verdict"
-    verdict: Verdict
-
-
-class ControlMsg(BaseModel):
-    type: Literal["control"] = "control"
-    op: Literal["pause", "resume", "cancel"]
-
-
-class RestartFrom(BaseModel):
-    type: Literal["restart_from"] = "restart_from"
-    step_idx: int
-
-
-ClientMsg = Union[VerdictMsg, ControlMsg, RestartFrom]
+# Control plane is HTTP (tenant-api-centric), not a WS protocol:
+#  - OUTBOUND: the runner emits trajectory SNAPSHOTS via control.emit(type, …) →
+#    POSTed to tenant-api's callback (event types: plan.ready / step.event /
+#    run.done). tenant-api persists the snapshot + fans out webhooks.
+#  - INBOUND: tenant-api forwards UI actions to the agent's /verdict, /control,
+#    /restart endpoints, which build a Verdict / op / step_idx and hand it to the
+#    ControlChannel. No typed wire-message classes are needed.

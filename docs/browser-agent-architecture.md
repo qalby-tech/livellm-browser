@@ -133,7 +133,9 @@ Loop, in order:
 
 The model is built from the **tenant's `/integrations` AI provider** (provider +
 key fetched per-task from tenant-api, owner-scoped, held only for the run; prefer
-a vision-capable model).
+a vision-capable model). **There is no implicit default model** — if the tenant
+has no resolvable AI integration the task is refused with a clear error
+(`model_not_configured`), never billed to a platform key.
 
 ## State model — separate `browser_agent` database
 
@@ -188,7 +190,7 @@ spec:
     controllerRef: <name>      #   registry + controller tools
     externalWsUrl: <wss://…>   #   BYO
   model:
-    integrationRef: <name>     # tenant /integrations provider (default: tenant default)
+    integrationRef: <name>     # tenant /integrations provider; REQUIRED — no implicit default, task refused if unresolved
   recording: { enabled: true } # CDP screencast → MinIO
   running: true                # pause/resume the runtime (PVC retained)
 status:

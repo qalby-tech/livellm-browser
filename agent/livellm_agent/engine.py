@@ -27,6 +27,19 @@ logger = logging.getLogger(__name__)
 # not a whole task, so it should converge well within this.
 SUBGOAL_MAX_STEPS = 15
 
+# Base URLs for known OpenAI-compatible providers (anything not anthropic/google
+# is driven through browser-use's ChatOpenAI). An explicit AGENT_MODEL_BASE_URL
+# overrides these.
+OPENAI_COMPAT_BASE = {
+    "zai-coding-plan": "https://api.z.ai/api/coding/paas/v4",
+    "openrouter": "https://openrouter.ai/api/v1",
+}
+OPENAI_COMPAT_DEFAULT_MODEL = {
+    "openai": "gpt-4o",
+    "zai-coding-plan": "glm-4.6",
+    "openrouter": "openai/gpt-4o",
+}
+
 
 class ModelNotConfigured(Exception):
     """Raised when the tenant has no resolvable AI integration. Never fall back
@@ -46,21 +59,25 @@ def build_llm(s: Settings):
     if provider == "anthropic":
         from browser_use import ChatAnthropic
         return ChatAnthropic(
-            model=s.model_name or "claude-sonnet-4-5",
-            api_key=s.model_api_key,
-            base_url=s.model_base_url,
-        )
-    if provider in ("openai", "openai-compatible"):
-        from browser_use import ChatOpenAI
-        return ChatOpenAI(
-            model=s.model_name or "gpt-4o",
+            model=s.model_name or "claude-sonnet-4-6",
             api_key=s.model_api_key,
             base_url=s.model_base_url,
         )
     if provider == "google":
         from browser_use import ChatGoogle
-        return ChatGoogle(model=s.model_name or "gemini-2.0-flash", api_key=s.model_api_key)
-    raise ModelNotConfigured(f"unsupported provider: {s.model_provider}")
+        return ChatGoogle(model=s.model_name or "gemini-2.5-pro", api_key=s.model_api_key)
+
+    # Everything else is treated as an OpenAI-compatible chat API. Known
+    # providers get their base URL from OPENAI_COMPAT_BASE; an explicit
+    # AGENT_MODEL_BASE_URL always wins. (zai-coding-plan = Z.ai GLM coding plan,
+    # openrouter, etc.)
+    from browser_use import ChatOpenAI
+    base = s.model_base_url or OPENAI_COMPAT_BASE.get(provider)
+    return ChatOpenAI(
+        model=s.model_name or OPENAI_COMPAT_DEFAULT_MODEL.get(provider, "gpt-4o"),
+        api_key=s.model_api_key,
+        base_url=base,
+    )
 
 
 def build_session(s: Settings) -> BrowserSession:
@@ -132,6 +149,7 @@ async def run_subgoal(
         browser_session=session,
         tools=tools,
         enable_planning=False,                       # our layer plans; keep sub-goals focused
+        use_vision="auto",                            # don't force screenshots on non-vision models
         register_should_stop_callback=should_stop,    # async pause/cancel (clean stop)
     )
     history = await agent.run(max_steps=SUBGOAL_MAX_STEPS)

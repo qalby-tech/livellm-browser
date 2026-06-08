@@ -49,24 +49,31 @@ def _parse_steps(text: str) -> list[str]:
 
 async def plan(s: Settings, prompt: str) -> list[str]:
     provider = (s.model_provider or "").lower()
+    # base URLs for known OpenAI-compatible providers (mirror engine.py)
+    openai_base = {
+        "zai-coding-plan": "https://api.z.ai/api/coding/paas/v4",
+        "openrouter": "https://openrouter.ai/api/v1",
+    }
+    openai_default_model = {"openai": "gpt-4o", "zai-coding-plan": "glm-4.6", "openrouter": "openai/gpt-4o"}
+
     steps: list[str] = []
     try:
         if provider == "anthropic":
             from anthropic import AsyncAnthropic
             client = AsyncAnthropic(api_key=s.model_api_key, base_url=s.model_base_url)
             msg = await client.messages.create(
-                model=s.model_name or "claude-sonnet-4-5",
+                model=s.model_name or "claude-sonnet-4-6",
                 max_tokens=1024,
                 system=_SYS,
                 messages=[{"role": "user", "content": prompt}],
             )
             text = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
             steps = _parse_steps(text)
-        elif provider in ("openai", "openai-compatible"):
+        elif provider != "google":  # openai / openai-compatible / zai / openrouter / …
             from openai import AsyncOpenAI
-            client = AsyncOpenAI(api_key=s.model_api_key, base_url=s.model_base_url)
+            client = AsyncOpenAI(api_key=s.model_api_key, base_url=s.model_base_url or openai_base.get(provider))
             resp = await client.chat.completions.create(
-                model=s.model_name or "gpt-4o",
+                model=s.model_name or openai_default_model.get(provider, "gpt-4o"),
                 messages=[
                     {"role": "system", "content": _SYS},
                     {"role": "user", "content": prompt},

@@ -68,6 +68,9 @@ class Step(BaseModel):
 class Trajectory(BaseModel):
     version: int = Field(default=1, description="Bumped on each reform")
     plan: list[Step] = Field(default_factory=list)
+    # Final synthesized answer to the task prompt (set when the run finishes) —
+    # the run's deliverable, not just per-step outputs.
+    result: Optional[str] = None
     created_at: datetime = Field(default_factory=_now)
 
 

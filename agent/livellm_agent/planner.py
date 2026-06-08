@@ -88,3 +88,46 @@ async def plan(s: Settings, prompt: str) -> list[str]:
         logger.info("planner produced no steps; running the task as one sub-goal")
         steps = [prompt]
     return steps
+
+
+_SYNTH_SYS = (
+    "You are a research assistant. A browser agent executed a plan and collected "
+    "notes from web pages. Using ONLY those notes, write a clear, well-structured, "
+    "complete answer to the user's task — the actual deliverable, not a summary of "
+    "what you did. Use markdown (headings, bullet points, steps) where it helps. "
+    "If the notes are insufficient for part of the task, say so briefly."
+)
+
+
+async def synthesize(s: Settings, prompt: str, notes: str) -> str:
+    """Turn the collected step notes into a final answer to the task prompt.
+    Best-effort: returns '' if the provider call fails."""
+    provider = (s.model_provider or "").lower()
+    user = f"TASK:\n{prompt}\n\nNOTES collected by the agent:\n{notes}\n\nWrite the answer to the TASK."
+    openai_base = {
+        "zai-coding-plan": "https://api.z.ai/api/coding/paas/v4",
+        "openrouter": "https://openrouter.ai/api/v1",
+    }
+    openai_default_model = {"openai": "gpt-4o", "zai-coding-plan": "glm-4.6", "openrouter": "openai/gpt-4o"}
+    try:
+        if provider == "anthropic":
+            from anthropic import AsyncAnthropic
+            client = AsyncAnthropic(api_key=s.model_api_key, base_url=s.model_base_url)
+            msg = await client.messages.create(
+                model=s.model_name or "claude-sonnet-4-6",
+                max_tokens=2048,
+                system=_SYNTH_SYS,
+                messages=[{"role": "user", "content": user}],
+            )
+            return "".join(b.text for b in msg.content if getattr(b, "type", None) == "text").strip()
+        if provider != "google":
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(api_key=s.model_api_key, base_url=s.model_base_url or openai_base.get(provider))
+            resp = await client.chat.completions.create(
+                model=s.model_name or openai_default_model.get(provider, "gpt-4o"),
+                messages=[{"role": "system", "content": _SYNTH_SYS}, {"role": "user", "content": user}],
+            )
+            return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        logger.warning("synthesize failed: %s", e)
+    return ""

@@ -137,6 +137,7 @@ class SubgoalResult:
     output: Optional[str]
     url: Optional[str]
     screenshot_b64: Optional[str]
+    error: Optional[str]  # last browser-use error when the sub-goal failed
     raw: dict  # history.model_dump(), for the trajectory artifact
 
 
@@ -163,10 +164,16 @@ async def run_subgoal(
 
     screenshots = history.screenshots() or []
     urls = history.urls() or []
+    errs: list[str] = []
+    try:
+        errs = [str(e) for e in (history.errors() or []) if e]
+    except Exception:
+        pass
     return SubgoalResult(
         success=bool(history.is_successful()),
         output=history.final_result(),
         url=urls[-1] if urls else None,
         screenshot_b64=screenshots[-1] if screenshots else None,
+        error=errs[-1] if errs else None,
         raw=history.model_dump(),
     )

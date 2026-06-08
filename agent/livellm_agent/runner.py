@@ -35,7 +35,7 @@ from livellm_agent.models import (
     Verdict,
     VerdictKind,
 )
-from livellm_agent.planner import plan
+from livellm_agent.planner import plan, synthesize
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +158,7 @@ class Runner:
             await self._emit_step(step, "failed")
             return "next"
 
-        step.action_json = {"output": res.output, "success": res.success}
+        step.action_json = {"output": res.output, "success": res.success, "error": res.error}
         # capture exact browser state for restart-from-step (best-effort);
         # falls back to just the URL if the CDP snapshot fails.
         try:
@@ -225,16 +225,36 @@ class Runner:
     async def _finish_pass(self) -> None:
         failed = any(s.status == StepStatus.failed for s in self.steps)
         self.task.status = TaskStatus.failed if failed else TaskStatus.done
+
+        # Synthesize a final ANSWER to the task from the collected step outputs —
+        # the run's deliverable. Best-effort; runs even if some steps failed (uses
+        # whatever was gathered).
+        notes = "\n\n".join(
+            f"[{s.idx + 1}] {s.intent}\n{(s.action_json or {}).get('output') or '(no output)'}"
+            for s in self.steps
+            if (s.action_json or {}).get("output")
+        )
+        if self.task.trajectory and notes:
+            try:
+                answer = await synthesize(settings, self.task.prompt, notes)
+                if answer:
+                    self.task.trajectory.result = answer
+            except Exception as e:
+                logger.warning("final synthesis failed: %s", e)
+
         trajectory_ref = ""
         if settings.artifact_endpoint and self.task.trajectory:
             try:
-                trajectory_ref = artifacts.store().put_trajectory(
-                    self.task.id, self.task.trajectory
-                )
+                trajectory_ref = artifacts.store().put_trajectory(self.task.id, self.task.trajectory)
             except Exception as e:
                 logger.warning("trajectory upload failed: %s", e)
+
+        result = (self.task.trajectory.result if self.task.trajectory else "") or ""
+        msg = f"task {self.task.status.value}"
+        if result:
+            msg += "\n\n" + result
         # video_ref stays empty until the recorder lands (deferred) — see docs.
         await self.control.emit(
             "run.done", self.task.trajectory, status=self.task.status.value,
-            message=f"task {self.task.status.value}", video_ref="", trajectory_ref=trajectory_ref or "",
+            message=msg, video_ref="", trajectory_ref=trajectory_ref or "",
         )

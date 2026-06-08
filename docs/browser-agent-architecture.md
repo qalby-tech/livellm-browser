@@ -236,8 +236,11 @@ P3  tenant-api                browser_agent_tasks (goose 0005 + sqlc); act/get/l
                               ingestion + webhook→channels; agent HTTP control plane
                               (replaced the gateway WS); api-rbac browseragents
                               get/list. DONE. (model-key wiring → P4 chart.)
-P4  charts/tenant + tenant-ui render BrowserAgent workload; the review UI
-                              (trajectory, per-step verdict buttons, video, restart).
+P4  charts/tenant + tenant-ui DONE. chart renders the BrowserAgent workload
+                              (model key ← tenant provider Secret); operator
+                              TenantSpec gains browser-agent; tenant-ui Agent tab
+                              (trajectory + verdict buttons + restart + webhooks).
+                              Only the MP4 recorder remains (deferred).
 ```
 
 ## Open seams

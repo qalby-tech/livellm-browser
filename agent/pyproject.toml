@@ -12,8 +12,14 @@ dependencies = [
     "pydantic-settings>=2.0",
     "httpx>=0.27",
     "websockets>=13.0",
-    "browser-use>=0.3,<0.5",
-    "patchright==1.56.0",
+    # Pinned: 0.12.x talks raw CDP via cdp-use (dropped Playwright/Patchright),
+    # uses its own Chat* LLM classes, and Tools() registry. The engine codes to
+    # this exact surface — do not float the major/minor without re-checking.
+    "browser-use==0.12.9",
+    # Provider SDKs (also pulled transitively by browser-use) — pinned for the
+    # planner pass, which calls the provider directly for a structured plan.
+    "anthropic>=0.40",
+    "openai>=1.50",
     "boto3>=1.34",
 ]
 

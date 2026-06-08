@@ -66,22 +66,27 @@ jobs:
         run: |
           BROWSER_VERSION=$(grep '^version = ' browser/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
           CONTROLLER_VERSION=$(grep '^version = ' controller/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          AGENT_VERSION=$(grep '^version = ' agent/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
           echo "BROWSER_VERSION=$BROWSER_VERSION" >> $GITHUB_OUTPUT
           echo "CONTROLLER_VERSION=$CONTROLLER_VERSION" >> $GITHUB_OUTPUT
-          echo "Browser version: $BROWSER_VERSION, Controller version: $CONTROLLER_VERSION"
+          echo "AGENT_VERSION=$AGENT_VERSION" >> $GITHUB_OUTPUT
+          echo "Browser: $BROWSER_VERSION, Controller: $CONTROLLER_VERSION, Agent: $AGENT_VERSION"
 
       - name: Compute image tags
         id: tags
         run: |
           BROWSER_VERSION="${{ steps.version.outputs.BROWSER_VERSION }}"
           CONTROLLER_VERSION="${{ steps.version.outputs.CONTROLLER_VERSION }}"
+          AGENT_VERSION="${{ steps.version.outputs.AGENT_VERSION }}"
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           if [ "${{ github.ref }}" = "refs/heads/develop" ]; then
             echo "BROWSER_TAG=${IMAGE}:dev-${BROWSER_VERSION}" >> $GITHUB_OUTPUT
             echo "CONTROLLER_TAG=${IMAGE}:dev-controller-${CONTROLLER_VERSION}" >> $GITHUB_OUTPUT
+            echo "AGENT_TAG=${IMAGE}:dev-agent-${AGENT_VERSION}" >> $GITHUB_OUTPUT
           else
             echo "BROWSER_TAG=${IMAGE}:${BROWSER_VERSION}" >> $GITHUB_OUTPUT
             echo "CONTROLLER_TAG=${IMAGE}:controller-${CONTROLLER_VERSION}" >> $GITHUB_OUTPUT
+            echo "AGENT_TAG=${IMAGE}:agent-${AGENT_VERSION}" >> $GITHUB_OUTPUT
           fi
 
       - name: Build and push browser image
@@ -105,7 +110,20 @@ jobs:
           tags: ${{ steps.tags.outputs.CONTROLLER_TAG }}
           cache-from: type=gha,scope=controller
           cache-to: type=gha,mode=max,scope=controller
-  
+
+      - name: Build and push agent image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./agent
+          file: ./agent/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.AGENT_TAG }}
+          cache-from: type=gha,scope=agent
+          cache-to: type=gha,mode=max,scope=agent
+  # NOTE: the operator chart's agentVersion annotation is wired into the
+  # update-chart job in P2, once charts gain the BrowserAgent resource.
+
   update-chart:
     needs: build-and-push
     runs-on: ubuntu-latest

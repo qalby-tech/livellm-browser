@@ -31,9 +31,11 @@ Hard requirements (from the product owner):
 No off-the-shelf engine ships per-step human review, plan-before-execute, or
 restart-from-step (verified survey: browser-use, Skyvern, Steel, Stagehand,
 computer-use — none do). So the trajectory/checkpoint/review layer is **ours to
-build**; the engine is just the body. We build it on **browser-use (MIT)** because
-it already rides the **same patchright stack** the `Browser` image launches, so it
-adds zero new stealth risk.
+build**; the engine is just the body. We build it on **browser-use (MIT)**,
+pinned to **0.12.9** (raw CDP via `cdp-use`; its own `Chat*` LLM classes;
+`Tools()` registry). It connects to the already-running, patchright-launched
+`Browser`, so it inherits the launch-layer stealth (see decision B for the
+client-layer nuance).
 
 ## What already exists (recap)
 
@@ -58,16 +60,21 @@ adds zero new stealth risk.
 `externalWsUrl` (BYO). Minimum viable tier is **Browser + BrowserAgent, no
 controller**. The controller is an *accelerator*, never required.
 
-### B. Stealth is connection-inherited, hardening is optional
+### B. Stealth is launch-inherited; client-layer hardening lives in the proxy
 The hardened binary + launch flags live on the **browser pod** (patchright
-launch), so every CDP client inherits them — including the agent and any
-BYO vanilla-Playwright client. The deeper client-side patches (`Runtime.enable`
-suppression, `navigator.webdriver` init-scripts) are covered for the agent
-because browser-use uses patchright. To cover *arbitrary* clients automatically
-we can later make the in-pod CDP proxy **CDP-aware** and auto-inject
-`Page.addScriptToEvaluateOnNewDocument` on every new target — but the 2026
-anti-detect benchmark shows protocol-level patching adds ~no gain once the
-binary/flags are right, so it's a low-priority enhancement, not part of v1.
+launch), so every CDP client inherits them — the agent, and any BYO client.
+This is the layer that actually moves the needle.
+
+> **Pin note (browser-use 0.12.9):** modern browser-use **dropped Playwright/
+> Patchright** — it talks raw CDP via `cdp-use`. So the agent no longer inherits
+> patchright's *client-side* patches (`Runtime.enable` suppression,
+> `navigator.webdriver` init-scripts); it only inherits the launch-layer
+> hardening. The client layer therefore belongs in the **in-pod CDP proxy**:
+> make it CDP-aware and auto-inject `Page.addScriptToEvaluateOnNewDocument` on
+> every new target, covering *all* clients uniformly. The 2026 anti-detect
+> benchmark shows this client-layer gives ~no gain once the binary/flags are
+> right, so it stays a **deferred enhancement** (not v1) — but it's now the
+> single home for client-layer stealth rather than something the engine carries.
 
 ### C. The controller is a tool server for the agent
 When `controllerRef` is set, the agent registers the controller's deterministic
@@ -95,7 +102,7 @@ extraction. Tiers degrade gracefully.
                              │
             control channel  │  (cloud_gateways WS: step events ⇄ verdicts)
                              ▼
-                       BrowserAgent pod  ── browser-use (patchright) ──┐
+                       BrowserAgent pod  ── browser-use (raw CDP) ────┐
                              │  registers controller tools (optional)   │
                              ▼                                          ▼
               Controller (optional, registry + tools)            Browser pod (CDP :9222)
@@ -114,19 +121,25 @@ Dockerfile, image `kamasalyamov/livellm-browser:agent-X.Y.Z`. **Python ≥3.11**
 
 Loop, in order:
 
-1. **Plan.** A planner LLM pass turns the task into an ordered step list →
-   persisted as the **trajectory** (this is *our* layer; browser-use is otherwise
-   step-by-step ReAct).
-2. **Connect.** `connect_over_cdp(ws_url)` via patchright (plain or registry-
-   resolved). If `controllerRef`, register the controller tools (decision C).
-3. **Execute, gated.** Drive browser-use step by step against the trajectory.
-   Use `register_new_step_callback` to emit a **step event** and, when the step
-   is marked `review`, block on `state.paused` until a **verdict** arrives over
-   the control channel. `register_done_callback` closes the run.
-4. **Checkpoint per step.** Snapshot browser state (URL + cookies +
-   localStorage via CDP) into the step row — **do not** rely on browser-use
-   `rerun_history()` (fragile on dynamic pages). Restart-from-step replays from
-   the nearest checkpoint, re-seeding the agent.
+1. **Plan.** A planner LLM pass (provider SDK, structured) turns the task into
+   an ordered list of **sub-goal** intents → persisted as the **trajectory**.
+   This is *our* layer; browser-use's internal planning is disabled
+   (`enable_planning=False`).
+2. **Connect.** `BrowserSession(cdp_url=...)` → `Agent(browser_session=...)`
+   (plain or registry-resolved). If `controllerRef`, register the controller
+   endpoints as `Tools()` (decision C).
+3. **Execute, gated — one browser-use run per sub-goal.** Each trajectory step
+   is a single `agent.run()` on the **shared** `BrowserSession` (state carries
+   across steps). Human review gates cleanly *between* sub-goals — we emit a
+   `step.event(review)` and block on the verdict over the control channel.
+   Mid-step pause/cancel uses the async `register_should_stop_callback`. (We do
+   **not** drive browser-use's internal step loop: in 0.12.9 `pause()` raises
+   `InterruptedError`, so the clean seam is between runs, and a "sub-goal" is the
+   reviewable unit the product shows — "search X", "open Y", "extract Z".)
+4. **Checkpoint per step.** Record the step's resulting URL (and, as an
+   enhancement, cookies/localStorage via CDP) into the step row. Restart-from-
+   step replays the trajectory from step *k* on the same session — **not** via
+   browser-use `rerun_history()` (fragile on dynamic pages).
 5. **Record.** `Page.startScreencast` frames → encode MP4 (page-scoped, works even
    if a browser hosts multiple pages). On completion, MP4 + trajectory JSON → MinIO.
 6. **Notify.** Emit lifecycle/step events to the chosen alert channel (webhook).

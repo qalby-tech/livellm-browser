@@ -16,7 +16,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from livellm_agent import artifacts
+from livellm_agent import artifacts, checkpoint
 from livellm_agent.config import settings
 from livellm_agent.control import ControlChannel
 from livellm_agent.engine import (
@@ -119,6 +119,10 @@ class Runner:
         # reset statuses from the start index forward
         for s in self.steps[i:]:
             s.status = StepStatus.pending
+        # restart-from-step: restore the state captured AFTER the prior step so
+        # step i re-runs from the same browser state it originally saw.
+        if i > 0 and self.steps[i - 1].checkpoint_json:
+            await checkpoint.restore(self._session, self.steps[i - 1].checkpoint_json)
         while i < len(self.steps):
             if self._restart.is_set():
                 return  # outer loop will re-enter at _restart_to
@@ -150,7 +154,12 @@ class Runner:
             return "next"
 
         step.action_json = {"output": res.output, "success": res.success}
-        step.checkpoint_json = {"url": res.url}
+        # capture exact browser state for restart-from-step (best-effort);
+        # falls back to just the URL if the CDP snapshot fails.
+        try:
+            step.checkpoint_json = await checkpoint.snapshot(self._session)
+        except Exception:
+            step.checkpoint_json = {"url": res.url}
         step.screenshot_ref = self._save_screenshot(step, res.screenshot_b64)
         step.ended_at = _now()
         step.status = StepStatus.done if res.success else StepStatus.failed

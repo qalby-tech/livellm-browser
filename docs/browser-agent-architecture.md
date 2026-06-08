@@ -220,6 +220,9 @@ P1  agent/ runtime image      browser-use over CDP; planner→trajectory; step
                               gating + checkpoints; controller tools. DONE except
                               the MP4 recorder (deferred — see Open seams).
 P2  BrowserAgent CRD+operator deploy runtime, wire target, control token, status.
+                              DONE (livellm-browser-operator: api + reconciler +
+                              rbac + CRD; resolves target from Browser/Controller
+                              status; Deployment+Service on :8800).
 P3  tenant-api                browser_agent DB (goose+sqlc); task/verdict/restart
                               endpoints; integration-key fetch; webhook→channels.
 P4  charts/tenant + tenant-ui render BrowserAgent workload; the review UI

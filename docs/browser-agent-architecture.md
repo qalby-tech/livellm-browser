@@ -95,13 +95,11 @@ extraction. Tiers degrade gracefully.
 ## Topology
 
 ```
-  task (NL) ──▶ tenant-api ──┐  (owner-scoped; fetches tenant AI key; persists)
-                             │
-                   browser_agent DB (Postgres / CNPG, separate database)
-                   tasks · trajectories · steps · verdicts · artifacts
-                             │
-            control channel  │  (cloud_gateways WS: step events ⇄ verdicts)
-                             ▼
+  UI ──▶ tenant-api ──┐  (owner-scoped; the UI talks ONLY to tenant-api)
+                      │   POST /browsers/{id}/act · /tasks/{id} · /verdict · /restart · /control
+            HTTP      │   browser_agent_tasks (Postgres; trajectory snapshots as JSONB)
+            control   │   ▲ POST /v1/internal/browser-agent/events  (agent → tenant-api)
+                      ▼   │  (persist snapshot + fan out webhook to chosen channel)
                        BrowserAgent pod  ── browser-use (raw CDP) ────┐
                              │  registers controller tools (optional)   │
                              ▼                                          ▼
@@ -151,49 +149,59 @@ a vision-capable model). **There is no implicit default model** — if the tenan
 has no resolvable AI integration the task is refused with a clear error
 (`model_not_configured`), never billed to a platform key.
 
-## State model — separate `browser_agent` database
+## State model — `browser_agent_tasks` (one row per task, JSONB trajectory)
 
-Tasks/trajectories/steps are high-churn, mutable, human-interactive application
-data — they do **not** belong in etcd/CRs and should not bloat tenant-api's
-schema. They live in a **separate `browser_agent` database** on the **same CNPG
-operator** (own goose migrations + sqlc), independently migratable/scalable; a
-dedicated physical cluster only when write volume demands it (maps onto per-cell
-DBs later). Multitenancy is **row-scoped** (`tenant_id` + app-level scoping),
-not DB-per-tenant.
+The agent streams trajectory **snapshots** (the whole plan + per-step status +
+verdicts), so persistence is ~one write per step *event*, not a row per step.
+That collapses the original normalized design into **one table** whose
+`trajectory` JSONB holds the current snapshot:
 
 ```
-tasks         (id, tenant_id, browser_agent_ref, prompt, mode, status, created_at)
-trajectories  (id, task_id, version, plan_json, created_at)   -- versioned (reformation)
-steps         (id, trajectory_id, idx, intent, action_json, status,   -- pending|running|review|done|skipped|failed
-               checkpoint_json, screenshot_ref, started_at, ended_at)
-verdicts      (id, step_id, kind, note, edited_action_json, actor, at) -- done|not_done|reform|rewrite
-artifacts     (id, task_id, kind, object_ref, bytes, created_at)       -- video|trajectory|screenshot
+browser_agent_tasks (id, tenant_name, browser_id, prompt, mode, status,
+                     channel_id → alert_channels,        -- webhook fan-out target
+                     trajectory JSONB,                   -- {version, plan:[{idx,intent,status,checkpoint,...}]}
+                     video_ref, trajectory_ref, created_at, updated_at)
 ```
 
-CR status (etcd) stays the source of truth for **infra**; the DB owns **dynamic
-run state** — same split as `Tenant` CR vs the `users` table.
+Because write volume is now low (row-per-task, not row-per-step), it lives in
+**tenant-api's existing DB** (goose migration `0005` + sqlc), prefixed and
+logically separable. A dedicated `browser_agent` database/cluster is deferred
+until volume justifies the second pool (see Open seams) — the original
+separate-DB rationale (per-step row churn) no longer applies. Multitenancy is
+**row-scoped** (`tenant_name`). CR status (etcd) stays the source of truth for
+**infra**; the DB owns **dynamic run state** — same split as `Tenant` CR vs `users`.
 
-## Control protocol (per-step review · restart · pause)
+## Control protocol (HTTP, tenant-api-centric)
 
-Reuses the `cloud_gateways` streaming proxy + HMAC token mint (same as VNC/agent
-streams). tenant-api mints a short-lived token; the agent pod holds a WS to the
-gateway. Messages:
+The UI talks only to tenant-api (platform convention; `cloud_gateways` is for
+media streaming — the deferred recorder/live-view — not control). So control is
+plain HTTP, no gateway WS:
 
-- agent → UI: `step.started`, `step.review` (blocks), `step.done`, `run.done`,
-  `plan.ready`.
-- UI → agent: `verdict{done|not_done|reform|rewrite, note?, action?}`,
-  `pause`, `resume`, `restart_from{step_idx}`.
+- **OUTBOUND (agent → tenant-api):** the runtime POSTs trajectory **snapshots**
+  to a per-task `callback_url` = `POST /v1/internal/browser-agent/events`
+  (in-cluster trust, like the Grafana webhook). Event types `plan.ready` /
+  `step.event` / `run.done`; each carries the full current trajectory + status.
+  tenant-api persists the snapshot and fans out a webhook to the task's chosen
+  alert channel.
+- **INBOUND (UI → tenant-api → agent):** `POST /tasks/{id}/verdict`,
+  `/tasks/{id}/control {pause|resume|cancel}`, `/tasks/{id}/restart {from}`.
+  tenant-api forwards to the agent pod's `/verdict`, `/control`, `/restart`,
+  which feed the same per-step Future / pause Event the runner awaits.
 
 `reform` re-runs the planner from the current step → new **trajectory version**.
-`rewrite` swaps a single step's action. `restart_from` replays to the chosen
+`rewrite` swaps a single step's intent. `restart_from` restores the prior
 step's checkpoint, then resumes live.
 
-## API surface (tenant-api)
+## API surface (tenant-api) — implemented
 
-`POST /v1/browsers/{id}/act {prompt, mode}` → create task + plan (the screenshot's
-"Drive via API"). Plus: `GET /v1/tasks/{id}` (trajectory+steps), `POST
-/v1/tasks/{id}/steps/{idx}/verdict`, `POST /v1/tasks/{id}/restart {from}`,
-`GET /v1/tasks/{id}/artifacts`. All owner-scoped.
+All owner-scoped under `/v1/tenants/{name}`:
+- `POST /browsers/{id}/act {prompt, mode, channelId?}` → create task + drive the
+  agent (the screenshot's "Drive via API"). 202 + the task.
+- `GET /browsers/{id}/tasks` → recent tasks for a browser.
+- `GET /tasks/{taskId}` → task + trajectory snapshot (steps + verdicts inline).
+- `POST /tasks/{taskId}/verdict {stepIdx, kind, note?, action?}` → forwarded to agent.
+- `POST /tasks/{taskId}/restart {from}` · `POST /tasks/{taskId}/control {op}`.
+- internal: `POST /v1/internal/browser-agent/events` (agent → tenant-api snapshot ingestion).
 
 ## CRD sketch (`BrowserAgent`, `livellm.io/v1alpha1`, short `ba`)
 
@@ -223,8 +231,11 @@ P2  BrowserAgent CRD+operator deploy runtime, wire target, control token, status
                               DONE (livellm-browser-operator: api + reconciler +
                               rbac + CRD; resolves target from Browser/Controller
                               status; Deployment+Service on :8800).
-P3  tenant-api                browser_agent DB (goose+sqlc); task/verdict/restart
-                              endpoints; integration-key fetch; webhook→channels.
+P3  tenant-api                browser_agent_tasks (goose 0005 + sqlc); act/get/list/
+                              verdict/restart/control endpoints; internal events
+                              ingestion + webhook→channels; agent HTTP control plane
+                              (replaced the gateway WS); api-rbac browseragents
+                              get/list. DONE. (model-key wiring → P4 chart.)
 P4  charts/tenant + tenant-ui render BrowserAgent workload; the review UI
                               (trajectory, per-step verdict buttons, video, restart).
 ```

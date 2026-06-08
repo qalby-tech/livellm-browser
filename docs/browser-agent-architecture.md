@@ -136,9 +136,10 @@ Loop, in order:
    **not** drive browser-use's internal step loop: in 0.12.9 `pause()` raises
    `InterruptedError`, so the clean seam is between runs, and a "sub-goal" is the
    reviewable unit the product shows — "search X", "open Y", "extract Z".)
-4. **Checkpoint per step.** Record the step's resulting URL (and, as an
-   enhancement, cookies/localStorage via CDP) into the step row. Restart-from-
-   step replays the trajectory from step *k* on the same session — **not** via
+4. **Checkpoint per step (implemented).** Snapshot url + cookies + localStorage
+   via raw CDP (`get_or_create_cdp_session()` → `session_id`) into the step row.
+   Restart-from-step *k* restores step *k-1*'s snapshot (cookies → navigate →
+   localStorage → reload) so *k* re-runs from the same state — **not** via
    browser-use `rerun_history()` (fragile on dynamic pages).
 5. **Record.** `Page.startScreencast` frames → encode MP4 (page-scoped, works even
    if a browser hosts multiple pages). On completion, MP4 + trajectory JSON → MinIO.
@@ -216,7 +217,8 @@ status:
 
 ```
 P1  agent/ runtime image      browser-use over CDP; planner→trajectory; step
-                              gating + checkpoints; controller tools; screencast.
+                              gating + checkpoints; controller tools. DONE except
+                              the MP4 recorder (deferred — see Open seams).
 P2  BrowserAgent CRD+operator deploy runtime, wire target, control token, status.
 P3  tenant-api                browser_agent DB (goose+sqlc); task/verdict/restart
                               endpoints; integration-key fetch; webhook→channels.

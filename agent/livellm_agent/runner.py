@@ -133,6 +133,17 @@ class Runner:
                     break
                 start = self._restart_to or 0
                 self._restart.clear()
+        except Exception as e:  # noqa: BLE001 — the task row must ALWAYS settle
+            # A mid-step stop (cancel) or any engine error raises out of
+            # _execute_from; without this the run ends with no run.done and
+            # tenant-api shows "running" forever.
+            status = TaskStatus.cancelled if self.control.cancelled.is_set() else TaskStatus.failed
+            self.task.status = status
+            logger.exception("task %s: run aborted", self.task.id)
+            await self.control.emit(
+                "run.done", self.task.trajectory or {}, status=status.value,
+                message="task cancelled" if status is TaskStatus.cancelled else f"aborted: {e}",
+            )
         finally:
             if self._ctrl_client:
                 await self._ctrl_client.close()

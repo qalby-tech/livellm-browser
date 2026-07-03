@@ -133,6 +133,18 @@ class Runner:
                     break
                 start = self._restart_to or 0
                 self._restart.clear()
+        except asyncio.CancelledError:
+            # browser-use's stop() cancels its internal step task and the
+            # CancelledError (a BaseException — `except Exception` never sees
+            # it) escapes here. Our own task isn't being cancelled, so
+            # awaiting the emit is safe.
+            status = TaskStatus.cancelled if self.control.cancelled.is_set() else TaskStatus.failed
+            self.task.status = status
+            logger.info("task %s: run stopped (%s)", self.task.id, status.value)
+            await self.control.emit(
+                "run.done", self.task.trajectory or {}, status=status.value,
+                message="task cancelled" if status is TaskStatus.cancelled else "aborted",
+            )
         except Exception as e:  # noqa: BLE001 — the task row must ALWAYS settle
             # A mid-step stop (cancel) or any engine error raises out of
             # _execute_from; without this the run ends with no run.done and

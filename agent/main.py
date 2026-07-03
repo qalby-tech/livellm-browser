@@ -22,7 +22,7 @@ from pydantic import BaseModel
 from livellm_agent import __version__
 from livellm_agent.config import settings
 from livellm_agent.control import ControlChannel
-from livellm_agent.models import Task, TaskMode, Verdict, VerdictKind
+from livellm_agent.models import Task, TaskMode, TaskStatus, Verdict, VerdictKind
 from livellm_agent.runner import Runner
 
 logging.basicConfig(level=logging.INFO)
@@ -91,7 +91,23 @@ async def ready() -> dict:
 async def act(body: ActRequest) -> dict:
     """Create a task and start it. tenant-api follows it via the callback."""
     if _active["task_id"] is not None:
-        raise HTTPException(status_code=409, detail="agent already has an active task")
+        # A SETTLED task lingers on purpose (its runner waits for a possible
+        # restart-from-step) — but it must not block new work: evict it by
+        # cancelling the wait. Only a genuinely running task 409s.
+        prev_runner, prev_control, prev_drive = _active["runner"], _active["control"], _active["drive"]
+        settled = prev_runner is not None and prev_runner.task.status in (
+            TaskStatus.done, TaskStatus.failed, TaskStatus.cancelled,
+        )
+        if not settled:
+            raise HTTPException(status_code=409, detail="agent already has an active task")
+        if prev_control is not None:
+            prev_control.cancelled.set()
+        if prev_drive is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(prev_drive), timeout=10)
+            except (TimeoutError, asyncio.TimeoutError):
+                prev_drive.cancel()
+        _active.update(task_id=None, runner=None, control=None, drive=None)
 
     task_id = body.task_id or str(uuid.uuid4())
     tenant = body.tenant or settings.tenant_id

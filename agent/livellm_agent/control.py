@@ -62,6 +62,14 @@ class ControlChannel:
         if not self._callback:
             return  # standalone / no callback configured
         traj = trajectory.model_dump(mode="json") if isinstance(trajectory, BaseModel) else (trajectory or {})
+        # Checkpoints hold full cookies + localStorage — restart state that
+        # lives in the runner's memory. Never ship it in events: it bloats the
+        # payload past the control plane's body cap (dropping run.done on big
+        # sites) and would persist session tokens in the task row.
+        for step in (traj.get("plan") or []):
+            cp = step.get("checkpoint_json")
+            if isinstance(cp, dict) and ("cookies" in cp or "local_storage" in cp or "localStorage" in cp):
+                step["checkpoint_json"] = {"url": cp.get("url")}
         payload = {
             "task_id": self._task_id,
             "tenant": self._tenant,

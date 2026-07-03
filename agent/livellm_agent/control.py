@@ -73,7 +73,8 @@ class ControlChannel:
             "message": message,
         }
         try:
-            await self._http.post(self._callback, json=payload)
+            resp = await self._http.post(self._callback, json=payload)
+            logger.info("control: emit %s status=%s -> %s", event_type, status, resp.status_code)
         except Exception as e:  # reporting is best-effort; never fail the run
             logger.warning("control: emit %s failed: %s", event_type, e)
 

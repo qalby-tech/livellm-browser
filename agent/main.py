@@ -122,7 +122,11 @@ async def act(body: ActRequest) -> dict:
     async def _drive() -> None:
         try:
             await runner.run()
+        except BaseException:
+            logger.exception("drive for task %s died", task_id)
+            raise
         finally:
+            logger.info("drive for task %s finished", task_id)
             await control.close()
             _active.update(task_id=None, runner=None, control=None, drive=None)
 

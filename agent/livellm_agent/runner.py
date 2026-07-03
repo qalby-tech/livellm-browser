@@ -110,6 +110,8 @@ class Runner:
             start = 0
             while True:
                 await self._execute_from(start)
+                logger.info("task %s: pass finished (cancelled=%s)",
+                            self.task.id, self.control.cancelled.is_set())
                 if self.control.cancelled.is_set():
                     # cancelled mid-pass: mark and report as such — do NOT run
                     # _finish_pass (which would label it done/failed and spend

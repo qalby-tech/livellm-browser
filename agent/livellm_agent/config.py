@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     model_name: Optional[str] = None             # vision-capable preferred
     model_api_key: Optional[str] = None
     model_base_url: Optional[str] = None          # optional override / proxy
+    # Vision override (AGENT_MODEL_VISION=true/false). Unset → inferred: models
+    # driven with raw_output (zai/GLM text endpoints) get no screenshots, the
+    # rest keep browser-use's "auto" behavior. See engine.resolve_use_vision.
+    model_vision: Optional[bool] = None
+    # Per-call LLM timeout (seconds) for browser-use's action loop. The library
+    # default is 75s, which slow models (GLM et al.) routinely blow through.
+    llm_timeout: int = 180
 
     # ── control channel (cloud_gateways) ─────────────────────────────────
     control_url: Optional[str] = None             # wss://<gateway>/agent/... (events ⇄ verdicts)

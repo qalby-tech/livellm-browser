@@ -25,6 +25,7 @@ from livellm_agent.engine import (
     build_controller_tools,
     build_llm,
     build_session,
+    resolve_use_vision,
     run_subgoal,
 )
 from livellm_agent.models import (
@@ -36,9 +37,13 @@ from livellm_agent.models import (
     Verdict,
     VerdictKind,
 )
-from livellm_agent.planner import plan, synthesize
+from livellm_agent.planner import plan, replan_or_ask, synthesize
 
 logger = logging.getLogger(__name__)
+
+# Auto-mode failure policy: at most this many automatic replans per pass; past
+# the cap a failed step always escalates to the human instead.
+MAX_AUTO_REPLANS = 2
 
 
 def _now() -> datetime:
@@ -64,6 +69,8 @@ class Runner:
         self._restart_to: Optional[int] = None
         self._restart = asyncio.Event()
         self._llm = None
+        self._use_vision = "auto"
+        self._replans = 0  # automatic replans this pass (capped at MAX_AUTO_REPLANS)
         self._session = None
         self._tools = None
         self._ctrl_client = None
@@ -102,6 +109,7 @@ class Runner:
                                     message="model_not_configured")
             return
 
+        self._use_vision = resolve_use_vision(self._llm, settings)
         self._session = build_session(settings)
         self._tools, self._ctrl_client = build_controller_tools(settings)
 
@@ -173,6 +181,7 @@ class Runner:
     # ── execution ──────────────────────────────────────────────────────────
     async def _execute_from(self, i: int) -> None:
         self.task.status = TaskStatus.running
+        self._replans = 0  # the replan cap is per pass
         # reset statuses from the start index forward
         for s in self.steps[i:]:
             s.status = StepStatus.pending
@@ -209,12 +218,17 @@ class Runner:
             res = await run_subgoal(
                 self._session, self._llm, self._tools, step.intent, self._should_stop,
                 control=self.control,
+                use_vision=self._use_vision,
+                llm_timeout=settings.llm_timeout,
             )
-        except Exception:
+        except Exception as e:
             logger.exception("step %d failed", step.idx)
             step.status = StepStatus.failed
+            step.action_json = {"output": None, "success": False, "error": str(e)}
             step.ended_at = _now()
             await self._emit_step(step, "failed")
+            if self.task.mode.value != "review":
+                return await self._on_step_failure(step)
             return "next"
 
         step.action_json = {"output": res.output, "success": res.success, "error": res.error}
@@ -234,9 +248,13 @@ class Runner:
             return await self._ask_human(step, question)
 
         step.status = StepStatus.done if res.success else StepStatus.failed
-        await self._emit_step(step, "done")
+        await self._emit_step(step, "done" if res.success else "failed")
 
         if self.task.mode.value != "review":
+            if step.status == StepStatus.failed:
+                # never march blindly into dependent steps: replan the
+                # remainder or escalate to the human (see _on_step_failure)
+                return await self._on_step_failure(step)
             return "next"
 
         # block for a human verdict
@@ -277,6 +295,53 @@ class Runner:
             return "retry"
         return await self._apply_verdict(step, verdict)
 
+    async def _on_step_failure(self, step: Step) -> str:
+        """Auto-mode failure policy: never advance past a failed step blindly.
+
+        Ask the planner to either (a) revise the remainder of the plan based on
+        what succeeded, or (b) escalate one clear question to the human. At most
+        MAX_AUTO_REPLANS automatic replans per pass; past the cap — or when the
+        replan call itself fails without a question — the failure always routes
+        into the _ask_human flow (task parks as paused, NEED_HUMAN in
+        trajectory.result, resumed by a rewrite verdict carrying the answer).
+        """
+        err = (step.action_json or {}).get("error") or (step.action_json or {}).get("output") or "no details"
+        fallback_q = (
+            f"Step {step.idx + 1} failed ('{step.intent}'): {str(err)[:300]}. "
+            "How should I proceed?"
+        )
+        if self._replans >= MAX_AUTO_REPLANS:
+            logger.info("task %s: replan cap (%d) reached; escalating step %d to human",
+                        self.task.id, MAX_AUTO_REPLANS, step.idx)
+            return await self._ask_human(step, fallback_q)
+
+        decision = None
+        try:
+            decision = await replan_or_ask(settings, self.task.prompt, self.steps, step)
+        except Exception as e:  # noqa: BLE001 — degrade to asking the human
+            logger.warning("replan_or_ask failed for step %d: %s", step.idx, e)
+
+        if decision and decision.get("steps"):
+            self._replans += 1
+            await self._reform_tail(
+                step, decision["steps"],
+                f"replanned after step {step.idx} failed "
+                f"(v{self._version + 1}, replan {self._replans}/{MAX_AUTO_REPLANS})",
+            )
+            return "reform"
+        question = (decision or {}).get("need_human") or fallback_q
+        return await self._ask_human(step, question)
+
+    async def _reform_tail(self, step: Step, intents: list[str], message: str) -> None:
+        """Replace the plan from `step` onward with `intents` → new trajectory
+        version, emit plan.ready. Shared by the reform verdict and auto-replan."""
+        self._version += 1
+        tail = [Step(idx=step.idx + k, intent=t) for k, t in enumerate(intents)]
+        self.steps = self.steps[: step.idx] + tail
+        self.task.trajectory = Trajectory(version=self._version, plan=self.steps)
+        await self.control.emit("plan.ready", self.task.trajectory, status=self.task.status.value,
+                                message=message)
+
     async def _apply_verdict(self, step: Step, v: Verdict) -> str:
         if v.kind == VerdictKind.done:
             step.status = StepStatus.done
@@ -295,12 +360,7 @@ class Runner:
             # re-plan the remainder from here → new trajectory version
             ctx = f"{self.task.prompt}\n\nReplan from step {step.idx} ('{step.intent}'). Reviewer note: {v.note or ''}"
             intents = await plan(settings, ctx)
-            self._version += 1
-            tail = [Step(idx=step.idx + k, intent=t) for k, t in enumerate(intents)]
-            self.steps = self.steps[: step.idx] + tail
-            self.task.trajectory = Trajectory(version=self._version, plan=self.steps)
-            await self.control.emit("plan.ready", self.task.trajectory, status=self.task.status.value,
-                                    message=f"reformed trajectory (v{self._version})")
+            await self._reform_tail(step, intents, f"reformed trajectory (v{self._version + 1})")
             return "reform"
         return "next"
 

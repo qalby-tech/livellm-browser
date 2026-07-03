@@ -161,6 +161,25 @@ def build_llm(s: Settings):
     )
 
 
+def resolve_use_vision(llm, s: Settings):
+    """What to pass browser-use's Agent as use_vision for this LLM.
+
+    browser-use 0.12.9 semantics: True forces a screenshot into every LLM call;
+    "auto" exposes a `screenshot` tool — if the model calls it, the image goes
+    into the message content; False never sends images and removes the tool.
+    Text-only endpoints (Z.ai GLM: `messages.content.type is invalid, allowed
+    values: ['text']`) 400 on image parts, so they must get False, not "auto".
+
+    AGENT_MODEL_VISION=true/false overrides; unset → raw_output models (GLM &
+    friends, see _wants_raw_output) get False, everything else keeps "auto".
+    """
+    if s.model_vision is not None:
+        return "auto" if s.model_vision else False
+    if getattr(llm, "raw_output", False):  # RepairingChatOpenAI for text-only models
+        return False
+    return "auto"
+
+
 def build_session(s: Settings) -> BrowserSession:
     """Connect to the EXISTING Browser over CDP (does not launch Chromium).
 
@@ -219,11 +238,17 @@ def build_controller_tools(s: Settings) -> tuple[Optional[Tools], Optional[Contr
 NEED_HUMAN_PREFIX = "NEED_HUMAN:"
 
 _NEED_HUMAN_NUDGE = (
-    "If you reach a point where you need information only the human operator "
-    "can provide (login credentials, a 2FA/verification code, a payment "
-    "confirmation, or a choice you must not guess), do NOT invent it: call "
-    "`done` with success=false and text starting exactly with 'NEED_HUMAN: ' "
-    "followed by one clear question for the human."
+    "If you reach a point where you need information or a decision only the "
+    "human operator can provide, do NOT invent it and do NOT keep retrying "
+    "until the step limit: call `done` with success=false and text starting "
+    "exactly with 'NEED_HUMAN: ' followed by one clear question for the human. "
+    "This applies in particular to: a delivery address or delivery time slot "
+    "(e.g. a site demands an address before items can be added to the cart), "
+    "login credentials or a 2FA/verification code, a payment confirmation or "
+    "payment details, and choosing between options you must not guess (which "
+    "product variant, which account, which shipping method). If a modal or "
+    "form blocks progress and filling it needs any of the above, stop and ask "
+    "instead of grinding against it."
 )
 
 
@@ -267,12 +292,18 @@ async def run_subgoal(
     intent: str,
     should_stop: Callable[[], Awaitable[bool]],
     control=None,
+    use_vision="auto",
+    llm_timeout: int = 180,
 ) -> SubgoalResult:
     """Execute one trajectory sub-goal as a browser-use run on the shared session.
 
     `control` (a ControlChannel) is optional: when given, its pause/cancel flags
     are mirrored onto the running agent mid-sub-goal (pause at the next action,
     cancel within seconds) instead of only at sub-goal boundaries.
+
+    `use_vision` comes from resolve_use_vision (False for text-only models —
+    images in the message content 400 there). `llm_timeout` overrides
+    browser-use's 75s default, which slow models routinely exceed.
     """
     agent = Agent(
         task=intent,
@@ -280,7 +311,8 @@ async def run_subgoal(
         browser_session=session,
         tools=tools,
         enable_planning=False,                       # our layer plans; keep sub-goals focused
-        use_vision="auto",                            # don't force screenshots on non-vision models
+        use_vision=use_vision,                        # resolve_use_vision: False for text-only models
+        llm_timeout=llm_timeout,                      # library default 75s is too tight for GLM et al.
         use_judge=False,                              # GLM/weak models return invalid JSON for the judge
         use_thinking=False,                           # ditto the thinking schema; keep the action loop simple
         register_should_stop_callback=should_stop,    # async cancel/restart (clean stop)

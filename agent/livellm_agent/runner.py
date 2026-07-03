@@ -20,6 +20,7 @@ from livellm_agent import artifacts, checkpoint
 from livellm_agent.config import settings
 from livellm_agent.control import ControlChannel
 from livellm_agent.engine import (
+    NEED_HUMAN_PREFIX,
     ModelNotConfigured,
     build_controller_tools,
     build_llm,
@@ -44,6 +45,16 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _need_human(output: Optional[str]) -> Optional[str]:
+    """The question when a sub-goal's final output is a NEED_HUMAN escape."""
+    if not output:
+        return None
+    txt = output.strip().strip("\"'")
+    if txt.startswith(NEED_HUMAN_PREFIX):
+        return txt[len(NEED_HUMAN_PREFIX):].strip() or "The agent needs your input."
+    return None
+
+
 class Runner:
     def __init__(self, task: Task, control: ControlChannel):
         self.task = task
@@ -57,11 +68,24 @@ class Runner:
         self._tools = None
         self._ctrl_client = None
         control.on_restart = self._on_restart
+        control.on_control = self._on_control
 
     # ── control hooks ────────────────────────────────────────────────────
     async def _on_restart(self, step_idx: int) -> None:
         self._restart_to = max(0, min(step_idx, len(self.steps) - 1))
         self._restart.set()
+
+    async def _on_control(self, op: str) -> None:
+        # Reflect pause/resume in the task status immediately, so the UI sees
+        # the control take effect (the engine bridge pauses the live agent).
+        if op == "pause" and self.task.status == TaskStatus.running:
+            self.task.status = TaskStatus.paused
+            await self.control.emit("task.event", self.task.trajectory or {},
+                                    status=TaskStatus.paused.value, message="paused by user")
+        elif op == "resume" and self.task.status == TaskStatus.paused:
+            self.task.status = TaskStatus.running
+            await self.control.emit("task.event", self.task.trajectory or {},
+                                    status=TaskStatus.running.value, message="resumed by user")
 
     async def _should_stop(self) -> bool:
         # stop the current sub-goal cleanly on cancel or a restart request
@@ -86,6 +110,15 @@ class Runner:
             start = 0
             while True:
                 await self._execute_from(start)
+                if self.control.cancelled.is_set():
+                    # cancelled mid-pass: mark and report as such — do NOT run
+                    # _finish_pass (which would label it done/failed and spend
+                    # an LLM call on synthesis).
+                    self.task.status = TaskStatus.cancelled
+                    await self.control.emit("run.done", self.task.trajectory or {},
+                                            status=TaskStatus.cancelled.value,
+                                            message="task cancelled")
+                    return
                 await self._finish_pass()
                 # wait for a post-completion restart, or stop
                 self._restart.clear()
@@ -149,7 +182,8 @@ class Runner:
 
         try:
             res = await run_subgoal(
-                self._session, self._llm, self._tools, step.intent, self._should_stop
+                self._session, self._llm, self._tools, step.intent, self._should_stop,
+                control=self.control,
             )
         except Exception:
             logger.exception("step %d failed", step.idx)
@@ -167,6 +201,13 @@ class Runner:
             step.checkpoint_json = {"url": res.url}
         step.screenshot_ref = self._save_screenshot(step, res.screenshot_b64)
         step.ended_at = _now()
+
+        # ask-human escape hatch: the model ended the sub-goal with a
+        # NEED_HUMAN question (credentials / 2FA / a choice it must not guess)
+        question = _need_human(res.output)
+        if question is not None:
+            return await self._ask_human(step, question)
+
         step.status = StepStatus.done if res.success else StepStatus.failed
         await self._emit_step(step, "done")
 
@@ -180,6 +221,35 @@ class Runner:
             verdict = await self.control.wait_verdict(step.idx)
         except Exception:
             return "next"  # cancelled/closed
+        return await self._apply_verdict(step, verdict)
+
+    async def _ask_human(self, step: Step, question: str) -> str:
+        """Surface a model question to the human and block for an answer.
+
+        Reuses the existing plumbing (no new endpoints): the task parks as
+        `paused` with the question in trajectory.result (NEED_HUMAN: …) and the
+        step in `review`; a `rewrite` verdict's note (or action.intent) is the
+        answer — it is injected as context and the step re-runs. Any other
+        verdict behaves as usual.
+        """
+        step.status = StepStatus.review
+        self.task.status = TaskStatus.paused
+        if self.task.trajectory:
+            self.task.trajectory.result = f"{NEED_HUMAN_PREFIX} {question}"
+        await self._emit_step(step, f"needs human input: {question}")
+        try:
+            verdict = await self.control.wait_verdict(step.idx)
+        except Exception:
+            return "next"  # cancelled/closed
+        self.task.status = TaskStatus.running
+        if self.task.trajectory:
+            self.task.trajectory.result = None
+        if verdict.kind == VerdictKind.rewrite:
+            answer = (verdict.action_json or {}).get("intent") or verdict.note
+            if answer:
+                step.intent = f"{step.intent}\n\nHuman-provided input: {answer}"
+            step.status = StepStatus.pending
+            return "retry"
         return await self._apply_verdict(step, verdict)
 
     async def _apply_verdict(self, step: Step, v: Verdict) -> str:

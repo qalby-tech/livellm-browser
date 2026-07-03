@@ -43,6 +43,8 @@ class ControlChannel:
 
         # hook the runner sets to handle a restart-from-step request
         self.on_restart: Optional[Callable[[int], Awaitable[None]]] = None
+        # hook the runner sets to reflect pause/resume in the task status
+        self.on_control: Optional[Callable[[str], Awaitable[None]]] = None
 
     async def close(self) -> None:
         await self._http.aclose()
@@ -92,6 +94,8 @@ class ControlChannel:
             self.cancelled.set()
             self._resume.set()
             self._fail_pending(RuntimeError("cancelled"))
+        if self.on_control:
+            asyncio.create_task(self.on_control(op))
 
     def submit_restart(self, step_idx: int) -> None:
         if self.on_restart:

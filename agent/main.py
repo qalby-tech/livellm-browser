@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="livellm-agent", version=__version__)
 
 # One active task per agent pod (matches BrowserAgent.status.activeTaskId).
-_active: dict[str, Any] = {"task_id": None, "runner": None, "control": None}
+_active: dict[str, Any] = {"task_id": None, "runner": None, "control": None, "drive": None}
 
 
 class ActRequest(BaseModel):
@@ -108,10 +108,12 @@ async def act(body: ActRequest) -> dict:
             await runner.run()
         finally:
             await control.close()
-            _active.update(task_id=None, runner=None, control=None)
+            _active.update(task_id=None, runner=None, control=None, drive=None)
 
     _active.update(task_id=task_id, runner=runner, control=control)
-    asyncio.create_task(_drive())
+    # keep a strong reference: asyncio only weak-refs tasks, and a GC'd drive
+    # task silently kills the run (and with it, pause/cancel handling)
+    _active["drive"] = asyncio.create_task(_drive())
     return {"task_id": task_id, "status": task.status.value}
 
 

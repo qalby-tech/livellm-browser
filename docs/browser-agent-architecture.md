@@ -225,8 +225,10 @@ status:
 
 ```
 P1  agent/ runtime image      browser-use over CDP; planner→trajectory; step
-                              gating + checkpoints; controller tools. DONE except
-                              the MP4 recorder (deferred — see Open seams).
+                              gating + checkpoints; controller tools; MP4
+                              recorder (recording.py: CDP screencast → spill
+                              frames to /tmp → ffmpeg concat → MinIO,
+                              video_ref on run.done). DONE.
 P2  BrowserAgent CRD+operator deploy runtime, wire target, control token, status.
                               DONE (livellm-browser-operator: api + reconciler +
                               rbac + CRD; resolves target from Browser/Controller
@@ -239,8 +241,9 @@ P3  tenant-api                browser_agent_tasks (goose 0005 + sqlc); act/get/l
 P4  charts/tenant + tenant-ui DONE. chart renders the BrowserAgent workload
                               (model key ← tenant provider Secret); operator
                               TenantSpec gains browser-agent; tenant-ui Agent tab
-                              (trajectory + verdict buttons + restart + webhooks).
-                              Only the MP4 recorder remains (deferred).
+                              (trajectory + verdict buttons + restart + webhooks
+                              + inline recording playback via the tenant-api
+                              presign redirect).
 ```
 
 ## Open seams

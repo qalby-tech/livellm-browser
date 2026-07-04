@@ -38,6 +38,7 @@ from livellm_agent.models import (
     VerdictKind,
 )
 from livellm_agent.planner import plan, replan_or_ask, synthesize
+from livellm_agent.recording import Recorder
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,7 @@ class Runner:
         self._session = None
         self._tools = None
         self._ctrl_client = None
+        self._recorder: Optional[Recorder] = None
         control.on_restart = self._on_restart
         control.on_control = self._on_control
 
@@ -112,6 +114,13 @@ class Runner:
         self._use_vision = resolve_use_vision(self._llm, settings)
         self._session = build_session(settings)
         self._tools, self._ctrl_client = build_controller_tools(settings)
+        # Recording needs both the flag and somewhere to upload — without an
+        # artifact store the video would be assembled and thrown away.
+        if settings.recording_enabled and settings.artifact_endpoint:
+            self._recorder = Recorder(self.task.id)
+        elif settings.recording_enabled:
+            logger.info("task %s: recording enabled but no artifact endpoint "
+                        "configured; skipping video", self.task.id)
 
         try:
             await self._plan()
@@ -127,7 +136,8 @@ class Runner:
                     self.task.status = TaskStatus.cancelled
                     await self.control.emit("run.done", self.task.trajectory or {},
                                             status=TaskStatus.cancelled.value,
-                                            message="task cancelled")
+                                            message="task cancelled",
+                                            video_ref=await self._finish_recording())
                     return
                 await self._finish_pass()
                 # wait for a post-completion restart, or stop
@@ -154,6 +164,7 @@ class Runner:
             await self.control.emit(
                 "run.done", self.task.trajectory or {}, status=status.value,
                 message="task cancelled" if status is TaskStatus.cancelled else "aborted",
+                video_ref=await self._finish_recording(),
             )
         except Exception as e:  # noqa: BLE001 — the task row must ALWAYS settle
             # A mid-step stop (cancel) or any engine error raises out of
@@ -165,8 +176,11 @@ class Runner:
             await self.control.emit(
                 "run.done", self.task.trajectory or {}, status=status.value,
                 message="task cancelled" if status is TaskStatus.cancelled else f"aborted: {e}",
+                video_ref=await self._finish_recording(),
             )
         finally:
+            if self._recorder:
+                self._recorder.cleanup()
             if self._ctrl_client:
                 await self._ctrl_client.close()
 
@@ -213,6 +227,13 @@ class Runner:
         step.status = StepStatus.running
         step.started_at = _now()
         await self._emit_step(step, "started")
+
+        # (Re)attach the screencast on the active page. Lazy — the CDP session
+        # only exists once browser-use starts the shared BrowserSession, and a
+        # tab switch between steps moves the recording to the new target.
+        # Never raises; a recording failure degrades to no-video.
+        if self._recorder:
+            await self._recorder.ensure_started(self._session)
 
         try:
             res = await run_subgoal(
@@ -365,6 +386,27 @@ class Runner:
         return "next"
 
     # ── artifacts / finish ───────────────────────────────────────────────
+    async def _finish_recording(self) -> str:
+        """Stop the screencast, assemble the MP4 and upload it. Returns the
+        artifact ref, or "" — never raises (every run.done exit path calls
+        this, and a recording failure must not mask the run's real status).
+        Frames stay on disk after finish(), so a restart-from-step pass
+        resumes recording and the next finish re-uploads the full video."""
+        if not self._recorder:
+            return ""
+        try:
+            mp4 = await self._recorder.finish()
+        except Exception as e:  # noqa: BLE001 — belt and braces; finish() shouldn't raise
+            logger.warning("recording: finish failed: %s", e)
+            return ""
+        if not mp4:
+            return ""
+        try:
+            return artifacts.store().put_video(self.task.id, mp4)
+        except Exception as e:
+            logger.warning("recording upload failed: %s", e)
+            return ""
+
     def _save_screenshot(self, step: Step, b64: Optional[str]) -> Optional[str]:
         if not b64 or not settings.artifact_endpoint:
             return None
@@ -408,8 +450,8 @@ class Runner:
         msg = f"task {self.task.status.value}"
         if result:
             msg += "\n\n" + result
-        # video_ref stays empty until the recorder lands (deferred) — see docs.
         await self.control.emit(
             "run.done", self.task.trajectory, status=self.task.status.value,
-            message=msg, video_ref="", trajectory_ref=trajectory_ref or "",
+            message=msg, video_ref=await self._finish_recording(),
+            trajectory_ref=trajectory_ref or "",
         )

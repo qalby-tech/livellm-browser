@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 class ArtifactStore:
     def __init__(self) -> None:
         self._bucket = settings.artifact_bucket
+        self._ensured = False
         self._s3 = boto3.client(
             "s3",
             endpoint_url=settings.artifact_endpoint,
@@ -39,6 +40,13 @@ class ArtifactStore:
             self._s3.create_bucket(Bucket=self._bucket)
 
     def put_bytes(self, task_id: str, name: str, data: bytes, content_type: str) -> str:
+        # Nothing pre-provisions the bucket (MinIO ships bare) — the first
+        # writer creates it. Once per process; races with another agent pod
+        # are fine (create_bucket on an existing bucket just errors and the
+        # next head_bucket sees it).
+        if not self._ensured:
+            self.ensure_bucket()
+            self._ensured = True
         key = self._key(task_id, name)
         self._s3.put_object(
             Bucket=self._bucket, Key=key, Body=data, ContentType=content_type
@@ -48,7 +56,7 @@ class ArtifactStore:
         return ref
 
     def put_video(self, task_id: str, mp4: bytes) -> str:
-        return self.put_bytes(task_id, "run.mp4", mp4, "video/mp4")
+        return self.put_bytes(task_id, "recording.mp4", mp4, "video/mp4")
 
     def put_trajectory(self, task_id: str, trajectory: Any) -> str:
         payload = (

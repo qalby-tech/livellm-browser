@@ -13,7 +13,9 @@ control channel (tenant-api persists them) and uploads artifacts to MinIO.
 import asyncio
 import base64
 import logging
+import shutil
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from livellm_agent import artifacts, checkpoint
@@ -38,7 +40,6 @@ from livellm_agent.models import (
     VerdictKind,
 )
 from livellm_agent.planner import plan, replan_or_ask, synthesize
-from livellm_agent.recording import Recorder
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +76,8 @@ class Runner:
         self._session = None
         self._tools = None
         self._ctrl_client = None
-        self._recorder: Optional[Recorder] = None
+        self._record_dir: Optional[str] = None  # native recording spill dir (None = recording off)
+        self._video_ref = ""  # last uploaded recording ref; re-reported on later run.done emits
         control.on_restart = self._on_restart
         control.on_control = self._on_control
 
@@ -112,15 +114,17 @@ class Runner:
             return
 
         self._use_vision = resolve_use_vision(self._llm, settings)
-        self._session = build_session(settings)
-        self._tools, self._ctrl_client = build_controller_tools(settings)
         # Recording needs both the flag and somewhere to upload — without an
-        # artifact store the video would be assembled and thrown away.
+        # artifact store the video would be encoded and thrown away. It's
+        # browser-use's NATIVE RecordingWatchdog (armed via record_video_dir);
+        # it owns the screencast and follows tab focus itself.
         if settings.recording_enabled and settings.artifact_endpoint:
-            self._recorder = Recorder(self.task.id)
+            self._record_dir = f"/tmp/rec-{self.task.id}"
         elif settings.recording_enabled:
             logger.info("task %s: recording enabled but no artifact endpoint "
                         "configured; skipping video", self.task.id)
+        self._session = build_session(settings, record_video_dir=self._record_dir)
+        self._tools, self._ctrl_client = build_controller_tools(settings)
 
         try:
             await self._plan()
@@ -153,6 +157,7 @@ class Runner:
                     break
                 start = self._restart_to or 0
                 self._restart.clear()
+                await self._resume_recording()  # previous pass finalized its video
         except asyncio.CancelledError:
             # browser-use's stop() cancels its internal step task and the
             # CancelledError (a BaseException — `except Exception` never sees
@@ -179,8 +184,8 @@ class Runner:
                 video_ref=await self._finish_recording(),
             )
         finally:
-            if self._recorder:
-                self._recorder.cleanup()
+            if self._record_dir:
+                shutil.rmtree(self._record_dir, ignore_errors=True)
             if self._ctrl_client:
                 await self._ctrl_client.close()
 
@@ -227,13 +232,6 @@ class Runner:
         step.status = StepStatus.running
         step.started_at = _now()
         await self._emit_step(step, "started")
-
-        # (Re)attach the screencast on the active page. Lazy — the CDP session
-        # only exists once browser-use starts the shared BrowserSession, and a
-        # tab switch between steps moves the recording to the new target.
-        # Never raises; a recording failure degrades to no-video.
-        if self._recorder:
-            await self._recorder.ensure_started(self._session)
 
         try:
             res = await run_subgoal(
@@ -386,26 +384,55 @@ class Runner:
         return "next"
 
     # ── artifacts / finish ───────────────────────────────────────────────
+    def _recording_watchdog(self):
+        """browser-use's RecordingWatchdog for the shared session, or None
+        before the session started / when recording is off. Private attr on
+        BrowserSession (0.12.9) — the watchdog itself exposes the public
+        start_recording/stop_recording surface we drive."""
+        if not self._record_dir:
+            return None
+        return getattr(self._session, "_recording_watchdog", None)
+
     async def _finish_recording(self) -> str:
-        """Stop the screencast, assemble the MP4 and upload it. Returns the
-        artifact ref, or "" — never raises (every run.done exit path calls
-        this, and a recording failure must not mask the run's real status).
-        Frames stay on disk after finish(), so a restart-from-step pass
-        resumes recording and the next finish re-uploads the full video."""
-        if not self._recorder:
-            return ""
+        """Finalize the native recording and upload it. Returns the artifact
+        ref (or the last one uploaded), never raises — every run.done exit
+        path calls this, and a recording failure must not mask the run's real
+        status. stop_recording() only ends the screencast + closes the video
+        writer; the shared external browser stays alive (the runner keeps the
+        session for restart-from-step, which re-arms via _resume_recording)."""
+        wd = self._recording_watchdog()
+        path = None
+        if wd is not None:
+            try:
+                path = await wd.stop_recording()
+            except Exception as e:  # noqa: BLE001 — fail-open: no video is fine, a broken run isn't
+                logger.warning("recording: stop/finalize failed: %s", e)
+        if path is not None:
+            try:
+                mp4 = Path(path).read_bytes()
+                if mp4:
+                    self._video_ref = artifacts.store().put_video(self.task.id, mp4)
+            except Exception as e:
+                logger.warning("recording upload failed: %s", e)
+        # A run.done after a restart pass must not blank an already-reported
+        # video (tenant-api overwrites video_ref with whatever run.done says).
+        return self._video_ref
+
+    async def _resume_recording(self) -> None:
+        """Re-arm recording for a restart-from-step pass. The previous pass's
+        video was finalized on its run.done, so the watchdog is idle; start a
+        fresh file (the pass's run.done uploads it over recording.mp4). The
+        first pass needs nothing — the watchdog auto-starts on
+        BrowserConnectedEvent. Best-effort: failure means no video, never a
+        broken run."""
+        wd = self._recording_watchdog()
+        if wd is None or wd.is_recording:
+            return
         try:
-            mp4 = await self._recorder.finish()
-        except Exception as e:  # noqa: BLE001 — belt and braces; finish() shouldn't raise
-            logger.warning("recording: finish failed: %s", e)
-            return ""
-        if not mp4:
-            return ""
-        try:
-            return artifacts.store().put_video(self.task.id, mp4)
-        except Exception as e:
-            logger.warning("recording upload failed: %s", e)
-            return ""
+            from uuid_extensions import uuid7str  # browser-use dep; matches its file naming
+            await wd.start_recording(Path(self._record_dir) / f"{uuid7str()}.mp4")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("recording: restart-pass re-arm failed: %s", e)
 
     def _save_screenshot(self, step: Step, b64: Optional[str]) -> Optional[str]:
         if not b64 or not settings.artifact_endpoint:

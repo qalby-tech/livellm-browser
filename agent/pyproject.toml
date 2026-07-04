@@ -1,6 +1,6 @@
 [project]
 name = "livellm-agent"
-version = "0.1.12"
+version = "0.1.13"
 description = "Browser-agent runtime: drives a Browser over CDP as a reviewable trajectory of steps (browser-use + patchright)"
 readme = "README.md"
 # browser-use requires Python >= 3.11 — cannot share the 3.9 controller base.
@@ -21,6 +21,12 @@ dependencies = [
     "anthropic>=0.40",
     "openai>=1.50",
     "boto3>=1.34",
+    # browser-use's optional [video] extra — its RecordingWatchdog encodes the
+    # run recording (CDP screencast → VideoRecorderService → MP4) via imageio,
+    # which pulls a bundled ffmpeg binary through imageio-ffmpeg.
+    "imageio>=2.37.3",
+    "imageio-ffmpeg>=0.6.0",
+    "numpy>=2.4.6",
 ]
 
 [dependency-groups]

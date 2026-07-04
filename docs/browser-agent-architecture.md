@@ -226,9 +226,14 @@ status:
 ```
 P1  agent/ runtime image      browser-use over CDP; planner→trajectory; step
                               gating + checkpoints; controller tools; MP4
-                              recorder (recording.py: CDP screencast → spill
-                              frames to /tmp → ffmpeg concat → MinIO,
-                              video_ref on run.done). DONE.
+                              recording via browser-use's NATIVE
+                              RecordingWatchdog (record_video_dir on the
+                              profile; imageio encodes; runner finalizes with
+                              stop_recording() → MinIO, video_ref on
+                              run.done). NB: never run a second screencast
+                              consumer beside it — two Page.startScreencast
+                              clients on one target corrupt DOMWatchdog state
+                              and kill every navigation. DONE.
 P2  BrowserAgent CRD+operator deploy runtime, wire target, control token, status.
                               DONE (livellm-browser-operator: api + reconciler +
                               rbac + CRD; resolves target from Browser/Controller

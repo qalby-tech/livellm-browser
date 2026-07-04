@@ -1,11 +1,7 @@
 FROM python:3.11-slim
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-
-# ffmpeg assembles the run recording (CDP screencast frames → MP4). The agent
-# degrades to no-video when it's missing, but the image should always have it.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+# No apt ffmpeg needed for run recordings: browser-use's VideoRecorderService
+# encodes via imageio, whose imageio-ffmpeg dep ships its own ffmpeg binary.
 
 # Copy the project into the image
 COPY . /app

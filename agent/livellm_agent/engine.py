@@ -180,11 +180,20 @@ def resolve_use_vision(llm, s: Settings):
     return "auto"
 
 
-def build_session(s: Settings) -> BrowserSession:
+def build_session(s: Settings, record_video_dir: Optional[str] = None) -> BrowserSession:
     """Connect to the EXISTING Browser over CDP (does not launch Chromium).
 
     decision A: plain CDP to a Browser's status.wsUrl, or registry-resolved
     when targeting a Controller (the operator injects the resolved ws URL).
+
+    `record_video_dir` turns on browser-use's NATIVE run recording: its
+    RecordingWatchdog starts a Page screencast on BrowserConnectedEvent,
+    follows AgentFocusChangedEvent across tabs, and encodes to an MP4 in that
+    dir via VideoRecorderService (imageio). Do NOT run a second screencast
+    consumer next to it — two Page.startScreencast clients on one target
+    corrupt browser-use's DOM state reads (DOMWatchdog starts returning None
+    and every navigation dies). The runner finalizes/uploads via the
+    watchdog's public stop_recording() — see Runner._finish_recording.
     """
     if not s.cdp_ws_url:
         raise RuntimeError("no cdp_ws_url configured (operator must resolve the target)")
@@ -192,7 +201,12 @@ def build_session(s: Settings) -> BrowserSession:
     # to kill it; is_local False so no local-process assumptions fire. (NB: the
     # browser must be EXCLUSIVE to this agent — a second CDP client creating/
     # destroying targets steals browser-use's page focus and breaks state reads.)
-    profile = BrowserProfile(keep_alive=True, is_local=False)
+    profile = BrowserProfile(
+        keep_alive=True,
+        is_local=False,
+        record_video_dir=record_video_dir,
+        record_video_framerate=s.recording_fps,
+    )
     return BrowserSession(cdp_url=s.cdp_ws_url, browser_profile=profile)
 
 

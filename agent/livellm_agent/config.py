@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     # The operator/tenant-api resolves the tenant's /integrations provider and
     # injects a provider id + key here; the agent never stores it long-term.
     model_provider: Optional[str] = None         # openai | anthropic | ...
+    # Workspace-owner guidance folded into planning + sub-goal prompts
+    # (chart delivers it as AGENT_INSTRUCTIONS from browser.aiAgent).
+    instructions: Optional[str] = None
     model_name: Optional[str] = None             # vision-capable preferred
     model_api_key: Optional[str] = None
     model_base_url: Optional[str] = None          # optional override / proxy

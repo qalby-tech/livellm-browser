@@ -49,6 +49,9 @@ def _parse_steps(text: str) -> list[str]:
 
 
 async def plan(s: Settings, prompt: str) -> list[str]:
+    # Owner instructions shape the plan (constraints, preferred sites, tone).
+    if s.instructions:
+        prompt = f"Standing instructions from the workspace owner:\n{s.instructions}\n\nTASK:\n{prompt}"
     provider = (s.model_provider or "").lower()
     # base URLs for known OpenAI-compatible providers (mirror engine.py)
     openai_base = {

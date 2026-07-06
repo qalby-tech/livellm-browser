@@ -1,6 +1,6 @@
 [project]
 name = "livellm-agent"
-version = "0.1.13"
+version = "0.1.14"
 description = "Browser-agent runtime: drives a Browser over CDP as a reviewable trajectory of steps (browser-use + patchright)"
 readme = "README.md"
 # browser-use requires Python >= 3.11 — cannot share the 3.9 controller base.

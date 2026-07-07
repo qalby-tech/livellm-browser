@@ -55,10 +55,25 @@ async def get_browser_info(
         try:
             info = await manager.connect_browser(bid, fresh_ws_url, headers=fresh_headers)
         except Exception as e:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Browser '{bid}' found in registry but connection failed: {e}",
+            # A dead Node driver fails every plain connect; without escalation
+            # this path 502-loops forever (the driver-restart recovery is only
+            # reachable for already-connected browsers). Escalate when the
+            # driver is the culprit rather than the remote browser.
+            if manager.driver_alive():
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Browser '{bid}' found in registry but connection failed: {e}",
+                )
+            logger.warning(
+                f"Connect to '{bid}' failed and driver is dead, running full recovery: {e}"
             )
+            try:
+                info = await manager.recover_connection(bid, fresh_ws_url, headers=fresh_headers)
+            except Exception as recover_err:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Browser '{bid}' connection failed and driver recovery failed: {recover_err}",
+                )
         return info
 
     # Check for ws_url drift (e.g. browser pod restarted with new IP/port).

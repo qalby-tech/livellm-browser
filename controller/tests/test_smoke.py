@@ -677,3 +677,31 @@ class TestBsHelpers:
         assert len(result) == 2
         assert result[0] == {"name": "heading", "values": ["Title"]}
         assert result[1] == {"name": "urls", "values": ["/link"]}
+
+
+class TestHealthzDriverLiveness:
+    """The liveness endpoint must go red when the Node driver process dies —
+    with an empty browsers dict the per-browser loop is vacuous, so only the
+    driver check lets Kubernetes restart a wedged pod."""
+
+    def test_healthz_ok_when_driver_alive(self, client: TestClient):
+        response = client.get("/healthz")
+        assert response.status_code == 200
+
+    def test_healthz_503_when_driver_dead(self, client: TestClient):
+        from unittest.mock import patch
+        from core.browser import browser_manager
+
+        with patch.object(browser_manager, "driver_alive", return_value=False):
+            response = client.get("/healthz")
+        assert response.status_code == 503
+        assert "driver" in response.text.lower()
+
+    def test_healthz_503_when_driver_dead_and_no_browsers(self, client: TestClient):
+        from unittest.mock import patch
+        from core.browser import browser_manager
+
+        browser_manager.browsers.clear()
+        with patch.object(browser_manager, "driver_alive", return_value=False):
+            response = client.get("/healthz")
+        assert response.status_code == 503

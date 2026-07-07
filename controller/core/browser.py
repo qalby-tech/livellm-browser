@@ -48,17 +48,37 @@ class BrowserManager:
         self._track_playwright_pid()
         logger.info("Browser manager started (agnostic mode — waiting for registrations)")
 
-    def _track_playwright_pid(self):
+    def _driver_proc(self):
+        """The Node driver subprocess behind the pipe transport, or None.
+
+        Reaches through private attributes (impl connection -> pipe transport),
+        so every step is guarded — a layout change just disables the feature.
+        """
         try:
-            if self.playwright and hasattr(self.playwright, '_impl_obj'):
-                obj = self.playwright._impl_obj
-                if hasattr(obj, '_browser'):
-                    transport = getattr(obj._browser, '_transport', None)
-                    if transport and hasattr(transport, '_proc'):
-                        self._playwright_pid = transport._proc.pid
-                        logger.info(f"Tracking Playwright driver PID: {self._playwright_pid}")
-        except Exception:
-            pass
+            return self.playwright._impl_obj._connection._transport._proc
+        except AttributeError:
+            return None
+
+    def _track_playwright_pid(self):
+        proc = self._driver_proc()
+        if proc is not None:
+            self._playwright_pid = proc.pid
+            logger.info(f"Tracking Playwright driver PID: {self._playwright_pid}")
+
+    def driver_alive(self) -> bool:
+        """Whether the Playwright Node driver process is still running.
+
+        Returns True when the process can't be introspected (private layout
+        changed) so a false negative can never crash-loop the pod.
+        """
+        if not self.playwright:
+            return False
+        proc = self._driver_proc()
+        if proc is None:
+            return True
+        # returncode is None while running, an int once exited. Only a
+        # definite int counts as dead (doubles/mocks stay "alive").
+        return not isinstance(proc.returncode, int)
 
     def _kill_playwright_process(self):
         if self._playwright_pid:

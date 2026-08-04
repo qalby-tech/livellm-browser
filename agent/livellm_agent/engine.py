@@ -41,6 +41,20 @@ SUBGOAL_MAX_STEPS = 15
 OPENAI_COMPAT_BASE = {
     "zai-coding-plan": "https://api.z.ai/api/coding/paas/v4",
     "openrouter": "https://openrouter.ai/api/v1",
+    "xai": "https://api.x.ai/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "mistral": "https://api.mistral.ai/v1",
+    "groq": "https://api.groq.com/openai/v1",
+    "cerebras": "https://api.cerebras.ai/v1",
+    "togetherai": "https://api.together.xyz/v1",
+    "fireworks-ai": "https://api.fireworks.ai/inference/v1",
+    "moonshotai": "https://api.moonshot.ai/v1",
+    "perplexity": "https://api.perplexity.ai",
+    "minimax": "https://api.minimax.io/v1",
+    "alibaba": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    "cohere": "https://api.cohere.ai/compatibility/v1",
+    "nvidia": "https://integrate.api.nvidia.com/v1",
+    "huggingface": "https://router.huggingface.co/v1",
 }
 OPENAI_COMPAT_DEFAULT_MODEL = {
     "openai": "gpt-4o",

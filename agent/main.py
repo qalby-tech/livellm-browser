@@ -160,7 +160,17 @@ async def restart(body: RestartRequest) -> dict:
 
 
 if __name__ == "__main__":
-    logger.info("livellm-agent %s starting on %s:%d (target=%s)",
-                __version__, settings.host, settings.port,
-                "controller" if settings.uses_controller else settings.cdp_ws_url or "unset")
-    uvicorn.run(app, host=settings.host, port=settings.port)
+    if settings.mode == "tools":
+        # Tools mode: browser-use as a library behind HTTP, no model in the
+        # pod — an external engine does the reasoning (livellm_agent/toolsmode).
+        from livellm_agent.toolsmode import build_tools_app
+
+        logger.info("livellm-browser-tools %s starting on %s:%d (cdp=%s)",
+                    __version__, settings.host, settings.port,
+                    settings.cdp_ws_url or "unset")
+        uvicorn.run(build_tools_app(), host=settings.host, port=settings.port)
+    else:
+        logger.info("livellm-agent %s starting on %s:%d (target=%s)",
+                    __version__, settings.host, settings.port,
+                    "controller" if settings.uses_controller else settings.cdp_ws_url or "unset")
+        uvicorn.run(app, host=settings.host, port=settings.port)

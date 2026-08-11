@@ -11,6 +11,13 @@ class Settings(BaseSettings):
     boots a health server even before a task is assigned.
     """
 
+    # ── mode ─────────────────────────────────────────────────────────────
+    # "agent" (default): the classic runtime — browser-use's own loop, model
+    # calls included. "tools": no model at all; expose browser-use's DOM
+    # distillation + actions as an HTTP tool surface for an external engine
+    # (toolsmode.py). Tools mode only reads cdp_ws_url from this config.
+    mode: str = "agent"
+
     # ── CDP target (decision A: controller is optional) ──────────────────
     # Exactly one of these is set by the operator from spec.target:
     #   - cdp_ws_url     plain CDP to a Browser's status.wsUrl (or BYO external)

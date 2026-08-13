@@ -1,6 +1,8 @@
 [project]
 name = "livellm-browser"
-version = "2.2.4"
+# 2.2.5/2.2.6 were out-of-band builds (garon3455 Docker Hub) of the same driver
+# fixes — 2.2.7 is the first repo-built version that carries them.
+version = "2.2.7"
 description = "Browser in docker with VNC and Chrome, exposing CDP over a launcher API"
 readme = "README.md"
 requires-python = "==3.9.*"
@@ -12,3 +14,13 @@ dependencies = [
     "httpx>=0.28.1",
 ]
 # patchright version is actually critical
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

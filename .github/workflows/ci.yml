@@ -40,6 +40,14 @@ jobs:
         working-directory: controller
         run: uv run pytest tests/ -v --tb=short
 
+      - name: Install browser dependencies
+        working-directory: browser
+        run: uv sync --all-extras
+
+      - name: Run browser tests
+        working-directory: browser
+        run: uv run pytest tests/ -v --tb=short
+
   build-and-push:
     needs: test
     runs-on: ubuntu-latest

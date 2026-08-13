@@ -93,17 +93,50 @@ async def _browser_watchdog():
     browser disconnects but the in-pod CDP proxy keeps its fixed port. We detect
     the dead connection and restart_browser() (which retargets the same proxy),
     so the browser self-heals in-place without a pod restart.
+
+    The Patchright driver itself can also die (the kernel OOM-kills the Node
+    process): then every playwright object is a corpse — even is_connected()
+    raises — and only a full recover_driver() helps, not a Chrome relaunch.
     """
+    relaunch_failures = 0
     while True:
         await asyncio.sleep(10)
         try:
-            info = local_browser_manager.browsers.get(DEFAULT_BROWSER_ID)
-            if info is None:
+            # A dead driver takes every browser with it — heal it first.
+            if not local_browser_manager.driver_alive():
+                logger.warning("Patchright driver is dead — recovering it")
+                await local_browser_manager.recover_driver()
                 continue
-            if info.browser is None or not info.browser.is_connected():
+
+            info = local_browser_manager.browsers.get(DEFAULT_BROWSER_ID)
+            if info is None or local_browser_manager.restarting(DEFAULT_BROWSER_ID):
+                continue
+
+            try:
+                browser_up = info.browser is not None and info.browser.is_connected()
+            except Exception as e:
+                logger.warning(f"Browser connection check failed: {e}")
+                browser_up = False
+
+            if not browser_up:
                 logger.warning("Default browser is down — relaunching")
-                await local_browser_manager.restart_browser(DEFAULT_BROWSER_ID)
-                logger.info("Default browser relaunched")
+                try:
+                    await local_browser_manager.restart_browser(DEFAULT_BROWSER_ID)
+                    logger.info("Default browser relaunched")
+                    relaunch_failures = 0
+                except Exception as e:
+                    # One failure may be transient — retry on the next tick.
+                    # Repeated failures mean the driver is broken in a way
+                    # driver_alive() can't see: force-replace it (which also
+                    # costs every other browser in the pod, so not on the
+                    # first strike).
+                    relaunch_failures += 1
+                    if relaunch_failures >= 2:
+                        logger.warning(f"Relaunch failed again ({e}) — force-recovering the driver")
+                        await local_browser_manager.recover_driver(force=True)
+                        relaunch_failures = 0
+                    else:
+                        logger.warning(f"Relaunch failed ({e}); will retry")
         except Exception as e:
             logger.warning(f"Browser watchdog error: {e}")
 
@@ -121,7 +154,6 @@ async def lifespan(app: FastAPI):
         playwright, extensions=extensions, proxy=proxy, cookies=cookies
     )
 
-    app.state.playwright = playwright
     watchdog = asyncio.create_task(_browser_watchdog())
 
     yield
@@ -136,8 +168,12 @@ async def lifespan(app: FastAPI):
         await local_browser_manager.shutdown(timeout=25.0)
     except Exception as e:
         logger.error(f"Error during browser shutdown: {e}")
+    # After a driver recovery the `playwright` captured above is a corpse —
+    # stop whatever driver the manager currently owns.
+    driver = local_browser_manager.playwright
     try:
-        await asyncio.wait_for(playwright.stop(), timeout=5.0)
+        if driver:
+            await asyncio.wait_for(driver.stop(), timeout=5.0)
     except Exception as e:
         logger.warning(f"Error stopping playwright: {e}")
     logger.info("Shutdown complete")
@@ -170,6 +206,11 @@ async def root():
 
 @app.get("/health")
 async def health():
+    # In-pod recovery (watchdog, ≤10s detection) usually beats the liveness
+    # probe (3×10s consecutive failures); when it doesn't, the pod restart is
+    # the correct backstop.
+    if not local_browser_manager.driver_alive():
+        return Response(status_code=503, content="Patchright driver is not running")
     ws = _default_ws_info()
     if not ws:
         return Response(status_code=503, content="No browser")

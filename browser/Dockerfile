@@ -90,9 +90,12 @@ RUN chmod 666 /etc/passwd /etc/group && \
     mkdir -p "${HOME}/Desktop/app/profiles/default" && \
     chown -R "${HEADLESS_USER_ID}":"${HEADLESS_USER_GROUP_ID}" "${HOME}" "${HOME}/Desktop/app/profiles"
 
-# Copy the custom startup script
+# Copy the custom startup script. A Windows checkout turns the shebang into
+# "/bin/bash\r" — strip CR so the container doesn't die on start with
+# "exec /usr/local/bin/custom-startup.sh: no such file or directory".
 COPY startup.sh /usr/local/bin/custom-startup.sh
-RUN chmod +x /usr/local/bin/custom-startup.sh
+RUN sed -i 's/\r$//' /usr/local/bin/custom-startup.sh && \
+    chmod +x /usr/local/bin/custom-startup.sh
 
 # Redirect the noVNC web root (/) to the auto-connecting, scale-to-fit client so
 # the bare URL serves the live framebuffer instead of a directory listing.

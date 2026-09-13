@@ -7,13 +7,12 @@ logger = logging.getLogger(__name__)
 
 # Path to the operator-maintained browser registry (a mounted ConfigMap).
 # JSON shape: {"browsers": {"<browser_id>": "ws://<svc>:<port>/devtools/browser/<id>", ...}}
-# A bare {"<id>": "ws://..."} object is also accepted.
 BROWSERS_CONFIG_PATH = os.environ.get("BROWSERS_CONFIG", "/etc/livellm/browsers.json")
 
 
 class BrowserRegistry:
     """
-    Static, file-backed browser registry — replaces the old Redis discovery.
+    Static, file-backed browser registry.
 
     In the managed platform each browser is its own pod fronted by a stable
     Service, so a browser's CDP ws_url is a deterministic value that never
@@ -44,7 +43,7 @@ class BrowserRegistry:
         if isinstance(value, str):
             return {"wsUrl": value, "headers": {}} if value else None
         if isinstance(value, dict):
-            ws = value.get("wsUrl") or value.get("ws_url") or ""
+            ws = value.get("wsUrl") or ""
             raw_headers = value.get("headers") or {}
             headers = {}
             if isinstance(raw_headers, dict):
@@ -71,7 +70,7 @@ class BrowserRegistry:
         try:
             with open(self.path) as f:
                 data = json.load(f)
-            browsers = data.get("browsers", data) if isinstance(data, dict) else {}
+            browsers = data.get("browsers", {}) if isinstance(data, dict) else {}
             cache = {}
             for k, v in browsers.items():
                 entry = self._normalize(v)

@@ -49,9 +49,8 @@ logger.addHandler(_handler)
 def _default_browser_config_from_env():
     """Build the primary browser's startup config from environment variables.
 
-    In the managed platform the operator passes desired state declaratively
-    (instead of the old Redis desired-state channel): a browser's extensions,
-    proxy, and a mounted cookies file are set on the pod, so the default
+    In the managed platform the operator passes desired state declaratively:
+    a browser's extensions, proxy, and a mounted cookies file are set on the pod, so the default
     browser is created with them at boot. All are optional.
     """
     extensions = None
@@ -61,7 +60,7 @@ def _default_browser_config_from_env():
             parsed = json.loads(exts_raw)
             extensions = parsed if isinstance(parsed, list) else None
         except json.JSONDecodeError:
-            extensions = [e.strip() for e in exts_raw.split(",") if e.strip()]
+            logger.warning("BROWSER_EXTENSIONS is not a JSON list; ignoring")
 
     proxy = None
     server = os.environ.get("BROWSER_PROXY_SERVER", "").strip()

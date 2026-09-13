@@ -3,8 +3,8 @@ services:
     build:
       context: ./browser
       dockerfile: Dockerfile
-    image: kamasalyamov/livellm-browser:2.0.1
-    container_name: livellm-browser-2.0.1
+    image: kamasalyamov/livellm-browser:2.2.8
+    container_name: livellm-browser
     ports:
       # VNC port
       - "5901:5901"
@@ -42,14 +42,14 @@ services:
     build:
       context: ./controller
       dockerfile: Dockerfile
-    image: kamasalyamov/livellm-controller:2.0.1
-    container_name: livellm-controller-2.0.1
+    image: kamasalyamov/livellm-browser:controller-2.3.3
+    container_name: livellm-controller
     ports:
       # FastAPI Controller
       - "8000:8000"
     environment:
       - NODE_OPTIONS=--max-old-space-size=3072
-      # File-backed browser registry (replaces Redis discovery). In K8s the
+      # File-backed browser registry. In K8s the
       # operator writes this from the namespace's Browser CRs; here it's a
       # static compose config pointing at the browser service.
       - BROWSERS_CONFIG=/etc/livellm/browsers.json

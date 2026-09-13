@@ -18,7 +18,7 @@ This starts two services:
 The browser pins its CDP proxy to a fixed port (`CDP_PORT=9222`), and the
 controller is handed a static registry file (compose `configs.browsers_json`)
 pointing at `ws://livellm-browser:9222/...`. The controller warm-connects on
-startup and lazily on first request — no registration step, no Redis.
+startup and lazily on first request — no registration step.
 
 ## How It Works
 
@@ -141,17 +141,17 @@ The controller connects to Chrome via CDP WebSocket. This happens automatically 
 ```bash
 # 1. Get the browser's CDP port from the Browser service
 curl http://localhost:9000/browsers
-# Returns: [{"browser_id":"default","cdp_port":52137,...}]
+# Returns: [{"browser_id":"default","cdp_port":9222,...}]
 
 # 2. Register it with the controller
 curl -X POST http://localhost:8000/parser/browsers \
   -H "Content-Type: application/json" \
-  -d '{"browser_id": "default", "ws_url": "ws://livellm-browser:52137/devtools/browser/default"}'
+  -d '{"browser_id": "default", "ws_url": "ws://livellm-browser:9222/devtools/browser/default"}'
 ```
 
 If the browser restarts (e.g. after installing an extension), the controller **auto-reconnects** on the next request — no manual re-registration needed.
 
-> **A file-backed registry is the source of truth.** Each browser is its own pod fronted by a stable Service, so its CDP `ws_url` is deterministic and never drifts — the in-pod CDP proxy keeps a **fixed port** (`CDP_PORT`, default 9222) and rewrites the ws path across Chrome restarts, while the Service keeps a stable DNS name across pod restarts. The operator writes the namespace's browsers into a ConfigMap (`{"browsers": {"<id>": "ws://<svc>:9222/devtools/browser/<id>"}}`) that the controller mounts at `BROWSERS_CONFIG` (default `/etc/livellm/browsers.json`) and re-reads on demand. The controller resolves `X-Browser-Id` against this map and reconnects only when a live connection dies. No Redis, no heartbeats.
+> **A file-backed registry is the source of truth.** Each browser is its own pod fronted by a stable Service, so its CDP `ws_url` is deterministic and never drifts — the in-pod CDP proxy keeps a **fixed port** (`CDP_PORT`, default 9222) and rewrites the ws path across Chrome restarts, while the Service keeps a stable DNS name across pod restarts. The operator writes the namespace's browsers into a ConfigMap (`{"browsers": {"<id>": "ws://<svc>:9222/devtools/browser/<id>"}}`) that the controller mounts at `BROWSERS_CONFIG` (default `/etc/livellm/browsers.json`) and re-reads on demand. The controller resolves `X-Browser-Id` against this map and reconnects only when a live connection dies.
 
 ### Sessions
 
@@ -309,4 +309,4 @@ curl -X POST http://localhost:8000/parser/search_videos \
 
 ## Running on Kubernetes
 
-For cluster deployments, use the [livellm-browser-operator](https://github.com/XvKuoMing/livellm-browser-operator) and its Helm chart. The operator manages `Browser` and `Controller` CRs: one pod per `Browser` (a stable Service + fixed CDP port), a per-namespace `Controller`, and the browser-registry ConfigMap that wires them together. It propagates desired state (extensions, cookies, proxy) to running pods via the launcher API. The controller pod's `NODE_OPTIONS` is auto-sized from its memory limit (`min(limit/2, 4096)` MiB); the browser pod is left alone so Chrome keeps the memory budget. Override per-CR via `spec.env`, cluster-wide via `DEFAULT_*_ENV`.
+For cluster deployments, use the [livellm-browser-operator](https://github.com/XvKuoMing/livellm-browser-operator) and its Helm chart. The operator manages `Browser` and `Controller` CRs: one pod per `Browser` (a stable Service + fixed CDP port), a per-namespace `Controller`, and the browser-registry ConfigMap that wires them together. It passes desired state (extensions, cookies, proxy) to the pod as env/volume and rolls it on change. The controller pod's `NODE_OPTIONS` is auto-sized from its memory limit (`max(limit/2, limit - 2 GiB)` MiB, clamped to 512-8192); the browser pod is left alone so Chrome keeps the memory budget. Override per-CR via `spec.env`, cluster-wide via `DEFAULT_*_ENV`.

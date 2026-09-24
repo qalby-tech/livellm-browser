@@ -25,7 +25,7 @@ class ConnectBrowserRequest(BaseModel):
 class StartSessionRequest(BaseModel):
     """Start a new session (browser tab) in a specific browser."""
     browser_id: Optional[str] = Field(
-        default=None, description="Browser to create session in. Uses first connected browser if omitted.",
+        default=None, description="Browser to start the session on. Omitted: the one with the fewest open tabs.",
     )
 
 

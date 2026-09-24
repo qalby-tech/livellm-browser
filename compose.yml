@@ -42,7 +42,7 @@ services:
     build:
       context: ./controller
       dockerfile: Dockerfile
-    image: kamasalyamov/livellm-browser:controller-2.3.3
+    image: kamasalyamov/livellm-browser:controller-2.4.0
     container_name: livellm-controller
     ports:
       # FastAPI Controller

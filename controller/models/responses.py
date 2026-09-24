@@ -11,8 +11,10 @@ class PingResponse(BaseModel):
 
 class BrowserResponse(BaseModel):
     browser_id: str
-    ws_url: str
-    session_count: int
+    connected: bool = Field(..., description="Whether the API holds a live connection to the browser")
+    healthy: bool = Field(..., description="False for a while after the browser could not be reached; calls that name no browser skip it")
+    open_tabs: int = Field(..., description="Tabs open in the browser, including ones a person opened; 0 while not connected")
+    session_count: int = Field(..., description="Sessions that live on this browser")
 
 
 class RatingMetadata(BaseModel):

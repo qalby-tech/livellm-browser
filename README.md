@@ -136,33 +136,67 @@ All controller endpoints are prefixed with `/parser` (e.g. `http://localhost:800
 
 ### Connecting a Browser
 
-The controller connects to Chrome via CDP WebSocket. This happens automatically on `docker compose up`, but you can also do it manually:
+The controller connects to Chrome via CDP WebSocket. With a registry (`BROWSERS_CONFIG` set, as in compose and on Kubernetes) the registry alone decides which browsers it drives: a browser added to the file is used from the next call, one removed from it is disconnected with its sessions, and `POST /browsers` / `DELETE /browsers/{id}` answer 403. Without `BROWSERS_CONFIG` you register browsers by hand:
 
 ```bash
 # 1. Get the browser's CDP port from the Browser service
 curl http://localhost:9000/browsers
 # Returns: [{"browser_id":"default","cdp_port":9222,...}]
 
-# 2. Register it with the controller
+# 2. Register it with the controller (only when BROWSERS_CONFIG is unset)
 curl -X POST http://localhost:8000/parser/browsers \
   -H "Content-Type: application/json" \
   -d '{"browser_id": "default", "ws_url": "ws://livellm-browser:9222/devtools/browser/default"}'
 ```
 
+`GET /browsers` lists every browser a call can land on, without addresses:
+
+```json
+[{"browser_id": "default", "connected": true, "healthy": true, "open_tabs": 2, "session_count": 1}]
+```
+
+`healthy` turns false for 30 seconds after a browser could not be reached; calls that name no browser skip it meanwhile.
+
 If the browser restarts (e.g. after installing an extension), the controller **auto-reconnects** on the next request — no manual re-registration needed.
 
 > **A file-backed registry is the source of truth.** Each browser is its own pod fronted by a stable Service, so its CDP `ws_url` is deterministic and never drifts — the in-pod CDP proxy keeps a **fixed port** (`CDP_PORT`, default 9222) and rewrites the ws path across Chrome restarts, while the Service keeps a stable DNS name across pod restarts. The operator writes the namespace's browsers into a ConfigMap (`{"browsers": {"<id>": "ws://<svc>:9222/devtools/browser/<id>"}}`) that the controller mounts at `BROWSERS_CONFIG` (default `/etc/livellm/browsers.json`) and re-reads on demand. The controller resolves `X-Browser-Id` against this map and reconnects only when a live connection dies.
 
+### Choosing a browser
+
+One controller drives many browsers. Each call lands on one of them in one of three ways:
+
+1. **Nothing named**: the browser with the fewest open tabs (every tab, including ones a person opened, plus calls still running). Nothing waits or is refused: a browser that cannot be reached is skipped and the next one is tried; `MAX_PAGES_PER_BROWSER` only ranks a busy browser last.
+2. **`X-Session-Id`**: the browser the session was started on. No other header is needed.
+3. **`X-Browser-Id: <name>`**, or the path prefix `/browsers/<name>/`: that browser. `POST /parser/browsers/agent-2/content` is exactly `POST /parser/content` with `X-Browser-Id: agent-2`.
+
+The prefix never clashes with the management routes: those are `/browsers` and `/browsers/{id}`, while a pinned call always has a path after the name.
+
+Every response for which a browser was chosen carries `X-Browser-Id` naming it.
+
+| Status | When |
+|--------|------|
+| `400` | The path names one browser and `X-Browser-Id` another |
+| `404` | The named browser is not in the controller, or the session is unknown (never started, ended, or its browser was removed) |
+| `409` | A named browser contradicts the session's browser |
+| `502` | The named (or session's) browser cannot be reached |
+| `503` | No browsers at all, or none of them can be reached |
+
 ### Sessions
 
-A session is a browser tab. Create one explicitly, or omit `X-Session-Id` to get an ad-hoc tab that is created for the request and closed on the way out.
+A session is a browser tab. Start one with `POST /start_session`, or omit `X-Session-Id` to get an ad-hoc tab that is created for the request and closed on the way out. A session stays on its browser: later calls send `X-Session-Id` alone. If its tab was closed or its browser reconnected, the session gets a new tab on the same browser. Sessions live in the controller's memory, so a controller restart ends them all.
 
 After extraction, every page operation issues `window.stop()` so Chrome stops streaming bytes back over CDP into the Node driver heap — important for large/heavy pages that would otherwise keep loading resources after the response was already returned.
 
 ```bash
-# Start a persistent session
+# Start a persistent session (on a chosen browser: add -H "X-Browser-Id: default")
 curl -X POST http://localhost:8000/parser/start_session
 # Returns: {"session_id": "abc-123", "browser_id": "default", ...}
+
+# Use it: X-Session-Id alone goes to its browser
+curl -X POST http://localhost:8000/parser/content \
+  -H "Content-Type: application/json" \
+  -H "X-Session-Id: abc-123" \
+  -d '{"url": "https://example.com"}'
 
 # End it
 curl -X DELETE http://localhost:8000/parser/end_session \
@@ -175,8 +209,10 @@ Most endpoints accept these optional headers:
 
 | Header | Description |
 |--------|-------------|
-| `X-Browser-Id` | Target browser (defaults to first connected) |
+| `X-Browser-Id` | Target browser (omit to use the one with the fewest open tabs, or the session's) |
 | `X-Session-Id` | Target session/tab (omit for ad-hoc) |
+
+Responses carry `X-Browser-Id` naming the browser that answered.
 
 ### Content — Get Page Text/HTML/Screenshot
 
@@ -292,9 +328,11 @@ curl -X POST http://localhost:8000/parser/search_videos \
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/ping` | Health check |
-| `GET` | `/browsers` | List connected browsers |
-| `POST` | `/browsers` | Register browser via CDP |
-| `DELETE` | `/browsers/{id}` | Disconnect browser |
+| `GET` | `/browsers` | List browsers with their tab counts |
+| `GET` | `/browsers/{id}` | One browser |
+| `POST` | `/browsers` | Register browser via CDP (no `BROWSERS_CONFIG` only) |
+| `DELETE` | `/browsers/{id}` | Disconnect browser (no `BROWSERS_CONFIG` only) |
+| `*` | `/browsers/{id}/<path>` | `<path>` on browser `{id}` (same as `X-Browser-Id`) |
 | `POST` | `/start_session` | Create a tab |
 | `DELETE` | `/end_session` | Close a tab |
 | `POST` | `/content` | Get page text/HTML/screenshot |

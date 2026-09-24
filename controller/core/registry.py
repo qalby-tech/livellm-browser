@@ -10,6 +10,17 @@ logger = logging.getLogger(__name__)
 BROWSERS_CONFIG_PATH = os.environ.get("BROWSERS_CONFIG", "/etc/livellm/browsers.json")
 
 
+def managed() -> bool:
+    """Whether the registry decides which browsers this controller drives.
+
+    Keyed on the BROWSERS_CONFIG env var (the operator and compose always set
+    it), not on the file: the mount can be briefly absent at startup, and the
+    answer must not flap. Managed, a browser that leaves the registry leaves
+    the controller, and POST/DELETE /browsers are refused.
+    """
+    return "BROWSERS_CONFIG" in os.environ
+
+
 class BrowserRegistry:
     """
     Static, file-backed browser registry.
@@ -22,8 +33,8 @@ class BrowserRegistry:
     into a ConfigMap mounted at ``BROWSERS_CONFIG_PATH``; we read it on demand
     (cached by mtime) so operator updates propagate without a restart.
 
-    When the file is absent (standalone / tests) the registry is empty and
-    browsers can still be registered ad-hoc via ``POST /parser/browsers``.
+    When BROWSERS_CONFIG is unset (standalone / tests) the registry is empty and
+    browsers can be registered ad-hoc via ``POST /parser/browsers``.
     """
 
     def __init__(self, path: str = BROWSERS_CONFIG_PATH):

@@ -18,10 +18,10 @@ async def healthz():
     # — check the driver itself so the liveness probe restarts the pod.
     if not browser_manager.driver_alive():
         return Response(status_code=503, content="Playwright driver is not running")
-    for bid, info in browser_manager.browsers.items():
-        try:
-            if not info.browser.is_connected():
-                return Response(status_code=503, content=f"Browser {bid} disconnected")
-        except Exception as e:
-            return Response(status_code=503, content=f"Browser {bid} error: {e}")
+    # One browser that dropped is that browser's problem: calls reconnect it
+    # or go elsewhere, and restarting this pod would end every session on
+    # every browser. Only when all of them dropped is the pod suspect.
+    ids = list(browser_manager.browsers)
+    if ids and not any(browser_manager.is_connected(bid) for bid in ids):
+        return Response(status_code=503, content="No browser connection is alive")
     return {"status": "ok"}

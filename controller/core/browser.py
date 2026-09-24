@@ -2,7 +2,8 @@ import asyncio
 import logging
 import os
 import signal
-from typing import Optional
+import time
+from typing import Iterable, Optional
 
 from patchright.async_api import Playwright, Browser, BrowserContext, Page
 
@@ -10,7 +11,15 @@ from core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Soft cap: a browser with this many open tabs is picked only when every
+# other one is as busy. Never a refusal.
 MAX_PAGES_PER_BROWSER = settings.max_pages_per_browser
+
+# How long a browser that could not be reached stays out of the pick.
+UNHEALTHY_SECONDS = 30.0
+
+# Closing tabs over a connection whose browser is gone can stall.
+DISCONNECT_TIMEOUT = 10.0
 
 
 class BrowserInfo:
@@ -23,7 +32,9 @@ class BrowserInfo:
         self.browser_id = browser_id
         # Optional auth headers sent on CDP connect (BYO/remote browsers).
         self.headers = headers or {}
-        # Named session pages (created via start_session)
+        # Tabs of the sessions that live on this browser, by session id.
+        # Emptied when the connection is rebuilt; the session itself stays
+        # on this browser (BrowserManager.sessions) and gets a new tab.
         self.pages: dict[str, Page] = {}
 
 
@@ -39,6 +50,17 @@ class BrowserManager:
     def __init__(self):
         self.playwright: Optional[Playwright] = None
         self.browsers: dict[str, BrowserInfo] = {}
+        # session id -> browser id. Kept apart from BrowserInfo.pages so a
+        # session outlives a reconnect of its browser: it stays there and
+        # gets a new tab. Dropped on end_session and when the browser leaves.
+        self.sessions: dict[str, str] = {}
+        # Calls running on each browser, counted from the moment the browser
+        # is chosen until the response is sent (see pick_browser/end_call).
+        self._in_flight: dict[str, int] = {}
+        # browser id -> monotonic deadline; a browser that failed to connect
+        # is skipped by pick_browser until then.
+        self._unhealthy_until: dict[str, float] = {}
+        self._rr = 0
         self._reconnect_lock = asyncio.Lock()
         self._playwright_pid: Optional[int] = None
 
@@ -126,6 +148,7 @@ class BrowserManager:
 
         info = BrowserInfo(browser, context, ws_url=ws_url, browser_id=browser_id, headers=headers or {})
         self.browsers[browser_id] = info
+        self.mark_healthy(browser_id)
         logger.info(f"Connected to browser '{browser_id}'")
         return info
 
@@ -150,6 +173,23 @@ class BrowserManager:
         logger.info(f"Disconnected browser '{browser_id}'")
         return True
 
+    async def remove_browser(self, browser_id: str) -> bool:
+        """Disconnect a browser for good: its sessions end with it.
+
+        ``disconnect_browser`` alone keeps the sessions (a reconnect gives them
+        new tabs on the same browser); this is for a browser that left.
+        """
+        for sid in [s for s, b in self.sessions.items() if b == browser_id]:
+            del self.sessions[sid]
+        self._unhealthy_until.pop(browser_id, None)
+        present = browser_id in self.browsers
+        try:
+            await asyncio.wait_for(self.disconnect_browser(browser_id), timeout=DISCONNECT_TIMEOUT)
+        except Exception as e:
+            logger.warning(f"Error disconnecting '{browser_id}': {e}")
+            self.browsers.pop(browser_id, None)
+        return present
+
     # ── lookup helpers ───────────────────────────────────────
 
     def get_browser(self, browser_id: str) -> BrowserInfo:
@@ -158,18 +198,128 @@ class BrowserManager:
             raise KeyError(f"Browser '{browser_id}' not connected")
         return self.browsers[browser_id]
 
-    def first_browser_id(self) -> Optional[str]:
-        return next(iter(self.browsers), None)
+    # ── sessions ─────────────────────────────────────────────
 
-    def least_loaded_browser_id(self) -> Optional[str]:
-        best_id: Optional[str] = None
-        best_count = float("inf")
-        for bid, info in self.browsers.items():
-            count = len(info.pages)
-            if count < best_count and count < MAX_PAGES_PER_BROWSER:
-                best_count = count
-                best_id = bid
-        return best_id
+    def session_browser(self, session_id: str) -> Optional[str]:
+        """The browser a session lives on, or None for an unknown session."""
+        return self.sessions.get(session_id)
+
+    def add_session(self, browser_id: str, session_id: str, page: Page) -> None:
+        self.sessions[session_id] = browser_id
+        self.browsers[browser_id].pages[session_id] = page
+
+    def end_session(self, session_id: str) -> Optional[Page]:
+        """Forget a session; returns its tab (if it has one) for the caller to close."""
+        browser_id = self.sessions.pop(session_id, None)
+        info = self.browsers.get(browser_id) if browser_id else None
+        return info.pages.pop(session_id, None) if info else None
+
+    def session_count(self, browser_id: str) -> int:
+        return sum(1 for b in self.sessions.values() if b == browser_id)
+
+    # ── load and health ──────────────────────────────────────
+
+    def is_connected(self, browser_id: str) -> bool:
+        info = self.browsers.get(browser_id)
+        if info is None:
+            return False
+        try:
+            return bool(info.browser.is_connected())
+        except Exception:
+            return False
+
+    def open_tabs(self, browser_id: str) -> int:
+        """Every tab open in the browser: sessions, one-off calls and tabs a
+        person opened. 0 for a browser that is not connected."""
+        if not self.is_connected(browser_id):
+            return 0
+        info = self.browsers[browser_id]
+        try:
+            return sum(len(ctx.pages) for ctx in info.browser.contexts)
+        except Exception:
+            return len(info.pages)
+
+    def load(self, browser_id: str) -> int:
+        return self.open_tabs(browser_id) + self._in_flight.get(browser_id, 0)
+
+    def begin_call(self, browser_id: str) -> None:
+        self._in_flight[browser_id] = self._in_flight.get(browser_id, 0) + 1
+
+    def end_call(self, browser_id: str) -> None:
+        left = self._in_flight.get(browser_id, 0) - 1
+        if left > 0:
+            self._in_flight[browser_id] = left
+        else:
+            self._in_flight.pop(browser_id, None)
+
+    def is_healthy(self, browser_id: str) -> bool:
+        until = self._unhealthy_until.get(browser_id)
+        return until is None or time.monotonic() >= until
+
+    def mark_unhealthy(self, browser_id: str) -> None:
+        self._unhealthy_until[browser_id] = time.monotonic() + UNHEALTHY_SECONDS
+
+    def mark_healthy(self, browser_id: str) -> None:
+        self._unhealthy_until.pop(browser_id, None)
+
+    def pick_browser(self, pool: Iterable[str], exclude: Iterable[str] = ()) -> Optional[str]:
+        """Choose a browser for a call that names none, and count the call on it.
+
+        Fewest open tabs plus calls in flight wins. Browsers that recently
+        failed to connect come last, then those at the soft tab cap; ties
+        rotate. Picking and counting happen with no await in between, so
+        calls that arrive together spread out. The caller must end_call().
+        """
+        skip = set(exclude)
+        options = [b for b in pool if b not in skip]
+        if not options:
+            return None
+        rank = {}
+        for b in options:
+            load = self.load(b)
+            rank[b] = (not self.is_healthy(b), load >= MAX_PAGES_PER_BROWSER, load)
+        best = min(rank.values())
+        ties = [b for b in options if rank[b] == best]
+        browser_id = ties[self._rr % len(ties)]
+        self._rr += 1
+        self.begin_call(browser_id)
+        return browser_id
+
+    async def ensure_connected(
+        self, browser_id: str, ws_url: Optional[str], headers: Optional[dict] = None
+    ) -> BrowserInfo:
+        """Return a live connection to ``browser_id``, connecting or recovering it.
+
+        A failure marks the browser unhealthy and raises; it never touches the
+        other browsers unless the Playwright driver itself is dead.
+        """
+        info = self.browsers.get(browser_id)
+        if info is None:
+            if not ws_url:
+                raise KeyError(f"Browser '{browser_id}' not connected")
+            try:
+                return await self.connect_browser(browser_id, ws_url, headers=headers)
+            except Exception as e:
+                # A dead Node driver fails every plain connect; only then is
+                # the driver restart worth it.
+                if self.driver_alive():
+                    self.mark_unhealthy(browser_id)
+                    raise
+                logger.warning(
+                    f"Connect to '{browser_id}' failed and driver is dead, running full recovery: {e}"
+                )
+                return await self.recover_connection(browser_id, ws_url, headers=headers)
+
+        drifted = bool(ws_url) and ws_url != info.ws_url
+        if drifted or not info.browser.is_connected():
+            if drifted:
+                logger.info(
+                    f"Browser '{browser_id}' ws_url drift ({info.ws_url} -> {ws_url}), reconnecting..."
+                )
+            else:
+                logger.info(f"Browser '{browser_id}' connection is dead, auto-reconnecting...")
+            return await self.recover_connection(browser_id, ws_url or info.ws_url, headers=headers)
+        return info
 
     # ── recovery ────────────────────────────────────────────
 
@@ -182,8 +332,8 @@ class BrowserManager:
 
         * Level 1 – disconnect the stale entry and reconnect via the
           **existing** Playwright driver.
-        * Level 2 – if the driver pipe is broken, restart the entire
-          Playwright driver process and reconnect every browser.
+        * Level 2 – only when the driver process is dead, restart it and
+          reconnect every browser.
 
         ``headers`` defaults to the existing connection's headers (so BYO auth
         survives a reconnect) when not provided by the caller.
@@ -201,14 +351,28 @@ class BrowserManager:
 
             # ── Level 1: simple reconnect with same Playwright driver ──
             try:
-                return await self._reconnect_same_driver(browser_id, ws_url, headers)
+                info = await self._reconnect_same_driver(browser_id, ws_url, headers)
+                self.mark_healthy(browser_id)
+                return info
             except Exception as e:
                 logger.warning(
                     f"Level-1 reconnect failed for '{browser_id}': {e}"
                 )
+                # With a live driver the fault is this browser (not ready,
+                # offline, gone). Restarting the driver would drop every other
+                # browser's connection and tabs, so fail this one alone.
+                if self.driver_alive():
+                    self.mark_unhealthy(browser_id)
+                    raise
 
             # ── Level 2: restart Playwright driver entirely ──
-            return await self._restart_playwright_and_reconnect(browser_id, ws_url, headers)
+            try:
+                info = await self._restart_playwright_and_reconnect(browser_id, ws_url, headers)
+            except Exception:
+                self.mark_unhealthy(browser_id)
+                raise
+            self.mark_healthy(browser_id)
+            return info
 
     async def _reconnect_same_driver(
         self, browser_id: str, ws_url: str, headers: Optional[dict] = None

@@ -43,8 +43,7 @@ class TestSessionManagement:
             "/end_session",
             headers={"X-Session-Id": "non-existent-session-id"},
         )
-        assert response.status_code == 200
-        assert response.json()["status"] == "success"
+        assert response.status_code == 404
 
     def test_full_session_lifecycle(self, client: TestClient):
         start_response = client.post("/start_session")
@@ -477,10 +476,13 @@ class TestBrowserManagement:
         assert response.status_code == 200
         data = response.json()
         assert isinstance(data, list)
-        if len(data) > 0:
-            assert "browser_id" in data[0]
-            assert "ws_url" in data[0]
-            assert "session_count" in data[0]
+        assert data[0] == {
+            "browser_id": "test-browser",
+            "connected": True,
+            "healthy": True,
+            "open_tabs": 0,
+            "session_count": 0,
+        }
 
     def test_connect_browser(self, client: TestClient):
         response = client.post(
@@ -490,7 +492,8 @@ class TestBrowserManagement:
         assert response.status_code == 200
         data = response.json()
         assert data["browser_id"] == "my-browser"
-        assert "ws_url" in data
+        assert data["connected"] is True
+        assert "ws_url" not in data
 
     def test_connect_browser_requires_fields(self, client: TestClient):
         response = client.post("/browsers", json={})

@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
 from patchright.async_api import async_playwright
 
 from core.browser import browser_manager
+from core.dependencies import browser_pool
+from core.middleware import BrowserRouting
 from core.registry import browser_registry
 from routes import health, browsers, search, content, interact, attribute
 
@@ -39,6 +41,8 @@ async def _stale_page_cleanup_loop():
     open page holds references in the driver process.  Left unchecked the
     driver eventually OOM-crashes (``FATAL ERROR: Ineffective mark-compacts
     near heap limit``), killing every connection.
+
+    Also lets go of browsers that left the registry while no call came in.
     """
     try:
         while True:
@@ -47,6 +51,10 @@ async def _stale_page_cleanup_loop():
                 await browser_manager.cleanup_stale_pages()
             except Exception as e:
                 logger.warning(f"Stale page cleanup failed: {e}")
+            try:
+                await browser_pool(browser_manager)
+            except Exception as e:
+                logger.warning(f"Registry sync failed: {e}")
     except asyncio.CancelledError:
         pass
 
@@ -73,6 +81,7 @@ async def lifespan(app: FastAPI):
                     await browser_manager.connect_browser(browser_id, ws_url)
                     logger.info(f"Warm-connected browser '{browser_id}' from registry: {ws_url}")
                 except Exception as e:
+                    browser_manager.mark_unhealthy(browser_id)
                     logger.warning(f"Failed to warm-connect browser '{browser_id}': {e}")
         if browsers:
             logger.info(f"Registry lists {len(browsers)} browser(s)")
@@ -117,6 +126,8 @@ app = FastAPI(
     lifespan=lifespan,
     root_path="/parser",
 )
+
+app.add_middleware(BrowserRouting)
 
 app.include_router(health.router)
 app.include_router(browsers.router)

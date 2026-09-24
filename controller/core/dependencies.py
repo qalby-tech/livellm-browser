@@ -1,11 +1,12 @@
+import functools
 import logging
-from typing import Annotated, Optional, AsyncGenerator
+from typing import Annotated, List, Optional, AsyncGenerator, Tuple
 
 from fastapi import Depends, Header, HTTPException, Request
 from patchright.async_api import Page
 
 from core.browser import BrowserInfo, BrowserManager
-from core.registry import browser_registry
+from core.registry import browser_registry, managed
 
 logger = logging.getLogger(__name__)
 
@@ -14,12 +15,90 @@ BrowserIdDep = Annotated[Optional[str], Header(alias="X-Browser-Id")]
 SessionIdDep = Annotated[Optional[str], Header(alias="X-Session-Id")]
 
 
-async def get_browser_info(
-    request: Request,
-    browser_id: BrowserIdDep = None,
-) -> BrowserInfo:
+# ==================== Pool ====================
+
+async def browser_pool(manager: BrowserManager) -> List[str]:
+    """The browsers a call may land on, in registry order.
+
+    Managed (BROWSERS_CONFIG set): exactly the registry. A connected browser
+    that has left it is disconnected here, with its sessions, so taking a
+    browser out is immediate. Standalone: the registry plus whatever was
+    connected through POST /browsers.
+
+    The registry is re-read on every call (cached by mtime), so a browser
+    added to it is picked from the next call on.
     """
-    Resolve browser info from X-Browser-Id header.
+    registry_ids = list(browser_registry.get_all_browsers())
+    if managed():
+        for bid in [b for b in manager.browsers if b not in registry_ids]:
+            logger.info(f"Browser '{bid}' left the registry, disconnecting")
+            await manager.remove_browser(bid)
+        # Sessions of a browser that left while it was not connected.
+        for sid, bid in list(manager.sessions.items()):
+            if bid not in registry_ids:
+                manager.sessions.pop(sid, None)
+        return registry_ids
+    return registry_ids + [b for b in manager.browsers if b not in registry_ids]
+
+
+# ==================== Resolution ====================
+
+def _hold(request: Request, manager: BrowserManager, bid: str) -> None:
+    """Name ``bid`` as the answering browser and keep its call counted until
+    the response is sent (core.middleware releases it). The call must already
+    be counted (pick_browser or begin_call)."""
+    _release(request)
+    request.state.browser_id = bid
+    request.state.release_browser = functools.partial(manager.end_call, bid)
+
+
+def _release(request: Request) -> None:
+    release = getattr(request.state, "release_browser", None)
+    if release is not None:
+        release()
+        request.state.release_browser = None
+    request.state.browser_id = None
+
+
+def session_owner(
+    request: Request, manager: BrowserManager, session_id: str, named: Optional[str]
+) -> str:
+    """The browser a session lives on. 404 for an unknown session, 409 when
+    the call names another browser."""
+    owner = manager.session_browser(session_id)
+    if owner is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Session '{session_id}' not found. Start one with POST /start_session.",
+        )
+    if named and named != owner:
+        request.state.browser_id = owner
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Session '{session_id}' is on browser '{owner}', not '{named}'. "
+                f"Send X-Session-Id alone, or name '{owner}'."
+            ),
+        )
+    return owner
+
+
+async def resolve_browser(
+    request: Request, named: Optional[str] = None, session_id: Optional[str] = None
+) -> BrowserInfo:
+    """Choose the browser for a call and make sure it is connected.
+
+    Three ways, in this order:
+
+    1. ``X-Session-Id``: the session's own browser. A browser also named (by
+       ``X-Browser-Id`` or the /browsers/<name>/ path) must be that one, or
+       409. An unknown session is 404.
+    2. ``X-Browser-Id: <name>`` or the /browsers/<name>/ path prefix: that
+       browser. 404 when it is not in the pool, 502 when it cannot be reached.
+    3. Nothing named: the browser with the fewest open tabs, counting calls in
+       flight, over every browser in the pool, connected or not. One that
+       cannot be reached is skipped for a while and the next one is tried;
+       503 only when the pool is empty or none can be reached.
 
     Source of truth for ws_url is the file-backed registry (an operator-maintained
     ConfigMap mapping browser_id -> stable Service ws_url). On every request we
@@ -27,82 +106,96 @@ async def get_browser_info(
     local state can never silently lag behind cluster state.
     """
     manager: BrowserManager = request.app.state.browser_manager
+    pool = await browser_pool(manager)
 
-    bid = browser_id
-    if not bid:
-        bid = manager.least_loaded_browser_id() or manager.first_browser_id()
-        if not bid:
-            # Nothing connected yet — fall back to the first registered browser.
-            bid = next(iter(browser_registry.get_all_browsers()), None)
-        if not bid:
+    if session_id is not None:
+        named = session_owner(request, manager, session_id, named)
+
+    if named:
+        if named not in pool:
             raise HTTPException(
                 status_code=404,
-                detail="No browsers available. Register one first via POST /browsers.",
+                detail=f"Browser '{named}' not found. Ensure the browser is running.",
             )
-
-    fresh_ws_url = browser_registry.get_browser_ws_url(bid)
-    fresh_headers = browser_registry.get_browser_headers(bid)
-
-    try:
-        info = manager.get_browser(bid)
-    except KeyError:
-        if not fresh_ws_url:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Browser '{bid}' not found. Ensure the browser is running.",
-            )
-        logger.info(f"Auto-discovered browser '{bid}' from registry, connecting...")
+        manager.begin_call(named)
+        _hold(request, manager, named)
         try:
-            info = await manager.connect_browser(bid, fresh_ws_url, headers=fresh_headers)
+            return await _connect(manager, named)
         except Exception as e:
-            # A dead Node driver fails every plain connect; without escalation
-            # this path 502-loops forever (the driver-restart recovery is only
-            # reachable for already-connected browsers). Escalate when the
-            # driver is the culprit rather than the remote browser.
-            if manager.driver_alive():
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Browser '{bid}' found in registry but connection failed: {e}",
-                )
-            logger.warning(
-                f"Connect to '{bid}' failed and driver is dead, running full recovery: {e}"
-            )
-            try:
-                info = await manager.recover_connection(bid, fresh_ws_url, headers=fresh_headers)
-            except Exception as recover_err:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Browser '{bid}' connection failed and driver recovery failed: {recover_err}",
-                )
-        return info
-
-    # Check for ws_url drift (e.g. browser pod restarted with new IP/port).
-    drifted = bool(fresh_ws_url) and fresh_ws_url != info.ws_url
-
-    needs_recovery = drifted or not info.browser.is_connected()
-
-    if needs_recovery:
-        reconnect_url = fresh_ws_url or info.ws_url
-        if drifted:
-            logger.info(
-                f"Browser '{bid}' ws_url drift "
-                f"({info.ws_url} -> {fresh_ws_url}), reconnecting..."
-            )
-        else:
-            logger.info(f"Browser '{bid}' connection is dead, auto-reconnecting...")
-        try:
-            info = await manager.recover_connection(bid, reconnect_url, headers=fresh_headers)
-        except Exception as e:
-            logger.error(f"Failed to reconnect browser '{bid}': {e}")
+            # The error text can carry the browser's internal address.
+            logger.warning(f"Browser '{named}' could not be reached: {e}")
             raise HTTPException(
                 status_code=502,
-                detail=f"Browser '{bid}' disconnected and reconnection failed: {e}",
+                detail=f"Browser '{named}' is not reachable right now.",
             )
 
-    return info
+    if not pool:
+        detail = (
+            "This Browser API has no browsers yet."
+            if managed()
+            else "No browsers available. Register one first via POST /browsers."
+        )
+        raise HTTPException(status_code=503, detail=detail)
+
+    tried: List[str] = []
+    while True:
+        bid = manager.pick_browser(pool, exclude=tried)
+        if bid is None:
+            raise HTTPException(
+                status_code=503,
+                detail="None of this Browser API's browsers can be reached right now.",
+            )
+        _hold(request, manager, bid)
+        try:
+            return await _connect(manager, bid)
+        except Exception as e:
+            logger.warning(f"Browser '{bid}' could not be reached, trying another: {e}")
+            _release(request)
+            tried.append(bid)
+
+
+async def _connect(manager: BrowserManager, bid: str) -> BrowserInfo:
+    return await manager.ensure_connected(
+        bid,
+        browser_registry.get_browser_ws_url(bid),
+        headers=browser_registry.get_browser_headers(bid),
+    )
+
+
+async def get_browser_info(
+    request: Request,
+    browser_id: BrowserIdDep = None,
+    session_id: SessionIdDep = None,
+) -> BrowserInfo:
+    """Resolve the browser for this call; see ``resolve_browser``."""
+    return await resolve_browser(request, browser_id, session_id)
 
 
 BrowserInfoDep = Annotated[BrowserInfo, Depends(get_browser_info)]
+
+
+async def open_page(manager: BrowserManager, browser_info: BrowserInfo) -> Tuple[BrowserInfo, Page]:
+    """Open a tab, reconnecting once if the connection turns out to be dead.
+
+    Returns the (possibly rebuilt) BrowserInfo with the new page.
+    """
+    try:
+        return browser_info, await browser_info.context.new_page()
+    except Exception as e:
+        logger.warning(f"Failed to create page, attempting recovery: {e}")
+    bid = browser_info.browser_id
+    reconnect_url = browser_registry.get_browser_ws_url(bid) or browser_info.ws_url
+    try:
+        browser_info = await manager.recover_connection(
+            bid, reconnect_url, headers=browser_registry.get_browser_headers(bid),
+        )
+        return browser_info, await browser_info.context.new_page()
+    except Exception as recover_err:
+        logger.error(f"Failed to open a tab on '{bid}' after recovery: {recover_err}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not open a tab on browser '{bid}'.",
+        )
 
 
 async def get_or_create_page(
@@ -113,15 +206,17 @@ async def get_or_create_page(
     """
     Get a page for the request.
 
-    • **Named session** (``X-Session-Id`` provided) — returns the existing
-      session page, or creates a new one in the default context.
+    • **Session** (``X-Session-Id`` provided) — the session's tab on its own
+      browser; a new tab there if the old one was closed or the browser
+      reconnected.
     • **Ad-hoc** (no session header) — creates a fresh page just for this
       request and closes it on the way out.
     """
+    manager: BrowserManager = request.app.state.browser_manager
     is_ad_hoc = session_id is None
     page: Optional[Page] = None
 
-    # ── Named session: reuse existing page ──
+    # ── Session: reuse its tab ──
     if not is_ad_hoc and session_id in browser_info.pages:
         page = browser_info.pages[session_id]
         try:
@@ -131,30 +226,10 @@ async def get_or_create_page(
             page = None
 
     if page is None:
-        manager: BrowserManager = request.app.state.browser_manager
-        try:
-            page = await browser_info.context.new_page()
-        except Exception as e:
-            logger.warning(f"Failed to create page, attempting recovery: {e}")
-            fresh_ws_url = browser_registry.get_browser_ws_url(
-                browser_info.browser_id
-            )
-            reconnect_url = fresh_ws_url or browser_info.ws_url
-            try:
-                browser_info = await manager.recover_connection(
-                    browser_info.browser_id, reconnect_url,
-                    headers=browser_registry.get_browser_headers(browser_info.browser_id),
-                )
-                page = await browser_info.context.new_page()
-            except Exception as recover_err:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Failed to create page after recovery: {recover_err}",
-                )
-
+        browser_info, page = await open_page(manager, browser_info)
         if not is_ad_hoc:
-            browser_info.pages[session_id] = page
-            logger.info(f"Created new page for session {session_id}")
+            manager.add_session(browser_info.browser_id, session_id, page)
+            logger.info(f"Opened a tab for session {session_id} on '{browser_info.browser_id}'")
 
     try:
         yield page

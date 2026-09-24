@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import logging
 import os
 import signal
@@ -20,6 +21,11 @@ UNHEALTHY_SECONDS = 30.0
 
 # Closing tabs over a connection whose browser is gone can stall.
 DISCONNECT_TIMEOUT = 10.0
+
+# How long a call that names no browser waits for the one it picked to
+# connect before it tries the next. The connect itself goes on, and the
+# browser comes last in the pick until it is up.
+PICK_CONNECT_WAIT = 3.0
 
 
 class BrowserInfo:
@@ -60,8 +66,17 @@ class BrowserManager:
         # browser id -> monotonic deadline; a browser that failed to connect
         # is skipped by pick_browser until then.
         self._unhealthy_until: dict[str, float] = {}
+        # browser id -> the connect running for it, and when it started. Every
+        # call that finds the browser down waits on that one attempt, so calls
+        # arriving together open one connection, and a slow browser never
+        # holds up another.
+        self._connecting: dict[str, asyncio.Future] = {}
+        self._connect_started: dict[str, float] = {}
         self._rr = 0
-        self._reconnect_lock = asyncio.Lock()
+        # Held while the Playwright driver, shared by every browser, restarts.
+        # Made on first use: on Python 3.9 a lock binds to the loop current
+        # when it is created, and this object is created at import.
+        self._driver_lock: Optional[asyncio.Lock] = None
         self._playwright_pid: Optional[int] = None
 
     async def start(self, playwright: Playwright):
@@ -144,6 +159,15 @@ class BrowserManager:
 
         logger.info(f"Connecting to browser '{browser_id}' via {ws_url}")
         browser = await self.playwright.chromium.connect_over_cdp(ws_url, headers=headers or None)
+        current = self.browsers.get(browser_id)
+        if current is not None and current.ws_url == ws_url and self._alive(current):
+            # Another call connected it while this one waited: keep that
+            # connection and let this one go, or it would stay open for good.
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            return current
         context = browser.contexts[0] if browser.contexts else await browser.new_context()
 
         info = BrowserInfo(browser, context, ws_url=ws_url, browser_id=browser_id, headers=headers or {})
@@ -206,7 +230,9 @@ class BrowserManager:
 
     def add_session(self, browser_id: str, session_id: str, page: Page) -> None:
         self.sessions[session_id] = browser_id
-        self.browsers[browser_id].pages[session_id] = page
+        info = self.browsers.get(browser_id)
+        if info is not None:  # absent mid-reconnect: the session gets a new tab next call
+            info.pages[session_id] = page
 
     def end_session(self, session_id: str) -> Optional[Page]:
         """Forget a session; returns its tab (if it has one) for the caller to close."""
@@ -219,14 +245,16 @@ class BrowserManager:
 
     # ── load and health ──────────────────────────────────────
 
-    def is_connected(self, browser_id: str) -> bool:
-        info = self.browsers.get(browser_id)
-        if info is None:
-            return False
+    @staticmethod
+    def _alive(info: BrowserInfo) -> bool:
         try:
             return bool(info.browser.is_connected())
         except Exception:
             return False
+
+    def is_connected(self, browser_id: str) -> bool:
+        info = self.browsers.get(browser_id)
+        return info is not None and self._alive(info)
 
     def open_tabs(self, browser_id: str) -> int:
         """Every tab open in the browser: sessions, one-off calls and tabs a
@@ -262,13 +290,20 @@ class BrowserManager:
     def mark_healthy(self, browser_id: str) -> None:
         self._unhealthy_until.pop(browser_id, None)
 
+    def slow_to_connect(self, browser_id: str) -> bool:
+        """A connect to the browser has been running longer than a call that
+        names no browser waits for one."""
+        started = self._connect_started.get(browser_id)
+        return started is not None and time.monotonic() - started >= PICK_CONNECT_WAIT
+
     def pick_browser(self, pool: Iterable[str], exclude: Iterable[str] = ()) -> Optional[str]:
         """Choose a browser for a call that names none, and count the call on it.
 
         Fewest open tabs plus calls in flight wins. Browsers that recently
-        failed to connect come last, then those at the soft tab cap; ties
-        rotate. Picking and counting happen with no await in between, so
-        calls that arrive together spread out. The caller must end_call().
+        failed to connect, or are still slow to, come last, then those at the
+        soft tab cap; ties rotate. Picking and counting happen with no await
+        in between, so calls that arrive together spread out. The caller must
+        end_call().
         """
         skip = set(exclude)
         options = [b for b in pool if b not in skip]
@@ -277,7 +312,8 @@ class BrowserManager:
         rank = {}
         for b in options:
             load = self.load(b)
-            rank[b] = (not self.is_healthy(b), load >= MAX_PAGES_PER_BROWSER, load)
+            away = not self.is_healthy(b) or self.slow_to_connect(b)
+            rank[b] = (away, load >= MAX_PAGES_PER_BROWSER, load)
         best = min(rank.values())
         ties = [b for b in options if rank[b] == best]
         browser_id = ties[self._rr % len(ties)]
@@ -286,51 +322,79 @@ class BrowserManager:
         return browser_id
 
     async def ensure_connected(
-        self, browser_id: str, ws_url: Optional[str], headers: Optional[dict] = None
+        self, browser_id: str, ws_url: Optional[str], headers: Optional[dict] = None,
+        picked: bool = False,
     ) -> BrowserInfo:
         """Return a live connection to ``browser_id``, connecting or recovering it.
 
-        A failure marks the browser unhealthy and raises; it never touches the
-        other browsers unless the Playwright driver itself is dead.
+        Calls that find the browser down share one attempt (``_attempt``). A
+        call that named no browser (``picked``) waits for it at most
+        PICK_CONNECT_WAIT seconds and then gets ``asyncio.TimeoutError``; the
+        attempt goes on. A failure marks the browser unhealthy and raises; it
+        never touches the other browsers unless the Playwright driver itself
+        is dead.
         """
         info = self.browsers.get(browser_id)
         if info is None:
             if not ws_url:
                 raise KeyError(f"Browser '{browser_id}' not connected")
-            try:
-                return await self.connect_browser(browser_id, ws_url, headers=headers)
-            except Exception as e:
-                # A dead Node driver fails every plain connect; only then is
-                # the driver restart worth it.
-                if self.driver_alive():
-                    self.mark_unhealthy(browser_id)
-                    raise
-                logger.warning(
-                    f"Connect to '{browser_id}' failed and driver is dead, running full recovery: {e}"
-                )
-                return await self.recover_connection(browser_id, ws_url, headers=headers)
-
-        drifted = bool(ws_url) and ws_url != info.ws_url
-        if drifted or not info.browser.is_connected():
+        else:
+            drifted = bool(ws_url) and ws_url != info.ws_url
+            if not drifted and self._alive(info):
+                return info
             if drifted:
                 logger.info(
                     f"Browser '{browser_id}' ws_url drift ({info.ws_url} -> {ws_url}), reconnecting..."
                 )
             else:
                 logger.info(f"Browser '{browser_id}' connection is dead, auto-reconnecting...")
-            return await self.recover_connection(browser_id, ws_url or info.ws_url, headers=headers)
-        return info
+            ws_url = ws_url or info.ws_url
+        return await self._attempt(
+            browser_id, ws_url, headers, wait=PICK_CONNECT_WAIT if picked else None,
+        )
+
+    async def recover_connection(self, browser_id: str, ws_url: str, headers: Optional[dict] = None) -> BrowserInfo:
+        """Reconnect a browser whose connection broke (see ``_recover``),
+        joining an attempt already running for it."""
+        return await self._attempt(browser_id, ws_url, headers)
 
     # ── recovery ────────────────────────────────────────────
 
-    async def recover_connection(self, browser_id: str, ws_url: str, headers: Optional[dict] = None) -> BrowserInfo:
+    async def _attempt(
+        self, browser_id: str, ws_url: str, headers: Optional[dict], wait: Optional[float] = None,
+    ) -> BrowserInfo:
+        """Wait on the one connect running for ``browser_id``, starting it if none is.
+
+        The attempt is shielded: a caller that stops waiting (``wait`` ran
+        out, or its client went away) leaves it running for the others.
         """
-        Recover a broken browser connection.
+        task = self._connecting.get(browser_id)
+        if task is None:
+            task = asyncio.ensure_future(self._recover(browser_id, ws_url, headers))
+            self._connecting[browser_id] = task
+            self._connect_started[browser_id] = time.monotonic()
+            task.add_done_callback(functools.partial(self._attempt_done, browser_id))
+        return await asyncio.wait_for(asyncio.shield(task), timeout=wait)
 
-        Uses a lock so that concurrent requests don't all try to recover at
-        the same time.  Two recovery levels are attempted:
+    def _attempt_done(self, browser_id: str, task: asyncio.Future) -> None:
+        if self._connecting.get(browser_id) is task:
+            del self._connecting[browser_id]
+            self._connect_started.pop(browser_id, None)
+        if not task.cancelled():
+            task.exception()  # retrieved: an attempt nobody waits for any more stays quiet
 
-        * Level 1 – disconnect the stale entry and reconnect via the
+    def _driver_lock_now(self) -> asyncio.Lock:
+        if self._driver_lock is None:
+            self._driver_lock = asyncio.Lock()
+        return self._driver_lock
+
+    async def _recover(self, browser_id: str, ws_url: str, headers: Optional[dict] = None) -> BrowserInfo:
+        """
+        Bring a browser's connection up, the first time or after it broke.
+
+        Runs as the one attempt for the browser (``_attempt``). Two levels:
+
+        * Level 1 – drop the stale entry, if any, and connect via the
           **existing** Playwright driver.
         * Level 2 – only when the driver process is dead, restart it and
           reconnect every browser.
@@ -338,41 +402,45 @@ class BrowserManager:
         ``headers`` defaults to the existing connection's headers (so BYO auth
         survives a reconnect) when not provided by the caller.
         """
-        async with self._reconnect_lock:
-            # Another request may have already recovered while we waited
-            if browser_id in self.browsers:
-                existing = self.browsers[browser_id]
-                if headers is None:
-                    headers = existing.headers
-                # Only short-circuit if the URL also matches — ws_url drift
-                # (browser pod restart with new IP/port) means we MUST reconnect.
-                if existing.ws_url == ws_url and existing.browser.is_connected():
-                    return existing
+        existing = self.browsers.get(browser_id)
+        if existing is not None:
+            if headers is None:
+                headers = existing.headers
+            # Only short-circuit if the URL also matches — ws_url drift
+            # (browser pod restart with new IP/port) means we MUST reconnect.
+            if existing.ws_url == ws_url and self._alive(existing):
+                return existing
 
-            # ── Level 1: simple reconnect with same Playwright driver ──
+        # ── Level 1: connect with the same Playwright driver ──
+        try:
+            info = await self._reconnect_same_driver(browser_id, ws_url, headers)
+            self.mark_healthy(browser_id)
+            return info
+        except Exception as e:
+            logger.warning(f"Level-1 connect failed for '{browser_id}': {e}")
+            # With a live driver the fault is this browser (not ready,
+            # offline, gone). Restarting the driver would drop every other
+            # browser's connection and tabs, so fail this one alone.
+            if self.driver_alive():
+                self.mark_unhealthy(browser_id)
+                raise
+
+        # ── Level 2: restart the Playwright driver entirely ──
+        async with self._driver_lock_now():
+            # Another browser's attempt may have restarted it while this one waited.
+            current = self.browsers.get(browser_id)
+            if current is not None and current.ws_url == ws_url and self._alive(current):
+                return current
             try:
-                info = await self._reconnect_same_driver(browser_id, ws_url, headers)
-                self.mark_healthy(browser_id)
-                return info
-            except Exception as e:
-                logger.warning(
-                    f"Level-1 reconnect failed for '{browser_id}': {e}"
-                )
-                # With a live driver the fault is this browser (not ready,
-                # offline, gone). Restarting the driver would drop every other
-                # browser's connection and tabs, so fail this one alone.
                 if self.driver_alive():
-                    self.mark_unhealthy(browser_id)
-                    raise
-
-            # ── Level 2: restart Playwright driver entirely ──
-            try:
-                info = await self._restart_playwright_and_reconnect(browser_id, ws_url, headers)
+                    info = await self._reconnect_same_driver(browser_id, ws_url, headers)
+                else:
+                    info = await self._restart_playwright_and_reconnect(browser_id, ws_url, headers)
             except Exception:
                 self.mark_unhealthy(browser_id)
                 raise
-            self.mark_healthy(browser_id)
-            return info
+        self.mark_healthy(browser_id)
+        return info
 
     async def _reconnect_same_driver(
         self, browser_id: str, ws_url: str, headers: Optional[dict] = None
@@ -380,7 +448,7 @@ class BrowserManager:
         """Disconnect stale entry and open a fresh CDP connection."""
         try:
             await asyncio.wait_for(
-                self.disconnect_browser(browser_id), timeout=10.0
+                self.disconnect_browser(browser_id), timeout=DISCONNECT_TIMEOUT
             )
         except Exception as e:
             logger.warning(f"Error disconnecting '{browser_id}': {e}")
@@ -393,7 +461,7 @@ class BrowserManager:
         )
         info = BrowserInfo(browser, context, ws_url=ws_url, browser_id=browser_id, headers=headers or {})
         self.browsers[browser_id] = info
-        logger.info(f"Reconnected browser '{browser_id}' (same driver)")
+        logger.info(f"Connected browser '{browser_id}' (same driver)")
         return info
 
     async def _restart_playwright_and_reconnect(
@@ -489,6 +557,8 @@ class BrowserManager:
     async def shutdown(self, timeout: float = 25.0):
         """Disconnect all browsers."""
         logger.info("Starting browser manager shutdown…")
+        for task in list(self._connecting.values()):
+            task.cancel()
 
         async def _shutdown():
             for bid in list(self.browsers.keys()):

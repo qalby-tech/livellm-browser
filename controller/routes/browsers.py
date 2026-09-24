@@ -104,6 +104,11 @@ async def start_session(
     ``browser_id`` in the body), else the one with the fewest open tabs. Later
     calls with X-Session-Id alone go to that browser.
     """
+    if browser_id and body.browser_id and body.browser_id != browser_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"The body names browser '{body.browser_id}' but the call names '{browser_id}'.",
+        )
     browser_info = await resolve_browser(request, browser_id or body.browser_id)
     browser_info, page = await open_page(browser_manager, browser_info)
 

@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import re
+from pathlib import Path
 
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
@@ -78,7 +80,9 @@ async def lifespan(app: FastAPI):
         for browser_id, ws_url in browsers.items():
             if browser_id not in browser_manager.browsers:
                 try:
-                    await browser_manager.connect_browser(browser_id, ws_url)
+                    await browser_manager.connect_browser(
+                        browser_id, ws_url, headers=browser_registry.get_browser_headers(browser_id),
+                    )
                     logger.info(f"Warm-connected browser '{browser_id}' from registry: {ws_url}")
                 except Exception as e:
                     browser_manager.mark_unhealthy(browser_id)
@@ -120,9 +124,19 @@ async def lifespan(app: FastAPI):
 
 # ==================== App ====================
 
+def _version() -> str:
+    """The version in pyproject.toml, which CI tags the image with (the
+    project is not installed as a package, so there is no metadata)."""
+    try:
+        text = (Path(__file__).parent / "pyproject.toml").read_text()
+        return re.search(r'^version = "([^"]+)"', text, re.M).group(1)
+    except (OSError, AttributeError):
+        return "unknown"
+
+
 app = FastAPI(
     title="Controller API",
-    version="0.4.0",
+    version=_version(),
     lifespan=lifespan,
     root_path="/parser",
 )

@@ -1,6 +1,7 @@
 """
 Pytest configuration and fixtures for smoke tests.
 """
+import asyncio
 import itertools
 import json
 import os
@@ -22,6 +23,7 @@ def mock_page():
     page.query_selector = AsyncMock(return_value=None)
     page.query_selector_all = AsyncMock(return_value=[])
     page.close = AsyncMock()
+    page.is_closed = MagicMock(return_value=False)
     page.screenshot = AsyncMock(return_value=b"fake_png_bytes")
 
     mock_locator = MagicMock()
@@ -82,6 +84,7 @@ def fresh_manager(tmp_path):
     with patch.multiple(
         browser_manager,
         browsers={}, sessions={}, _in_flight={}, _unhealthy_until={}, _rr=0,
+        _connecting={}, _connect_started={}, _driver_lock=None,
         playwright=None, _playwright_pid=None,
     ), patch.multiple(
         browser_registry, path=str(tmp_path / "absent.json"), _cache={}, _mtime=-1.0,
@@ -118,7 +121,8 @@ def client(mock_playwright, mock_browser_context, mock_browser, fresh_manager, m
 #
 # Fake Chrome instances behind a fake CDP connect: tabs live in the Chrome
 # (so they survive a reconnect, and a person's tabs count), and a Chrome can
-# be taken down, which breaks its connections and refuses new ones.
+# be taken down, which breaks its connections and refuses new ones. Like
+# Patchright's, a page's url never raises; a closed page fails when used.
 
 class FakePage:
     def __init__(self, context, tag):
@@ -127,13 +131,23 @@ class FakePage:
         self.url = "about:blank"
         self.closed = False
 
+    def is_closed(self):
+        return self.closed
+
+    def _check(self):
+        if self.closed:
+            raise RuntimeError("Target page, context or browser has been closed")
+
     async def goto(self, url, **kwargs):
+        self._check()
         self.url = url
 
     async def inner_text(self, selector):
+        self._check()
         return self.tag
 
     async def content(self):
+        self._check()
         return f"<html><body>{self.tag}</body></html>"
 
     async def evaluate(self, *args, **kwargs):
@@ -162,6 +176,8 @@ class FakeChrome:
     def __init__(self, name):
         self.name = name
         self.up = True
+        # The Authorization header it requires, if any (a remote browser).
+        self.auth = None
         self.context = FakeContext(name)
 
 
@@ -181,11 +197,17 @@ class FakeCdpBrowser:
 
 
 class FakeNet:
-    """The browsers' side of the network: ws://<name>:9222/... reaches Chrome <name>."""
+    """The browsers' side of the network: ws://<name>:9222/... reaches Chrome <name>.
+
+    ``connects`` lists every connect attempt by browser, ``opened`` every
+    connection made, and ``delay[name]`` makes connects to it take that long.
+    """
 
     def __init__(self, *names):
         self.chromes = {n: FakeChrome(n) for n in names}
         self.connects = []
+        self.opened = []
+        self.delay = {}
 
     def chrome(self, name):
         if name not in self.chromes:
@@ -195,13 +217,22 @@ class FakeNet:
     def down(self, name):
         self.chrome(name).up = False
 
+    def open_connections(self, name):
+        return [c for c in self.opened if c._chrome.name == name and c._open]
+
     async def connect_over_cdp(self, ws_url, headers=None):
         name = ws_url.split("://", 1)[1].split(":", 1)[0]
         self.connects.append(name)
+        if self.delay.get(name):
+            await asyncio.sleep(self.delay[name])
         chrome = self.chrome(name)
         if not chrome.up:
             raise ConnectionError(f"connect ECONNREFUSED {ws_url}")
-        return FakeCdpBrowser(chrome)
+        if chrome.auth and (headers or {}).get("Authorization") != chrome.auth:
+            raise ConnectionError(f"Unexpected status 401 when connecting to {ws_url}")
+        conn = FakeCdpBrowser(chrome)
+        self.opened.append(conn)
+        return conn
 
     def playwright(self):
         # No private driver attributes: driver_alive() reads as alive.
@@ -212,26 +243,39 @@ class FakeNet:
 
 
 @pytest.fixture
-def pool(request, tmp_path, monkeypatch, fresh_manager):
+def net():
+    return FakeNet("agent-1", "agent-2")
+
+
+@pytest.fixture
+def pool(request, tmp_path, monkeypatch, fresh_manager, net):
     """A managed controller (BROWSERS_CONFIG set) over agent-1 and agent-2.
 
-    Parametrize indirectly with a list of ids to start from another registry.
-    ``pool.set_registry(*ids)`` rewrites it the way the operator does.
+    Parametrize indirectly with a list of ids to start from another registry,
+    or a dict {id: Authorization header or None} for browsers that require
+    one. ``pool.set_registry(*ids)`` rewrites it the way the operator does.
     """
     from core.registry import browser_registry
 
-    ids = getattr(request, "param", ["agent-1", "agent-2"])
+    param = getattr(request, "param", ["agent-1", "agent-2"])
+    ids = list(param)
+    auth = {n: a for n, a in param.items() if a} if isinstance(param, dict) else {}
     reg = tmp_path / "browsers.json"
-    net = FakeNet("agent-1", "agent-2")
     stamp = itertools.count(1)
 
+    def entry(n):
+        ws_url = f"ws://{n}:9222/devtools/browser/{n}"
+        if n in auth:
+            return {"wsUrl": ws_url, "headers": {"Authorization": auth[n]}}
+        return ws_url
+
     def set_registry(*names):
-        reg.write_text(json.dumps({"browsers": {
-            n: f"ws://{n}:9222/devtools/browser/{n}" for n in names
-        }}))
+        reg.write_text(json.dumps({"browsers": {n: entry(n) for n in names}}))
         t = 1_000_000_000 + next(stamp)
         os.utime(reg, (t, t))
 
+    for n, a in auth.items():
+        net.chrome(n).auth = a
     set_registry(*ids)
     monkeypatch.setenv("BROWSERS_CONFIG", str(reg))
     with patch.object(browser_registry, "path", str(reg)), \

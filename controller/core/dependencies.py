@@ -60,6 +60,13 @@ def _release(request: Request) -> None:
     request.state.browser_id = None
 
 
+def unknown_session(session_id: str) -> HTTPException:
+    return HTTPException(
+        status_code=404,
+        detail=f"Session '{session_id}' not found. Start one with POST /start_session.",
+    )
+
+
 def session_owner(
     request: Request, manager: BrowserManager, session_id: str, named: Optional[str]
 ) -> str:
@@ -67,10 +74,7 @@ def session_owner(
     the call names another browser."""
     owner = manager.session_browser(session_id)
     if owner is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Session '{session_id}' not found. Start one with POST /start_session.",
-        )
+        raise unknown_session(session_id)
     if named and named != owner:
         request.state.browser_id = owner
         raise HTTPException(
@@ -97,8 +101,9 @@ async def resolve_browser(
        browser. 404 when it is not in the pool, 502 when it cannot be reached.
     3. Nothing named: the browser with the fewest open tabs, counting calls in
        flight, over every browser in the pool, connected or not. One that
-       cannot be reached is skipped for a while and the next one is tried;
-       503 only when the pool is empty or none can be reached.
+       cannot be reached, or takes longer than a few seconds to connect, is
+       skipped for a while and the next one is tried; 503 only when the pool
+       is empty or none can be reached.
 
     Source of truth for ws_url is the file-backed registry (an operator-maintained
     ConfigMap mapping browser_id -> stable Service ws_url). On every request we
@@ -147,18 +152,19 @@ async def resolve_browser(
             )
         _hold(request, manager, bid)
         try:
-            return await _connect(manager, bid)
+            return await _connect(manager, bid, picked=True)
         except Exception as e:
-            logger.warning(f"Browser '{bid}' could not be reached, trying another: {e}")
+            logger.warning(f"Browser '{bid}' could not be reached, trying another: {e!r}")
             _release(request)
             tried.append(bid)
 
 
-async def _connect(manager: BrowserManager, bid: str) -> BrowserInfo:
+async def _connect(manager: BrowserManager, bid: str, picked: bool = False) -> BrowserInfo:
     return await manager.ensure_connected(
         bid,
         browser_registry.get_browser_ws_url(bid),
         headers=browser_registry.get_browser_headers(bid),
+        picked=picked,
     )
 
 
@@ -219,15 +225,21 @@ async def get_or_create_page(
     # ── Session: reuse its tab ──
     if not is_ad_hoc and session_id in browser_info.pages:
         page = browser_info.pages[session_id]
-        try:
-            _ = page.url
-        except Exception:
+        if page.is_closed():
             logger.info(f"Session page {session_id} was closed, creating new one")
             page = None
 
     if page is None:
         browser_info, page = await open_page(manager, browser_info)
         if not is_ad_hoc:
+            if manager.session_browser(session_id) != browser_info.browser_id:
+                # The session ended, or its browser left, while the tab opened:
+                # keeping the tab would leave it open with no session to close it.
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                raise unknown_session(session_id)
             manager.add_session(browser_info.browser_id, session_id, page)
             logger.info(f"Opened a tab for session {session_id} on '{browser_info.browser_id}'")
 

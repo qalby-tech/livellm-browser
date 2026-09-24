@@ -3,6 +3,8 @@ Smoke tests for livellm-controller FastAPI controller.
 
 Run with: uv run pytest tests/ -v
 """
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 
@@ -337,7 +339,9 @@ class TestOpenAPISchema:
         assert response.status_code == 200
         schema = response.json()
         assert schema["info"]["title"] == "Controller API"
-        assert schema["info"]["version"] == "0.4.0"
+        # The version CI tags the image with.
+        pyproject = (Path(__file__).parent.parent / "pyproject.toml").read_text()
+        assert f'version = "{schema["info"]["version"]}"' in pyproject
 
     def test_docs_endpoint_available(self, client: TestClient):
         response = client.get("/docs")

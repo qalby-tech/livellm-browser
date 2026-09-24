@@ -4,6 +4,9 @@ browser. See the ``pool`` fixture in conftest.py.
 
 Run with: uv run pytest tests/ -v
 """
+import asyncio
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -63,6 +66,20 @@ class TestPinning:
         assert r.status_code == 200
         assert r.json()["browser_id"] == "agent-2"
         assert r.headers["x-browser-id"] == "agent-2"
+
+    def test_start_session_by_body(self, pool):
+        r = pool.client.post("/start_session", json={"browser_id": "agent-2"})
+        assert r.json()["browser_id"] == "agent-2"
+        r = pool.client.post("/start_session", json={"browser_id": "agent-2"}, headers={"X-Browser-Id": "agent-2"})
+        assert r.json()["browser_id"] == "agent-2"
+
+    def test_start_session_body_and_other_name_disagree(self, pool):
+        r = pool.client.post("/start_session", json={"browser_id": "agent-2"}, headers={"X-Browser-Id": "agent-1"})
+        assert r.status_code == 400
+        assert r.json()["detail"] == "The body names browser 'agent-2' but the call names 'agent-1'."
+        r = pool.client.post("/browsers/agent-1/start_session", json={"browser_id": "agent-2"})
+        assert r.status_code == 400
+        assert pool.manager.sessions == {}
 
 
 class TestManagementRoutes:
@@ -173,6 +190,39 @@ class TestSessions:
         r = pool.client.post("/content", json=CONTENT, headers={"X-Session-Id": sid})
         assert r.status_code == 404
 
+    def test_tab_closed_by_hand_is_replaced(self, pool):
+        sid, _ = start(pool, **{"X-Browser-Id": "agent-2"})
+        tab = pool.net.chrome("agent-2").context.pages[0]
+        # A person closes the session's tab in the browser.
+        tab.closed = True
+        pool.net.chrome("agent-2").context.pages.remove(tab)
+        r = pool.client.post("/content", json=CONTENT, headers={"X-Session-Id": sid})
+        assert r.status_code == 200
+        assert answered(r) == ("agent-2", "agent-2-p2")
+        r = pool.client.post("/content", json=CONTENT, headers={"X-Session-Id": sid})
+        assert answered(r) == ("agent-2", "agent-2-p2")
+
+    def test_session_ended_while_its_tab_opens(self, pool):
+        sid, _ = start(pool, **{"X-Browser-Id": "agent-2"})
+        # Its connection dropped, so the next session call reconnects first,
+        # and end_session lands meanwhile.
+        pool.manager.browsers["agent-2"].browser._open = False
+        pool.net.delay["agent-2"] = 0.5
+        out = {}
+
+        def call():
+            out["call"] = pool.client.post("/content", json=CONTENT, headers={"X-Session-Id": sid})
+
+        t = threading.Thread(target=call)
+        t.start()
+        time.sleep(0.15)
+        assert pool.client.delete("/end_session", headers={"X-Session-Id": sid}).status_code == 200
+        t.join()
+        assert out["call"].status_code == 404
+        assert sid not in pool.manager.sessions
+        # No tab is left open with no session to close it.
+        assert pool.net.chrome("agent-2").context.pages == []
+
     def test_session_outlives_a_reconnect_of_its_browser(self, pool):
         sid, _ = start(pool, **{"X-Browser-Id": "agent-2"})
         # The browser restarts: the connection drops, then it is back.
@@ -227,6 +277,71 @@ class TestFewestTabs:
         assert {first, second} == {"agent-1", "agent-2"}
         m.end_call(first)
         assert m.pick_browser(["agent-1", "agent-2"]) == first
+
+
+class TestConnecting:
+    @pytest.mark.parametrize("pool", [["agent-1"]], indirect=True)
+    def test_calls_arriving_together_open_one_connection(self, pool):
+        # agent-2 joins with no tabs, so every call below picks it while it
+        # is still connecting.
+        pool.net.chrome("agent-1").context.pages.extend([object()] * 6)
+        pool.net.delay["agent-2"] = 0.3
+        pool.set_registry("agent-1", "agent-2")
+
+        def call(_):
+            r = pool.client.post("/content", json=CONTENT)
+            return r.status_code, r.headers.get("x-browser-id")
+
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            seen = list(ex.map(call, range(4)))
+        assert seen == [(200, "agent-2")] * 4
+        assert pool.net.connects.count("agent-2") == 1
+        assert len(pool.net.open_connections("agent-2")) == 1
+
+    async def test_connects_racing_keep_one_connection(self, fresh_manager, net):
+        fresh_manager.playwright = net.playwright()
+        net.delay["agent-1"] = 0.05
+        url = "ws://agent-1:9222/devtools/browser/agent-1"
+        first, second = await asyncio.gather(
+            fresh_manager.connect_browser("agent-1", url),
+            fresh_manager.connect_browser("agent-1", url),
+        )
+        assert first is second is fresh_manager.browsers["agent-1"]
+        assert len(net.open_connections("agent-1")) == 1
+
+    @pytest.mark.parametrize("pool", [["agent-1"]], indirect=True)
+    def test_a_slow_browser_holds_no_call_up(self, pool, monkeypatch):
+        monkeypatch.setattr("core.browser.PICK_CONNECT_WAIT", 0.5)
+        pool.net.chrome("agent-1").context.pages.append(object())  # agent-2 is tried first
+        pool.net.delay["agent-2"] = 1.5
+        pool.set_registry("agent-1", "agent-2")
+
+        began = time.monotonic()
+        r = pool.client.post("/content", json=CONTENT)
+        assert r.headers["x-browser-id"] == "agent-1"
+        assert time.monotonic() - began < 1.2
+        # While its connect goes on, calls go elsewhere at once and start no other.
+        for _ in range(3):
+            began = time.monotonic()
+            r = pool.client.post("/content", json=CONTENT)
+            assert r.headers["x-browser-id"] == "agent-1"
+            assert time.monotonic() - began < 0.4
+        assert pool.net.connects.count("agent-2") == 1
+        # A call that names it waits for that same connect.
+        r = pool.client.post("/content", json=CONTENT, headers={"X-Browser-Id": "agent-2"})
+        assert r.status_code == 200
+        assert r.headers["x-browser-id"] == "agent-2"
+        assert pool.net.connects.count("agent-2") == 1
+        # Once up, it is picked like any other.
+        assert pool.client.post("/content", json=CONTENT).headers["x-browser-id"] == "agent-2"
+
+    @pytest.mark.parametrize(
+        "pool", [{"agent-1": "Bearer t1", "agent-2": None}], indirect=True,
+    )
+    def test_startup_connect_sends_the_registry_headers(self, pool):
+        assert pool.manager.is_connected("agent-1")
+        assert pool.manager.is_healthy("agent-1")
+        assert pool.net.connects.count("agent-1") == 1
 
 
 class TestRegistryChanges:
@@ -331,6 +446,30 @@ class TestDeadMember:
         pool.manager.mark_unhealthy("agent-2")
         seen = {pool.client.post("/content", json=CONTENT).headers["x-browser-id"] for _ in range(4)}
         assert seen == {"agent-1", "agent-2"}
+
+    def test_dead_driver_is_restarted(self, pool, monkeypatch):
+        manager = pool.manager
+        restarts = []
+
+        async def restart(browser_id, fresh_ws_url=None, headers=None):
+            restarts.append(browser_id)
+            pool.net.chrome("agent-2").up = True  # the new driver reaches it
+            return await manager._reconnect_same_driver(browser_id, fresh_ws_url, headers)
+
+        monkeypatch.setattr(manager, "_restart_playwright_and_reconnect", restart)
+        pool.net.down("agent-2")
+        manager.browsers["agent-2"].browser._open = False
+        # A live driver: the browser alone is at fault, nothing restarts.
+        r = pool.client.post("/content", json=CONTENT, headers={"X-Browser-Id": "agent-2"})
+        assert r.status_code == 502
+        assert restarts == []
+        # A dead driver fails every connect: then it is restarted.
+        monkeypatch.setattr(manager, "driver_alive", lambda: False)
+        r = pool.client.post("/content", json=CONTENT, headers={"X-Browser-Id": "agent-2"})
+        assert r.status_code == 200
+        assert r.headers["x-browser-id"] == "agent-2"
+        assert restarts == ["agent-2"]
+        assert manager.is_healthy("agent-2")
 
     def test_healthz_stays_ok_with_one_dead_member(self, pool):
         pool.net.down("agent-2")

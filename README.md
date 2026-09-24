@@ -165,7 +165,7 @@ If the browser restarts (e.g. after installing an extension), the controller **a
 
 One controller drives many browsers. Each call lands on one of them in one of three ways:
 
-1. **Nothing named**: the browser with the fewest open tabs (every tab, including ones a person opened, plus calls still running). Nothing waits or is refused: a browser that cannot be reached is skipped and the next one is tried; `MAX_PAGES_PER_BROWSER` only ranks a busy browser last.
+1. **Nothing named**: the browser with the fewest open tabs (every tab, including ones a person opened, plus calls still running). Nothing waits or is refused: a browser that cannot be reached is skipped and the next one is tried, and one that takes more than a few seconds to connect is passed over until it is up; `MAX_PAGES_PER_BROWSER` only ranks a busy browser last.
 2. **`X-Session-Id`**: the browser the session was started on. No other header is needed.
 3. **`X-Browser-Id: <name>`**, or the path prefix `/browsers/<name>/`: that browser. `POST /parser/browsers/agent-2/content` is exactly `POST /parser/content` with `X-Browser-Id: agent-2`.
 
@@ -175,7 +175,7 @@ Every response for which a browser was chosen carries `X-Browser-Id` naming it.
 
 | Status | When |
 |--------|------|
-| `400` | The path names one browser and `X-Browser-Id` another |
+| `400` | The path names one browser and `X-Browser-Id` another, or `start_session`'s body names another |
 | `404` | The named browser is not in the controller, or the session is unknown (never started, ended, or its browser was removed) |
 | `409` | A named browser contradicts the session's browser |
 | `502` | The named (or session's) browser cannot be reached |

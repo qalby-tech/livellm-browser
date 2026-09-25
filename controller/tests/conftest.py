@@ -154,18 +154,27 @@ class FakePage:
         return None
 
     async def close(self):
+        if self._context.chrome.hung:
+            await _forever()
         if not self.closed:
             self.closed = True
             self._context.pages.remove(self)
 
 
+async def _forever():
+    await asyncio.sleep(3600)
+
+
 class FakeContext:
-    def __init__(self, name):
+    def __init__(self, name, chrome=None):
         self.name = name
+        self.chrome = chrome
         self.pages = []
         self._opened = 0
 
     async def new_page(self):
+        if self.chrome.hung:
+            await _forever()
         self._opened += 1
         page = FakePage(self, f"{self.name}-p{self._opened}")
         self.pages.append(page)
@@ -176,9 +185,13 @@ class FakeChrome:
     def __init__(self, name):
         self.name = name
         self.up = True
+        # Gone without a trace (its pod deleted, the address black-holed):
+        # connections to it still read as connected, but a connect, a new tab
+        # or a close never answers.
+        self.hung = False
         # The Authorization header it requires, if any (a remote browser).
         self.auth = None
-        self.context = FakeContext(name)
+        self.context = FakeContext(name, self)
 
 
 class FakeCdpBrowser:
@@ -193,6 +206,8 @@ class FakeCdpBrowser:
         return self._open and self._chrome.up
 
     async def close(self):
+        if self._chrome.hung:
+            await _forever()
         self._open = False
 
 
@@ -217,6 +232,9 @@ class FakeNet:
     def down(self, name):
         self.chrome(name).up = False
 
+    def hang(self, name):
+        self.chrome(name).hung = True
+
     def open_connections(self, name):
         return [c for c in self.opened if c._chrome.name == name and c._open]
 
@@ -226,6 +244,8 @@ class FakeNet:
         if self.delay.get(name):
             await asyncio.sleep(self.delay[name])
         chrome = self.chrome(name)
+        if chrome.hung:
+            await _forever()
         if not chrome.up:
             raise ConnectionError(f"connect ECONNREFUSED {ws_url}")
         if chrome.auth and (headers or {}).get("Authorization") != chrome.auth:

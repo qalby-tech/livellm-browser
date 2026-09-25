@@ -19,8 +19,18 @@ MAX_PAGES_PER_BROWSER = settings.max_pages_per_browser
 # How long a browser that could not be reached stays out of the pick.
 UNHEALTHY_SECONDS = 30.0
 
-# Closing tabs over a connection whose browser is gone can stall.
-DISCONNECT_TIMEOUT = 10.0
+# Closing tabs over a connection whose browser is gone can stall (a deleted
+# pod's address answers nothing, so the socket never closes). The close runs
+# in the background, bounded by this; no call ever waits for it.
+DISCONNECT_TIMEOUT = 3.0
+
+# A CDP connect that gets no answer gives up after this.
+CONNECT_TIMEOUT = 5.0
+
+# Opening a tab on a connection that still reads as connected but whose
+# browser is gone never returns on its own. After this the connection is
+# dropped and the browser marked unhealthy.
+TAB_TIMEOUT = 5.0
 
 # How long a call that names no browser waits for the one it picked to
 # connect before it tries the next. The connect itself goes on, and the
@@ -78,6 +88,8 @@ class BrowserManager:
         # when it is created, and this object is created at import.
         self._driver_lock: Optional[asyncio.Lock] = None
         self._playwright_pid: Optional[int] = None
+        # Closes of dropped connections still running in the background.
+        self._closing: set = set()
 
     async def start(self, playwright: Playwright):
         """Initialise with a Playwright instance. No auto-connections."""
@@ -158,7 +170,7 @@ class BrowserManager:
             await self.disconnect_browser(browser_id)
 
         logger.info(f"Connecting to browser '{browser_id}' via {ws_url}")
-        browser = await self.playwright.chromium.connect_over_cdp(ws_url, headers=headers or None)
+        browser = await self._cdp_connect(ws_url, headers)
         current = self.browsers.get(browser_id)
         if current is not None and current.ws_url == ws_url and self._alive(current):
             # Another call connected it while this one waited: keep that
@@ -176,26 +188,53 @@ class BrowserManager:
         logger.info(f"Connected to browser '{browser_id}'")
         return info
 
+    async def _cdp_connect(self, ws_url: str, headers: Optional[dict]):
+        """One CDP connect, given up after CONNECT_TIMEOUT."""
+        return await asyncio.wait_for(
+            self.playwright.chromium.connect_over_cdp(ws_url, headers=headers or None),
+            timeout=CONNECT_TIMEOUT,
+        )
+
     async def disconnect_browser(self, browser_id: str) -> bool:
-        """Disconnect a browser and close all its session pages."""
-        if browser_id not in self.browsers:
+        """Drop a browser's connection; its session tabs and the connection
+        are closed in the background (see ``drop_connection``)."""
+        return self.drop_connection(browser_id)
+
+    def drop_connection(self, browser_id: str, info: Optional[BrowserInfo] = None) -> bool:
+        """Forget a browser's connection now and close it in the background.
+
+        With ``info``, only that connection is dropped (a newer one made
+        meanwhile stays). The sessions stay on the browser; a reconnect gives
+        them new tabs. Never waits: a browser that is gone can leave the close
+        hanging, and it is bounded by DISCONNECT_TIMEOUT on its own.
+        """
+        current = self.browsers.get(browser_id)
+        if current is None or (info is not None and current is not info):
             return False
-
-        info = self.browsers.pop(browser_id)
-
-        for page in list(info.pages.values()):
-            try:
-                await page.close()
-            except Exception as e:
-                logger.warning(f"Error closing page in '{browser_id}': {e}")
-
-        try:
-            await info.browser.close()
-        except Exception as e:
-            logger.warning(f"Error closing browser '{browser_id}': {e}")
-
+        del self.browsers[browser_id]
+        task = asyncio.ensure_future(self._close_connection(current))
+        self._closing.add(task)
+        task.add_done_callback(self._closing.discard)
         logger.info(f"Disconnected browser '{browser_id}'")
         return True
+
+    async def _close_connection(self, info: BrowserInfo) -> None:
+        async def close_all():
+            for page in list(info.pages.values()):
+                try:
+                    await page.close()
+                except Exception as e:
+                    logger.warning(
+                        f"Error closing a tab of '{info.browser_id}': {type(e).__name__}: {e}"
+                    )
+            await info.browser.close()
+
+        try:
+            await asyncio.wait_for(close_all(), timeout=DISCONNECT_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"Error disconnecting '{info.browser_id}': {type(e).__name__}: {e}")
 
     async def remove_browser(self, browser_id: str) -> bool:
         """Disconnect a browser for good: its sessions end with it.
@@ -206,13 +245,24 @@ class BrowserManager:
         for sid in [s for s, b in self.sessions.items() if b == browser_id]:
             del self.sessions[sid]
         self._unhealthy_until.pop(browser_id, None)
-        present = browser_id in self.browsers
+        return self.drop_connection(browser_id)
+
+    async def open_tab(self, info: BrowserInfo) -> Page:
+        """Open a tab on ``info``, given up after TAB_TIMEOUT.
+
+        A failure marks the browser unhealthy and drops the connection (a
+        connection that reads as alive to a browser that is gone would
+        otherwise be handed out again), then raises.
+        """
         try:
-            await asyncio.wait_for(self.disconnect_browser(browser_id), timeout=DISCONNECT_TIMEOUT)
+            return await asyncio.wait_for(info.context.new_page(), timeout=TAB_TIMEOUT)
         except Exception as e:
-            logger.warning(f"Error disconnecting '{browser_id}': {e}")
-            self.browsers.pop(browser_id, None)
-        return present
+            logger.warning(
+                f"Could not open a tab on '{info.browser_id}': {type(e).__name__}: {e}"
+            )
+            self.mark_unhealthy(info.browser_id)
+            self.drop_connection(info.browser_id, info)
+            raise
 
     # ── lookup helpers ───────────────────────────────────────
 
@@ -417,7 +467,7 @@ class BrowserManager:
             self.mark_healthy(browser_id)
             return info
         except Exception as e:
-            logger.warning(f"Level-1 connect failed for '{browser_id}': {e}")
+            logger.warning(f"Level-1 connect failed for '{browser_id}': {type(e).__name__}: {e}")
             # With a live driver the fault is this browser (not ready,
             # offline, gone). Restarting the driver would drop every other
             # browser's connection and tabs, so fail this one alone.
@@ -445,16 +495,11 @@ class BrowserManager:
     async def _reconnect_same_driver(
         self, browser_id: str, ws_url: str, headers: Optional[dict] = None
     ) -> BrowserInfo:
-        """Disconnect stale entry and open a fresh CDP connection."""
-        try:
-            await asyncio.wait_for(
-                self.disconnect_browser(browser_id), timeout=DISCONNECT_TIMEOUT
-            )
-        except Exception as e:
-            logger.warning(f"Error disconnecting '{browser_id}': {e}")
-            self.browsers.pop(browser_id, None)
+        """Drop the stale entry (closed in the background) and open a fresh
+        CDP connection, bounded by CONNECT_TIMEOUT."""
+        self.drop_connection(browser_id)
 
-        browser = await self.playwright.chromium.connect_over_cdp(ws_url, headers=headers or None)
+        browser = await self._cdp_connect(ws_url, headers)
         context = (
             browser.contexts[0] if browser.contexts
             else await browser.new_context()
@@ -546,7 +591,7 @@ class BrowserManager:
                 if dead:
                     info.pages.pop(sid, None)
                     try:
-                        await page.close()
+                        await asyncio.wait_for(page.close(), timeout=DISCONNECT_TIMEOUT)
                     except Exception:
                         pass
                     closed += 1
@@ -557,21 +602,13 @@ class BrowserManager:
     async def shutdown(self, timeout: float = 25.0):
         """Disconnect all browsers."""
         logger.info("Starting browser manager shutdown…")
-        for task in list(self._connecting.values()):
+        for task in list(self._connecting.values()) + list(self._closing):
             task.cancel()
 
         async def _shutdown():
             for bid in list(self.browsers.keys()):
                 info = self.browsers[bid]
-                for page in list(info.pages.values()):
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
-                try:
-                    await info.browser.close()
-                except Exception:
-                    pass
+                await self._close_connection(info)
             self.browsers.clear()
             logger.info("All browsers disconnected")
 

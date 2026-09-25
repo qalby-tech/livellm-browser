@@ -476,3 +476,82 @@ class TestDeadMember:
         assert pool.client.get("/healthz").status_code == 200
         pool.net.down("agent-1")
         assert pool.client.get("/healthz").status_code == 503
+
+
+class TestGoneMember:
+    """A browser deleted while still in the registry: its pod is gone and its
+    address answers nothing, so the open connection still reads as connected
+    while a new tab, a close or a connect never returns."""
+
+    @pytest.fixture
+    def quick(self, monkeypatch):
+        monkeypatch.setattr("core.browser.TAB_TIMEOUT", 0.3)
+        monkeypatch.setattr("core.browser.CONNECT_TIMEOUT", 0.3)
+        monkeypatch.setattr("core.browser.PICK_CONNECT_WAIT", 0.3)
+        monkeypatch.setattr("core.browser.DISCONNECT_TIMEOUT", 0.3)
+
+    def test_unnamed_call_is_answered_by_another_member(self, pool, quick):
+        pool.net.chrome("agent-1").context.pages.append(object())  # agent-2 is tried first
+        pool.net.hang("agent-2")
+        began = time.monotonic()
+        r = pool.client.post("/content", json=CONTENT)
+        assert r.status_code == 200, r.text
+        assert r.headers["x-browser-id"] == "agent-1"
+        assert time.monotonic() - began < 1.5
+        # Its connection was dropped and it is out of the pick for a while.
+        assert "agent-2" not in pool.manager.browsers
+        by_id = {b["browser_id"]: b for b in pool.client.get("/browsers").json()}
+        assert by_id["agent-2"]["healthy"] is False
+        for _ in range(3):
+            began = time.monotonic()
+            r = pool.client.post("/content", json=CONTENT)
+            assert r.headers["x-browser-id"] == "agent-1"
+            assert time.monotonic() - began < 0.25
+        assert pool.manager._in_flight == {}
+
+    def test_unnamed_session_start_goes_to_another_member(self, pool, quick):
+        pool.net.chrome("agent-1").context.pages.append(object())
+        pool.net.hang("agent-2")
+        began = time.monotonic()
+        _, browser = start(pool)
+        assert browser == "agent-1"
+        assert time.monotonic() - began < 1.5
+
+    def test_connect_that_never_answers_is_skipped(self, pool, quick):
+        pool.net.chrome("agent-1").context.pages.append(object())
+        pool.net.hang("agent-2")
+        pool.manager.browsers.pop("agent-2")  # not connected: the connect itself hangs
+        began = time.monotonic()
+        r = pool.client.post("/content", json=CONTENT)
+        assert r.headers["x-browser-id"] == "agent-1"
+        assert time.monotonic() - began < 1.0
+
+    def test_named_gone_member_is_502_in_bounded_time(self, pool, quick):
+        pool.net.hang("agent-2")
+        began = time.monotonic()
+        r = pool.client.post("/content", json=CONTENT, headers={"X-Browser-Id": "agent-2"})
+        assert r.status_code == 502
+        assert time.monotonic() - began < 2.0
+
+    def test_gone_member_leaving_the_registry_holds_no_call_up(self, pool, monkeypatch):
+        # Its close would hang for good; dropping it must not wait for that.
+        monkeypatch.setattr("core.browser.DISCONNECT_TIMEOUT", 30)
+        start(pool, **{"X-Browser-Id": "agent-2"})
+        pool.net.hang("agent-2")
+        pool.set_registry("agent-1")
+        began = time.monotonic()
+        r = pool.client.post("/content", json=CONTENT)
+        assert r.headers["x-browser-id"] == "agent-1"
+        assert time.monotonic() - began < 0.5
+        assert list(pool.manager.browsers) == ["agent-1"]
+        assert pool.manager.sessions == {}
+
+    def test_disconnect_error_is_logged_with_its_type(self, pool, quick, caplog):
+        pool.net.hang("agent-2")
+        pool.set_registry("agent-1")
+        with caplog.at_level("WARNING", logger="core.browser"):
+            pool.client.post("/content", json=CONTENT)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and "Error disconnecting" not in caplog.text:
+                time.sleep(0.05)
+        assert "Error disconnecting 'agent-2': TimeoutError" in caplog.text

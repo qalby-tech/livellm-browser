@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from core.browser import browser_manager
 from core.dependencies import (
-    SessionIdDep, BrowserIdDep, browser_pool, open_page, resolve_browser, session_owner,
+    SessionIdDep, BrowserIdDep, browser_pool, close_page, resolve_page, session_owner,
 )
 from core.registry import managed
 from models.requests import ConnectBrowserRequest, StartSessionRequest
@@ -109,8 +109,7 @@ async def start_session(
             status_code=400,
             detail=f"The body names browser '{body.browser_id}' but the call names '{browser_id}'.",
         )
-    browser_info = await resolve_browser(request, browser_id or body.browser_id)
-    browser_info, page = await open_page(browser_manager, browser_info)
+    browser_info, page = await resolve_page(request, browser_id or body.browser_id)
 
     session_id = str(uuid.uuid4())
     browser_manager.add_session(browser_info.browser_id, session_id, page)
@@ -139,9 +138,5 @@ async def end_session(
 
     page = browser_manager.end_session(session_id)
     if page:
-        try:
-            await page.close()
-            logger.info(f"Closed page for session {session_id}")
-        except Exception as e:
-            logger.warning(f"Error closing page for session {session_id}: {e}")
+        await close_page(page, f"the tab of session {session_id}")
     return {"status": "success", "message": f"Session {session_id} ended", "browser_id": owner}

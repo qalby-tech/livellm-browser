@@ -34,6 +34,10 @@ logger.addHandler(_handler)
 # ==================== Background Tasks ====================
 
 STALE_PAGE_CLEANUP_INTERVAL = 60  # seconds between cleanup sweeps
+# Seconds between registry reads when no call comes in (a stat of the file;
+# the file is re-read only when it changed). A browser that left is dropped
+# within this, not at the next call or cleanup sweep.
+REGISTRY_SYNC_INTERVAL = 5
 
 
 async def _stale_page_cleanup_loop():
@@ -44,19 +48,25 @@ async def _stale_page_cleanup_loop():
     driver eventually OOM-crashes (``FATAL ERROR: Ineffective mark-compacts
     near heap limit``), killing every connection.
 
-    Also lets go of browsers that left the registry while no call came in.
+    Also lets go of browsers that left the registry while no call came in,
+    every REGISTRY_SYNC_INTERVAL seconds.
     """
+    loop = asyncio.get_running_loop()
+    next_cleanup = loop.time() + STALE_PAGE_CLEANUP_INTERVAL
     try:
         while True:
-            await asyncio.sleep(STALE_PAGE_CLEANUP_INTERVAL)
-            try:
-                await browser_manager.cleanup_stale_pages()
-            except Exception as e:
-                logger.warning(f"Stale page cleanup failed: {e}")
+            await asyncio.sleep(REGISTRY_SYNC_INTERVAL)
             try:
                 await browser_pool(browser_manager)
             except Exception as e:
-                logger.warning(f"Registry sync failed: {e}")
+                logger.warning(f"Registry sync failed: {type(e).__name__}: {e}")
+            if loop.time() < next_cleanup:
+                continue
+            next_cleanup = loop.time() + STALE_PAGE_CLEANUP_INTERVAL
+            try:
+                await browser_manager.cleanup_stale_pages()
+            except Exception as e:
+                logger.warning(f"Stale page cleanup failed: {type(e).__name__}: {e}")
     except asyncio.CancelledError:
         pass
 

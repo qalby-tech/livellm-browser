@@ -420,7 +420,7 @@ func (s *profileStore) ensureDirs() error {
 func (s *profileStore) tryLock() bool { return s.busy.TryLock() }
 
 func (s *profileStore) manifest(ctx context.Context) Manifest {
-	m := Manifest{CreatedAt: time.Now().UTC().Format(time.RFC3339)}
+	m := Manifest{CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
 	if v, err := s.k.launcher.version(ctx); err == nil {
 		m.ChromeVersion, m.ChromeMajor, m.ImageVersion = v.Chrome, v.ChromeMajor, v.Image
 	}

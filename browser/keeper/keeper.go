@@ -619,6 +619,10 @@ func (k *Keeper) run(ctx context.Context) {
 		case <-tick.C:
 			k.mu.Lock()
 			due := !k.nextRotationAt.IsZero() && !k.now().Before(k.nextRotationAt)
+			if due && k.cfg != nil {
+				// Moved on now, so a slow or refused rotation is not retried every tick.
+				k.nextRotationAt = k.now().Add(time.Duration(k.cfg.Rotation.EveryMinutes) * time.Minute)
+			}
 			k.mu.Unlock()
 			if due {
 				go k.rotate(ctx, "")

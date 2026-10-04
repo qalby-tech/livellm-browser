@@ -66,7 +66,8 @@ def _default_browser_config_from_env():
         except json.JSONDecodeError:
             logger.warning("BROWSER_EXTENSIONS is not a JSON list; ignoring")
 
-    # The platform proxy (bypass entries ignored: each would go out directly).
+    # The platform proxy (through the sidecar's relay, bypass entries are
+    # ignored: each would go out directly).
     proxy = None
     cfg = platform_proxy_config()
     if cfg:
@@ -322,6 +323,10 @@ async def version(request: Request) -> dict:
         "pid": None if (info is None or paused) else _chrome_pid(info.chrome_port),
         "startedAt": None if info is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(info.started_at)),
         "paused": paused,
+        # The browser container's settings, for the profile manifest (the
+        # sidecar's own environment has none of them).
+        "timezone": os.environ.get("TZ") or "",
+        "locale": (os.environ.get("BROWSER_LOCALE") or "").strip(),
     }
 
 

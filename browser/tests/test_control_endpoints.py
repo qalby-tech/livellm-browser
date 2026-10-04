@@ -66,12 +66,20 @@ async def test_ipv6_loopback_is_local(fake_manager):
 
 
 async def test_version(fake_manager, monkeypatch):
+    monkeypatch.delenv("TZ", raising=False)
+    monkeypatch.delenv("BROWSER_LOCALE", raising=False)
     monkeypatch.setattr(launch, "_chrome_pid", lambda port: 777 if port == 4321 else None)
     async with client() as c:
         v = (await c.get("/version", headers=LOCAL)).json()
     assert v["chrome"] == "154.0.8037.57" and v["chromeMajor"] == 154
     assert v["image"] == "2.3.0" and v["pid"] == 777
     assert v["startedAt"] == "2023-11-14T22:13:20Z"
+    assert v["timezone"] == "" and v["locale"] == ""
+    monkeypatch.setenv("TZ", "Europe/Moscow")
+    monkeypatch.setenv("BROWSER_LOCALE", "ru-RU")
+    async with client() as c:
+        v = (await c.get("/version", headers=LOCAL)).json()
+    assert v["timezone"] == "Europe/Moscow" and v["locale"] == "ru-RU"
 
 
 def test_chrome_pid_skips_renderers(tmp_path):

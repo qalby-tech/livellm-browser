@@ -1,5 +1,6 @@
 """The single launch-preparation function: env, prefs, flags, geolocation."""
 import json
+import shutil
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -108,12 +109,19 @@ def test_webrtc_policy_with_a_platform_proxy(tmp_path):
     assert kw["proxy"] == {"server": "http://127.0.0.1:3128"}
 
 
-def test_platform_proxy_ignores_bypass(monkeypatch):
+def test_platform_proxy_ignores_bypass_through_the_relay(monkeypatch):
     monkeypatch.setenv("BROWSER_PROXY_SERVER", "http://127.0.0.1:3128")
     monkeypatch.setenv("BROWSER_PROXY_BYPASS", "*.example.com")
     assert lp.platform_proxy_config() == {"server": "http://127.0.0.1:3128"}
     monkeypatch.delenv("BROWSER_PROXY_SERVER")
     assert lp.platform_proxy_config() is None
+
+
+@pytest.mark.parametrize("server", ["http://proxy.internal:3128", "http://127.0.0.1:8080", "socks5://10.0.0.5:1080"])
+def test_any_other_proxy_keeps_its_bypass(monkeypatch, server):
+    monkeypatch.setenv("BROWSER_PROXY_SERVER", server)
+    monkeypatch.setenv("BROWSER_PROXY_BYPASS", "internal.svc")
+    assert lp.platform_proxy_config() == {"server": server, "bypass": "internal.svc"}
 
 
 def test_locales_table_shape():
@@ -226,3 +234,47 @@ async def test_auto_resume_at_max_seconds(tmp_path, launch_env, monkeypatch):
     await asyncio.sleep(0.2)
     assert not m.paused("default")
     assert len(calls) == 2
+
+
+# ── extensions on every launch path ──
+
+def _cached_extension(root: Path, ext_id: str) -> Path:
+    cache = root / "cache" / ext_id
+    cache.mkdir(parents=True)
+    (cache / "manifest.json").write_text(json.dumps({"name": ext_id, "version": "1.2"}))
+    return cache
+
+
+async def test_extensions_put_back_after_a_profile_swap(tmp_path, launch_env, monkeypatch):
+    from core import local_browser as lb
+    m, calls = launch_env
+    monkeypatch.setattr("core.local_browser.PROFILES_DIR", tmp_path)
+    cache = _cached_extension(tmp_path, "extx")
+    monkeypatch.setattr("core.local_browser.download_extension", AsyncMock(return_value=cache))
+    await m.create_browser(profile_uid="default", extensions=["extx"])
+    profile = tmp_path / "default"
+    assert lb.extension_installed("extx", profile)
+
+    # A restore/import swaps in a profile without it, then resumes.
+    await m.pause_browser("default", 30)
+    shutil.rmtree(profile)
+    (profile / "Default").mkdir(parents=True)
+    (profile / "Default" / "Preferences").write_text(json.dumps({"from": "elsewhere"}))
+    await m.resume_browser("default")
+    assert lb.extension_installed("extx", profile)
+    assert prefs_of(profile)["from"] == "elsewhere"
+
+    # Present (here recorded only in Secure Preferences, where Chrome keeps
+    # it): left alone, Secure Preferences not reset.
+    p = prefs_of(profile)
+    p["extensions"]["settings"].pop("extx")
+    (profile / "Default" / "Preferences").write_text(json.dumps(p))
+    (profile / "Default" / "Secure Preferences").write_text(json.dumps({"extensions": {"settings": {"extx": {"state": 0}}}}))
+    await m.restart_browser("default")
+    assert (profile / "Default" / "Secure Preferences").exists()
+    assert "extx" not in prefs_of(profile)["extensions"]["settings"]
+
+    # Removed by the person: never put back.
+    await m.restart_browser("default", remove_extensions=["extx"])
+    await m.restart_browser("default")
+    assert not lb.extension_installed("extx", profile)

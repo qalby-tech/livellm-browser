@@ -3,7 +3,9 @@
 Boot (create_browser), restart, the watchdog relaunch, a driver recovery and
 a resume after a pause all call ``prepare_launch``. No launch setting may live
 on one path only: a restart that forgot the locale or the WebRTC policy would
-quietly undo what the person chose.
+quietly undo what the person chose. The browser's extensions are put back
+on every relaunch the same way (``LocalBrowserManager._ensure_extensions``,
+run right before this), since a restored or imported profile may lack them.
 
 Settings come from the pod's environment (the platform renders them on the
 Browser):
@@ -21,6 +23,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Mapping, Optional
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -246,11 +249,26 @@ def prepare_launch(
     return kwargs
 
 
+# The control sidecar's relay (spec.proxy the platform renders for a browser
+# with proxies).
+RELAY_HOSTS = ("127.0.0.1", "localhost", "::1")
+RELAY_PORT = 3128
+
+
+def is_keeper_relay(server: str) -> bool:
+    try:
+        u = urlsplit(server if "://" in server else f"http://{server}")
+        return (u.hostname or "") in RELAY_HOSTS and u.port == RELAY_PORT
+    except ValueError:
+        return False
+
+
 def platform_proxy_config() -> Optional[dict]:
     """The proxy the platform set on the pod, if any.
 
-    With a platform proxy, bypass entries are ignored: every bypassed host
-    would go out directly, around the proxy the person chose.
+    Through the control sidecar's relay, bypass entries are ignored: every
+    bypassed host would go out directly, around the proxies the person
+    chose. Any other proxy keeps its bypass list as before.
     """
     server = (os.environ.get("BROWSER_PROXY_SERVER") or "").strip()
     if not server:
@@ -260,4 +278,7 @@ def platform_proxy_config() -> Optional[dict]:
         cfg["username"] = os.environ["BROWSER_PROXY_USERNAME"]
     if os.environ.get("BROWSER_PROXY_PASSWORD"):
         cfg["password"] = os.environ["BROWSER_PROXY_PASSWORD"]
+    bypass = (os.environ.get("BROWSER_PROXY_BYPASS") or "").strip()
+    if bypass and not is_keeper_relay(server):
+        cfg["bypass"] = bypass
     return cfg

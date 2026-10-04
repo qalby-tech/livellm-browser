@@ -208,6 +208,29 @@ def set_extension_enabled(extension_id: str, profile_path: Path, enabled: bool):
     logger.info(f"Extension {extension_id} {state_str} in Preferences")
 
 
+def extension_installed(extension_id: str, profile_path: Path) -> bool:
+    """Whether the profile has the extension's files AND Chrome's record of it
+    (in Preferences, or in Secure Preferences once Chrome moved it there). A
+    disabled extension is installed: its state is the person's choice."""
+    default_dir = profile_path / "Default"
+    ext_dir = default_dir / "Extensions" / extension_id
+    try:
+        if not any((v / "manifest.json").is_file() for v in ext_dir.iterdir() if v.is_dir()):
+            return False
+    except OSError:
+        return False
+    for name in ("Preferences", "Secure Preferences"):
+        try:
+            with open(default_dir / name, "r", encoding="utf-8") as f:
+                prefs = json.load(f)
+        except (OSError, ValueError):
+            continue
+        settings = (prefs.get("extensions") or {}).get("settings") or {}
+        if isinstance(settings, dict) and extension_id in settings:
+            return True
+    return False
+
+
 def list_profile_extensions(profile_path: Path) -> list[dict]:
     """List extensions installed in a profile, including their enabled/disabled state."""
     default_dir = profile_path / "Default"
@@ -372,6 +395,9 @@ class LocalBrowserManager:
         # browser_id -> monotonic deadline, plus the auto-resume timers.
         self._paused_until: dict[str, float] = {}
         self._resume_timers: dict[str, asyncio.Task] = {}
+        # The extensions each browser was given (id -> unpacked copy). Every
+        # launch puts back any of them a restored or imported profile lacks.
+        self._extensions: dict[str, dict[str, Path]] = {}
 
     async def start(self, playwright: Playwright, extensions: Optional[List[str]] = None, proxy=None, cookies: Optional[List[dict]] = None):
         """Initialize with a Playwright instance and create the default browser.
@@ -563,12 +589,15 @@ class LocalBrowserManager:
             # Download and inject extensions into the profile BEFORE Chrome launches
             if extensions and profile_path:
                 profile_path.mkdir(parents=True, exist_ok=True)
+                given: dict[str, Path] = {}
                 for ext_id in extensions:
                     try:
                         cache_path = await download_extension(ext_id)
                         inject_extension_into_profile(ext_id, cache_path, profile_path)
+                        given[ext_id] = cache_path
                     except Exception as e:
                         logger.error(f"Failed to inject extension {ext_id}: {e}")
+                self._extensions[browser_id] = given
 
             # Build proxy config. A platform proxy (set on the pod) always wins:
             # a launcher caller can't point a browser around it.
@@ -667,6 +696,7 @@ class LocalBrowserManager:
             closed = await self._close_browser_locked(browser_id)
         if closed:
             self._browser_locks.pop(browser_id, None)
+            self._extensions.pop(browser_id, None)
         return closed
 
     async def _close_browser_locked(self, browser_id: str) -> bool:
@@ -710,6 +740,7 @@ class LocalBrowserManager:
         the profile on disk to a registered-ready LocalBrowserInfo.
         """
         cleanup_profile_locks(profile_path)
+        self._ensure_extensions(browser_id, profile_path)
 
         chrome_port, chrome_sock = get_free_port()
 
@@ -743,6 +774,27 @@ class LocalBrowserManager:
         info = LocalBrowserInfo(browser, context, proxy_port, ws_endpoint, cdp_proxy, profile_path, is_ephemeral, proxy_config)
         info.chrome_port = chrome_port
         return info
+
+    def _ensure_extensions(self, browser_id: str, profile_path: Optional[Path]) -> None:
+        """Put back the browser's extensions that its profile lacks.
+
+        A restored snapshot, an imported or a copied profile may come from a
+        browser without them. One already there is left alone (injecting
+        resets Secure Preferences, and its enabled state is the person's).
+        """
+        if profile_path is None:
+            return
+        for ext_id, cache_path in (self._extensions.get(browser_id) or {}).items():
+            if extension_installed(ext_id, profile_path):
+                continue
+            if not (cache_path / "manifest.json").is_file():
+                logger.warning(f"Extension {ext_id} is missing from the profile and its copy is gone")
+                continue
+            try:
+                inject_extension_into_profile(ext_id, cache_path, profile_path)
+                logger.info(f"Put extension {ext_id} back into browser '{browser_id}'")
+            except Exception as e:
+                logger.error(f"Failed to put extension {ext_id} back: {e}")
 
     # ── Deliberate pause (the control sidecar copies the profile) ──
 
@@ -889,9 +941,11 @@ class LocalBrowserManager:
             if inject_extensions:
                 for ext_id, cache_path in inject_extensions:
                     inject_extension_into_profile(ext_id, cache_path, profile_path)
+                    self._extensions.setdefault(browser_id, {})[ext_id] = cache_path
             if remove_extensions:
                 for ext_id in remove_extensions:
                     remove_extension_from_profile(ext_id, profile_path)
+                    self._extensions.get(browser_id, {}).pop(ext_id, None)
             if toggle_extensions:
                 for ext_id, enabled in toggle_extensions:
                     set_extension_enabled(ext_id, profile_path, enabled)

@@ -62,6 +62,7 @@ type Keeper struct {
 	// Overridable for tests.
 	probeEvery   time.Duration
 	rotateProbe  time.Duration // how long a rotation waits for a new IP
+	changeProbe  time.Duration // the same after a change-IP call
 	probePoll    time.Duration
 	changeClient *http.Client
 }
@@ -78,7 +79,8 @@ func newKeeper(secretDir, statePath string, relayRequired bool, launcherURL stri
 		lastChangeIP:  map[string]int64{},
 		creds:         Creds{},
 		probeEvery:    10 * time.Minute,
-		rotateProbe:   90 * time.Second,
+		rotateProbe:   25 * time.Second, // + the swap: a rotation answers within 30 s
+		changeProbe:   85 * time.Second, // + the 30 s change-IP call: within 120 s
 		probePoll:     3 * time.Second,
 	}
 	k.rl = &relay{onError: k.setError}
@@ -98,6 +100,13 @@ func (k *Keeper) initialMode() string {
 		return "waiting"
 	}
 	return "direct"
+}
+
+// swapRouteLocked installs a new route. What the last probe saw belongs to
+// the old exit, so it is cleared until the new one is measured.
+func (k *Keeper) swapRouteLocked(r *route) {
+	k.rl.swap(r)
+	k.exitIP, k.country, k.measuredAt = "", "", time.Time{}
 }
 
 func (k *Keeper) setError(code string) {
@@ -244,7 +253,7 @@ func (k *Keeper) applyLocked(cfg *Config, creds Creds, probe bool) error {
 	cur := k.rl.route()
 	if cur == nil || cur.mode != mode || !sameUpstream(cur.up, up) || !reflect.DeepEqual(cur.login, login) {
 		k.generation++
-		k.rl.swap(newRoute(k.generation, mode, up, login, k.g))
+		k.swapRouteLocked(newRoute(k.generation, mode, up, login, k.g))
 	}
 	if c.Rotation.Mode == "interval" && mode == "proxy" {
 		base := k.lastRotation
@@ -389,7 +398,7 @@ func (k *Keeper) rotate(ctx context.Context, to string) (Status, *apiErr) {
 	k.generation++
 	login := k.creds.login(up.Name)
 	upc := up
-	k.rl.swap(newRoute(k.generation, "proxy", &upc, login, k.g))
+	k.swapRouteLocked(newRoute(k.generation, "proxy", &upc, login, k.g))
 	k.lastRotation = k.now().Unix()
 	k.rotatedAt = k.now()
 	if k.cfg.Rotation.Mode == "interval" {
@@ -398,22 +407,29 @@ func (k *Keeper) rotate(ctx context.Context, to string) (Status, *apiErr) {
 	k.saveLocked()
 	k.mu.Unlock()
 
-	// Probe until the exit changes or the wait runs out (not fatal).
-	deadline := k.now().Add(k.rotateProbe)
+	// Probe until the exit changes or the wait runs out (not fatal). The
+	// probes themselves end at the deadline too.
+	wait := k.rotateProbe
+	if changeURL != "" {
+		wait = k.changeProbe
+	}
+	deadline := k.now().Add(wait)
+	pctx, pcancel := context.WithDeadline(ctx, deadline)
+	defer pcancel()
 	for {
-		k.probeOnce(ctx, false)
+		k.probeOnce(pctx, false)
 		st := k.status()
 		if st.ExitIP != "" && st.ExitIP != prevIP {
 			break
 		}
-		if !k.now().Before(deadline) || ctx.Err() != nil {
+		if !k.now().Before(deadline) || pctx.Err() != nil {
 			if st.LastError == "" {
 				k.setError("exit_ip_unchanged")
 			}
 			break
 		}
 		select {
-		case <-ctx.Done():
+		case <-pctx.Done():
 		case <-time.After(k.probePoll):
 		}
 	}
@@ -522,6 +538,7 @@ func (k *Keeper) probeOnce(ctx context.Context, failover bool) {
 		return
 	}
 	defer k.probing.Store(false)
+	parent := ctx
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	code := ""
@@ -553,6 +570,9 @@ func (k *Keeper) probeOnce(ctx context.Context, failover bool) {
 				res = pr
 			}
 		}
+	}
+	if parent.Err() != nil {
+		return // the caller stopped waiting: not a measurement
 	}
 	k.mu.Lock()
 	if k.rl.route() != r {
@@ -595,7 +615,7 @@ func (k *Keeper) failover(failed *route) {
 	k.current = (k.current + 1) % len(k.cfg.Upstreams)
 	up := k.cfg.Upstreams[k.current]
 	k.generation++
-	k.rl.swap(newRoute(k.generation, "proxy", &up, k.creds.login(up.Name), k.g))
+	k.swapRouteLocked(newRoute(k.generation, "proxy", &up, k.creds.login(up.Name), k.g))
 	k.saveLocked()
 	go k.probeOnce(context.Background(), false)
 }

@@ -25,6 +25,8 @@ type launcherVersion struct {
 	Chrome      string `json:"chrome"`
 	ChromeMajor int    `json:"chromeMajor"`
 	Image       string `json:"image"`
+	Timezone    string `json:"timezone"`
+	Locale      string `json:"locale"`
 }
 
 func (l *launcherClient) do(ctx context.Context, method, path string, body any, out any) error {

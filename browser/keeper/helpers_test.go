@@ -261,6 +261,8 @@ type fakeLauncher struct {
 	pauses, resumes atomic.Int64
 	cookies         atomic.Int64
 	major           int
+	tz, locale      string
+	failPause       atomic.Bool
 	srv             *httptest.Server
 }
 
@@ -268,11 +270,15 @@ func startLauncher(t *testing.T) *fakeLauncher {
 	fl := &fakeLauncher{major: 154}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /version", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"chrome": fmt.Sprintf("%d.0.8037.57", fl.major), "chromeMajor": fl.major, "image": "2.3.0"})
+		json.NewEncoder(w).Encode(map[string]any{"chrome": fmt.Sprintf("%d.0.8037.57", fl.major), "chromeMajor": fl.major, "image": "2.3.0", "timezone": fl.tz, "locale": fl.locale})
 	})
 	mux.HandleFunc("POST /browsers/default/pause", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Livellm-Keeper") != "1" {
 			w.WriteHeader(403)
+			return
+		}
+		if fl.failPause.Load() {
+			w.WriteHeader(503)
 			return
 		}
 		fl.pauses.Add(1)
@@ -323,6 +329,7 @@ func (e *env) start(relay bool) {
 	e.k = newKeeper(e.secretDir, filepath.Join(e.runDir, "state.json"), relay, e.launcher.srv.URL)
 	e.k.g.ownIPs = func() []net.IP { return nil }
 	e.k.rotateProbe = 2 * time.Second
+	e.k.changeProbe = 2 * time.Second
 	e.k.probePoll = 50 * time.Millisecond
 	e.k.boot()
 	e.p = newProfileStore(e.profiles, e.k, 10, 64)

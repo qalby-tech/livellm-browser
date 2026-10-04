@@ -24,6 +24,10 @@ type server_ struct {
 
 const maxJSONBody = 1 << 20
 
+// Cookies come in batches of up to 5 MiB (tenant-api's own limit); its
+// re-encoding may add a little, hence the slack.
+const maxCookiesBody = 6 << 20
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -42,10 +46,15 @@ func writeErr(w http.ResponseWriter, err error) {
 
 // signed reads the body (unless streamed) and checks the signature.
 func (s *server_) signed(h func(w http.ResponseWriter, r *http.Request, body []byte)) http.HandlerFunc {
-	return s.signedOpts(false, h)
+	return s.signedOpts(false, maxJSONBody, h)
 }
 
-func (s *server_) signedOpts(stream bool, h func(w http.ResponseWriter, r *http.Request, body []byte)) http.HandlerFunc {
+// signedBig is signed with its own body cap.
+func (s *server_) signedBig(max int, h func(w http.ResponseWriter, r *http.Request, body []byte)) http.HandlerFunc {
+	return s.signedOpts(false, max, h)
+}
+
+func (s *server_) signedOpts(stream bool, max int, h func(w http.ResponseWriter, r *http.Request, body []byte)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ks := s.k.keys.Load()
 		if ks == nil {
@@ -55,8 +64,8 @@ func (s *server_) signedOpts(stream bool, h func(w http.ResponseWriter, r *http.
 		var body []byte
 		hash := unsignedTag
 		if !stream {
-			b, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBody+1))
-			if err != nil || len(b) > maxJSONBody {
+			b, err := io.ReadAll(io.LimitReader(r.Body, int64(max)+1))
+			if err != nil || len(b) > max {
 				writeJSON(w, 413, map[string]string{"code": "too_large"})
 				return
 			}
@@ -95,8 +104,8 @@ func (s *server_) routes() http.Handler {
 	}))
 	mux.HandleFunc("POST /v1/profile/snapshots/{id}/restore", s.signed(s.restore))
 	mux.HandleFunc("POST /v1/profile/export", s.signed(s.export))
-	mux.HandleFunc("POST /v1/profile/import", s.signedOpts(true, s.importProfile))
-	mux.HandleFunc("POST /v1/cookies", s.signed(s.cookies))
+	mux.HandleFunc("POST /v1/profile/import", s.signedOpts(true, 0, s.importProfile))
+	mux.HandleFunc("POST /v1/cookies", s.signedBig(maxCookiesBody, s.cookies))
 	return mux
 }
 
@@ -239,8 +248,14 @@ func (s *server_) export(w http.ResponseWriter, r *http.Request, body []byte) {
 		w.WriteHeader(200)
 		started = true
 	})
-	if err != nil && !started {
-		writeErr(w, err)
+	if err != nil {
+		if !started {
+			writeErr(w, err)
+			return
+		}
+		// The 200 is out: a clean end would pass a cut or empty file off as
+		// the whole profile. Reset the connection so the caller sees a failure.
+		panic(http.ErrAbortHandler)
 	}
 }
 

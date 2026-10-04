@@ -35,6 +35,7 @@ func main() {
 	k := newKeeper(secretDir, runDir+"/state.json", relayRequired, launcher)
 	k.boot()
 	p := newProfileStore(profiles, k, maxSnaps, maxArchive)
+	p.startSweep()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()

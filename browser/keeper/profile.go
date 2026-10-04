@@ -307,6 +307,9 @@ func extractArchive(r io.Reader, dst string, o extractOpts) (*Manifest, error) {
 			}
 			if dir := path.Dir(rel); dir != "." {
 				if err := mkdirNoFollow(dst, dir); err != nil {
+					if isNoSpace(err) {
+						return nil, errNoRoom
+					}
 					return nil, errBadArchive
 				}
 			}
@@ -398,6 +401,49 @@ func newProfileStore(root string, k *Keeper, maxSnaps int, maxArchiveMiB int64) 
 	}
 }
 
+// sweep removes what a profile change cut short by a keeper or pod restart
+// left on the disk: the replaced profile in trash/, unpacked staging dirs,
+// half-written files, temporary export snapshots and sealed snapshots whose
+// listing entry was never written. Run once at start, before any change.
+func (s *profileStore) sweep() {
+	if ents, err := os.ReadDir(s.meta); err == nil {
+		for _, e := range ents {
+			name := e.Name()
+			if (name == "trash" && e.IsDir()) || strings.HasPrefix(name, "staging-") {
+				os.RemoveAll(filepath.Join(s.meta, name))
+			}
+		}
+	}
+	ents, err := os.ReadDir(s.snapDir())
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		name := e.Name()
+		p := filepath.Join(s.snapDir(), name)
+		switch {
+		case !e.Type().IsRegular():
+		case strings.HasSuffix(name, ".partial"), strings.HasPrefix(name, "tmp-export-"):
+			os.Remove(p)
+		case strings.HasSuffix(name, ".llcprofile.age"):
+			id := strings.TrimSuffix(name, ".llcprofile.age")
+			if _, err := os.Lstat(filepath.Join(s.snapDir(), id+".json")); os.IsNotExist(err) {
+				os.Remove(p)
+			}
+		}
+	}
+}
+
+// startSweep holds the profile lock while sweep runs in the background, so
+// a big leftover never holds up the keeper's start and no change races it.
+func (s *profileStore) startSweep() {
+	s.busy.Lock()
+	go func() {
+		defer s.busy.Unlock()
+		s.sweep()
+	}()
+}
+
 func freeBytes(p string) int64 {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(p, &st); err != nil {
@@ -423,12 +469,14 @@ func (s *profileStore) manifest(ctx context.Context) Manifest {
 	m := Manifest{CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
 	if v, err := s.k.launcher.version(ctx); err == nil {
 		m.ChromeVersion, m.ChromeMajor, m.ImageVersion = v.Chrome, v.ChromeMajor, v.Image
+		// The browser container's settings (keeper's own env has none of them).
+		m.Timezone, m.Locale = v.Timezone, v.Locale
 	}
 	if b, err := os.ReadFile(filepath.Join(s.live, "Default", ".livellm-locale")); err == nil {
 		var mk struct {
 			Locale string `json:"locale"`
 		}
-		if json.Unmarshal(b, &mk) == nil {
+		if json.Unmarshal(b, &mk) == nil && mk.Locale != "" {
 			m.Locale = mk.Locale
 		}
 	}
@@ -439,9 +487,6 @@ func (s *profileStore) manifest(ctx context.Context) Manifest {
 			}
 		}
 		sort.Strings(m.Extensions)
-	}
-	if tz := os.Getenv("TZ"); tz != "" {
-		m.Timezone = tz
 	}
 	return m
 }
@@ -559,7 +604,8 @@ func (s *profileStore) sealLive(ctx context.Context, dst string, m Manifest) (in
 // withPause runs fn with Chrome closed and always resumes it.
 func (s *profileStore) withPause(ctx context.Context, fn func() error) error {
 	if err := s.k.launcher.pause(ctx, s.pauseFor); err != nil {
-		return &apiErr{503, "browser_busy", "The browser could not be paused. Try again shortly."}
+		// 409 like any other "busy right now": the caller retries shortly.
+		return &apiErr{409, "browser_busy", "The browser could not be paused. Try again shortly."}
 	}
 	defer func() {
 		rctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -868,6 +914,14 @@ func (s *profileStore) export(ctx context.Context, w io.Writer, snapshot, passwo
 		return err
 	}
 	defer c.Close()
+	// The first piece is opened before the answer starts, so a damaged
+	// snapshot is refused instead of sent as an empty or cut file.
+	first := make([]byte, 64<<10)
+	n, err := io.ReadAtLeast(r, first, 1)
+	if err != nil {
+		return errBadArchive
+	}
+	r = io.MultiReader(bytes.NewReader(first[:n]), r)
 	ext := ".llcprofile"
 	if password != "" {
 		ext += ".age"

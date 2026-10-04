@@ -15,6 +15,7 @@ from typing import Optional, Any, List
 
 from patchright.async_api import Playwright, Browser, BrowserContext, Page, async_playwright
 from core.cdp_proxy import CDPProxy
+from core.launch_prep import prepare_launch, platform_proxy_config
 from core.const import PROFILES_DIR, EXTENSIONS_CACHE_DIR, DEFAULT_BROWSER_ID, STABLE_WS_PREFIX
 
 logger = logging.getLogger(__name__)
@@ -346,6 +347,9 @@ class LocalBrowserInfo:
         self.profile_path = profile_path
         self.is_ephemeral = is_ephemeral
         self.proxy_config = proxy_config
+        # Chrome's own debugging port and this launch's time (for /version).
+        self.chrome_port: Optional[int] = None
+        self.started_at: float = time.time()
 
 
 class LocalBrowserManager:
@@ -364,6 +368,10 @@ class LocalBrowserManager:
         self._browser_locks: dict[str, asyncio.Lock] = {}
         self._recovery_lock = asyncio.Lock()
         self._driver_chain_warned = False
+        # A deliberate pause (the control sidecar copying the profile):
+        # browser_id -> monotonic deadline, plus the auto-resume timers.
+        self._paused_until: dict[str, float] = {}
+        self._resume_timers: dict[str, asyncio.Task] = {}
 
     async def start(self, playwright: Playwright, extensions: Optional[List[str]] = None, proxy=None, cookies: Optional[List[dict]] = None):
         """Initialize with a Playwright instance and create the default browser.
@@ -479,6 +487,11 @@ class LocalBrowserManager:
                         # A concurrent restart already rebuilt this one on the
                         # new driver — relaunching again would leak a Chrome.
                         continue
+                    if browser_id in self._paused_until:
+                        # Closed on purpose while its profile is copied: the
+                        # resume launches it on the new driver.
+                        old.browser = None
+                        continue
                     if not old.profile_path:
                         # Ephemeral, no profile to relaunch from — drop it.
                         try:
@@ -557,9 +570,13 @@ class LocalBrowserManager:
                     except Exception as e:
                         logger.error(f"Failed to inject extension {ext_id}: {e}")
 
-            # Build proxy config
-            proxy_config = None
-            if proxy:
+            # Build proxy config. A platform proxy (set on the pod) always wins:
+            # a launcher caller can't point a browser around it.
+            proxy_config = platform_proxy_config()
+            if proxy_config is not None:
+                if proxy:
+                    logger.info(f"Browser '{browser_id}' uses the platform proxy; the requested proxy is ignored")
+            elif proxy:
                 proxy_config = {"server": proxy.server}
                 if proxy.username:
                     proxy_config["username"] = proxy.username
@@ -584,20 +601,11 @@ class LocalBrowserManager:
             else:
                 proxy_port, proxy_sock = get_free_port()
 
-            launch_kwargs = {
-                "headless": False,
-                "channel": "chrome",
-                "args": [
-                    "--start-maximized",
-                    "--ignore-gpu-blocklist",
-                    "--enable-webgl",
-                    "--enable-gpu",
-                    f"--remote-debugging-port={chrome_port}",
-                    "--remote-allow-origins=*",
-                ],
-            }
-            if proxy_config:
-                launch_kwargs["proxy"] = proxy_config
+            if is_persistent:
+                profile_path.mkdir(parents=True, exist_ok=True)
+            launch_kwargs = prepare_launch(
+                chrome_port, profile_path if is_persistent else None, proxy_config
+            )
 
             # Release the held sockets — Chrome has now bound to chrome_port, and
             # we're about to bind proxy_port for the CDP proxy.
@@ -606,13 +614,13 @@ class LocalBrowserManager:
                 proxy_sock.close()
 
             if is_persistent:
-                launch_kwargs["user_data_dir"] = str(profile_path)
-                launch_kwargs["no_viewport"] = True
                 context = await self.playwright.chromium.launch_persistent_context(**launch_kwargs)
                 browser = context.browser
             else:
+                # Context options belong on the context, not on launch().
+                ctx_opts = {k: launch_kwargs.pop(k) for k in ("geolocation", "permissions") if k in launch_kwargs}
                 browser = await self.playwright.chromium.launch(**launch_kwargs)
-                context = await browser.new_context(no_viewport=True)
+                context = await browser.new_context(no_viewport=True, **ctx_opts)
 
             if browser is None and context:
                 browser = context.browser
@@ -636,6 +644,7 @@ class LocalBrowserManager:
                     logger.error(f"Failed to load cookies into browser '{browser_id}': {e}")
 
             browser_info = LocalBrowserInfo(browser, context, proxy_port, ws_endpoint, cdp_proxy, profile_path, is_ephemeral, proxy_config)
+            browser_info.chrome_port = chrome_port
             self.browsers[browser_id] = browser_info
 
             kind = "persistent" if is_persistent else "ephemeral"
@@ -704,22 +713,7 @@ class LocalBrowserManager:
 
         chrome_port, chrome_sock = get_free_port()
 
-        launch_kwargs = {
-            "headless": False,
-            "channel": "chrome",
-            "args": [
-                "--start-maximized",
-                "--ignore-gpu-blocklist",
-                "--enable-webgl",
-                "--enable-gpu",
-                f"--remote-debugging-port={chrome_port}",
-                "--remote-allow-origins=*",
-            ],
-            "user_data_dir": str(profile_path),
-            "no_viewport": True,
-        }
-        if proxy_config:
-            launch_kwargs["proxy"] = proxy_config
+        launch_kwargs = prepare_launch(chrome_port, profile_path, proxy_config)
 
         # Release the held socket — Chrome is about to bind chrome_port
         chrome_sock.close()
@@ -746,7 +740,98 @@ class LocalBrowserManager:
         # Retarget the existing proxy to the new Chrome instance
         cdp_proxy.retarget(chrome_port, ws_endpoint)
 
-        return LocalBrowserInfo(browser, context, proxy_port, ws_endpoint, cdp_proxy, profile_path, is_ephemeral, proxy_config)
+        info = LocalBrowserInfo(browser, context, proxy_port, ws_endpoint, cdp_proxy, profile_path, is_ephemeral, proxy_config)
+        info.chrome_port = chrome_port
+        return info
+
+    # ── Deliberate pause (the control sidecar copies the profile) ──
+
+    def paused(self, browser_id: str) -> bool:
+        deadline = self._paused_until.get(browser_id)
+        return deadline is not None and time.monotonic() < deadline + 60.0
+
+    def pause_deadline(self, browser_id: str) -> Optional[float]:
+        return self._paused_until.get(browser_id)
+
+    async def pause_browser(self, browser_id: str, max_seconds: float) -> None:
+        """Close Chrome gracefully and keep it closed for up to max_seconds.
+
+        The CDP proxy keeps its port; the watchdog leaves a paused browser
+        alone; a timer resumes it at max_seconds if nobody does. Pausing a
+        paused browser only moves its deadline.
+        """
+        if browser_id not in self.browsers:
+            raise KeyError(f"Browser with id '{browser_id}' not found")
+        async with self._browser_lock(browser_id):
+            info = self.browsers.get(browser_id)
+            if info is None:
+                raise KeyError(f"Browser with id '{browser_id}' not found")
+            if not info.profile_path:
+                raise ValueError("Cannot pause an ephemeral browser without a profile.")
+            already = browser_id in self._paused_until
+            self._paused_until[browser_id] = time.monotonic() + max_seconds
+            if not already:
+                try:
+                    await asyncio.wait_for(info.context.close(), timeout=self.close_timeout)
+                except asyncio.TimeoutError:
+                    self._paused_until.pop(browser_id, None)
+                    raise
+                except Exception as e:
+                    logger.warning(f"Error closing context for pause: {e}")
+                try:
+                    if info.browser:
+                        await asyncio.wait_for(info.browser.close(), timeout=self.close_timeout)
+                except asyncio.TimeoutError:
+                    self._paused_until.pop(browser_id, None)
+                    raise
+                except Exception as e:
+                    logger.warning(f"Error closing browser for pause: {e}")
+                cleanup_profile_locks(info.profile_path)
+                logger.info(f"Paused browser '{browser_id}' (proxy on :{info.proxy_port} kept alive)")
+            old = self._resume_timers.pop(browser_id, None)
+            if old is not None:
+                old.cancel()
+            self._resume_timers[browser_id] = asyncio.ensure_future(self._auto_resume(browser_id, max_seconds))
+
+    async def _auto_resume(self, browser_id: str, max_seconds: float) -> None:
+        try:
+            await asyncio.sleep(max_seconds)
+        except asyncio.CancelledError:
+            return
+        logger.warning(f"Browser '{browser_id}' paused for {max_seconds:.0f}s; resuming it")
+        self._resume_timers.pop(browser_id, None)
+        try:
+            await self.resume_browser(browser_id)
+        except Exception as e:
+            # The watchdog takes over once the pause has lapsed.
+            self._paused_until.pop(browser_id, None)
+            logger.error(f"Auto-resume of '{browser_id}' failed: {e}")
+
+    async def resume_browser(self, browser_id: str) -> LocalBrowserInfo:
+        """Start Chrome again after a pause. Idempotent: not paused = no-op."""
+        if browser_id not in self.browsers:
+            raise KeyError(f"Browser with id '{browser_id}' not found")
+        timer = self._resume_timers.pop(browser_id, None)
+        if timer is not None and timer is not asyncio.current_task():
+            timer.cancel()
+        async with self._browser_lock(browser_id):
+            info = self.browsers.get(browser_id)
+            if info is None:
+                raise KeyError(f"Browser with id '{browser_id}' not found")
+            if browser_id not in self._paused_until:
+                return info
+            try:
+                new_info = await self._launch_chrome_for(
+                    browser_id, info.profile_path, info.proxy_config,
+                    info.cdp_proxy, info.proxy_port, info.is_ephemeral,
+                )
+            finally:
+                # Launched or not, the pause is over: on failure the entry's
+                # dead Browser lets the watchdog relaunch it.
+                self._paused_until.pop(browser_id, None)
+            self.browsers[browser_id] = new_info
+            logger.info(f"Resumed browser '{browser_id}'")
+            return new_info
 
     async def restart_browser(self, browser_id: str, inject_extensions: Optional[List[tuple]] = None, remove_extensions: Optional[List[str]] = None, toggle_extensions: Optional[List[tuple]] = None, proxy_config: Optional[dict] = None, clear_proxy: bool = False) -> LocalBrowserInfo:
         """
@@ -767,6 +852,8 @@ class LocalBrowserManager:
             old_info = self.browsers.get(browser_id)
             if old_info is None:
                 raise KeyError(f"Browser with id '{browser_id}' not found")
+            if browser_id in self._paused_until:
+                raise ValueError("The browser is paused for a moment; try again shortly.")
             profile_path = old_info.profile_path
             if clear_proxy:
                 proxy_config = None

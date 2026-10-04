@@ -5,13 +5,16 @@ import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+import time
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
 from patchright.async_api import async_playwright
 
-from core.const import PROFILES_DIR, DEFAULT_BROWSER_ID, STABLE_WS_PREFIX
+from core.const import PROFILES_DIR, DEFAULT_BROWSER_ID, STABLE_WS_PREFIX, IMAGE_VERSION
+from core.launch_prep import platform_proxy_config
 from core.local_browser import (
     local_browser_manager,
     cleanup_profile_locks, download_extension, list_profile_extensions
@@ -25,7 +28,8 @@ class ProxySettings(BaseModel):
     bypass: Optional[str] = None
 
 class CreateBrowserRequest(BaseModel):
-    profile_uid: Optional[str] = None
+    # Joined to PROFILES_DIR: a plain name only, never a path.
+    profile_uid: Optional[str] = Field(None, pattern=r"^[A-Za-z0-9_-]{1,64}$")
     proxy: Optional[ProxySettings] = None
     extensions: Optional[list[str]] = None
     cookies: Optional[list[dict]] = None
@@ -62,15 +66,11 @@ def _default_browser_config_from_env():
         except json.JSONDecodeError:
             logger.warning("BROWSER_EXTENSIONS is not a JSON list; ignoring")
 
+    # The platform proxy (bypass entries ignored: each would go out directly).
     proxy = None
-    server = os.environ.get("BROWSER_PROXY_SERVER", "").strip()
-    if server:
-        proxy = ProxySettings(
-            server=server,
-            username=os.environ.get("BROWSER_PROXY_USERNAME") or None,
-            password=os.environ.get("BROWSER_PROXY_PASSWORD") or None,
-            bypass=os.environ.get("BROWSER_PROXY_BYPASS") or None,
-        )
+    cfg = platform_proxy_config()
+    if cfg:
+        proxy = ProxySettings(**cfg)
 
     cookies = None
     cookies_file = os.environ.get("BROWSER_COOKIES_FILE", "").strip()
@@ -110,6 +110,8 @@ async def _browser_watchdog():
             info = local_browser_manager.browsers.get(DEFAULT_BROWSER_ID)
             if info is None or local_browser_manager.restarting(DEFAULT_BROWSER_ID):
                 continue
+            if local_browser_manager.paused(DEFAULT_BROWSER_ID):
+                continue  # closed on purpose; the pause resumes it
 
             try:
                 browser_up = info.browser is not None and info.browser.is_connected()
@@ -205,6 +207,11 @@ async def root():
 
 @app.get("/health")
 async def health():
+    # A deliberate pause (the profile is being copied) is healthy for at most
+    # its own bound: without this the liveness probe would kill the pod
+    # mid-copy.
+    if local_browser_manager.paused(DEFAULT_BROWSER_ID):
+        return {"status": "paused"}
     # In-pod recovery (watchdog, ≤10s detection) usually beats the liveness
     # probe (3×10s consecutive failures); when it doesn't, the pod restart is
     # the correct backstop.
@@ -220,6 +227,99 @@ async def health():
     except Exception as e:
         return Response(status_code=503, content=f"Browser error: {e}")
     return {"status": "ok", **ws}
+
+# ── Pod-local control (the control sidecar only) ──
+#
+# Loopback only: the public CDP host reaches this port from Traefik's pod IP.
+# The header forces a CORS preflight, which this app never answers, so a page
+# in Chrome (also loopback) can't send one either.
+
+LOCAL_HEADER = "x-livellm-keeper"
+MAX_PAUSE_SECONDS = 600
+
+
+def _require_local(request: Request) -> None:
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1") or request.headers.get(LOCAL_HEADER) != "1":
+        raise HTTPException(status_code=403, detail="forbidden")
+
+
+class PauseRequest(BaseModel):
+    maxSeconds: float = Field(..., gt=0, le=MAX_PAUSE_SECONDS)
+
+
+def _chrome_pid(chrome_port: Optional[int], proc_root: str = "/proc") -> Optional[int]:
+    """The Chrome browser process (not a renderer) on this debugging port."""
+    if not chrome_port:
+        return None
+    want = f"--remote-debugging-port={chrome_port}".encode()
+    try:
+        entries = os.listdir(proc_root)
+    except OSError:
+        return None
+    for name in entries:
+        if not name.isdigit():
+            continue
+        try:
+            with open(os.path.join(proc_root, name, "cmdline"), "rb") as f:
+                argv = f.read().split(b"\0")
+        except OSError:
+            continue
+        if want in argv and not any(a.startswith(b"--type=") for a in argv):
+            return int(name)
+    return None
+
+
+@app.post("/browsers/default/pause")
+async def pause_default(body: PauseRequest, request: Request) -> dict:
+    _require_local(request)
+    try:
+        await local_browser_manager.pause_browser(DEFAULT_BROWSER_ID, body.maxSeconds)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="No browser")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=503, detail="Chrome did not close")
+    return {"status": "paused", "maxSeconds": body.maxSeconds}
+
+
+@app.post("/browsers/default/resume")
+async def resume_default(request: Request) -> dict:
+    _require_local(request)
+    try:
+        await local_browser_manager.resume_browser(DEFAULT_BROWSER_ID)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="No browser")
+    except Exception as e:
+        logger.error(f"Resume failed: {e}")
+        raise HTTPException(status_code=503, detail="Chrome did not start")
+    return {"status": "ok"}
+
+
+@app.get("/version")
+async def version(request: Request) -> dict:
+    _require_local(request)
+    info = local_browser_manager.browsers.get(DEFAULT_BROWSER_ID)
+    chrome = ""
+    if info is not None and info.browser is not None:
+        try:
+            chrome = info.browser.version or ""
+        except Exception:
+            chrome = ""
+    major = None
+    if chrome.split(".")[0].isdigit():
+        major = int(chrome.split(".")[0])
+    paused = local_browser_manager.paused(DEFAULT_BROWSER_ID)
+    return {
+        "chrome": chrome,
+        "chromeMajor": major,
+        "image": IMAGE_VERSION,
+        "pid": None if (info is None or paused) else _chrome_pid(info.chrome_port),
+        "startedAt": None if info is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(info.started_at)),
+        "paused": paused,
+    }
+
 
 # ── Browser CRUD ──
 

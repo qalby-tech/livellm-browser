@@ -1,3 +1,11 @@
+# The control sidecar (keeper) is a static Go binary built in its own stage.
+FROM golang:1.25.1-bookworm AS keeper
+WORKDIR /src/keeper
+COPY keeper/go.mod keeper/go.sum ./
+RUN go mod download
+COPY keeper/ ./
+RUN CGO_ENABLED=0 GOFLAGS=-trimpath go build -ldflags="-s -w" -o /out/livellm-keeper .
+
 # Start from scratch with Ubuntu 24.04
 FROM ubuntu:24.04
 
@@ -81,6 +89,26 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Install patchright system dependencies and Chrome
 RUN uv run patchright install-deps chrome || true
 RUN uv run patchright install chrome
+
+# A Chrome major jump fails the build: the image's profiles must stay
+# readable by the Chrome a rollback would bring back.
+ARG CHROME_MAJOR=154
+RUN v="$(google-chrome --version | grep -oE '[0-9]+' | head -1)" && \
+    echo "Chrome major $v (expected $CHROME_MAJOR)" && test "$v" = "$CHROME_MAJOR"
+
+# Fonts for every offered locale, installed explicitly (install-deps above may fail).
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends fonts-noto-core && \
+    fc-cache -f && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# The offered locales; each must resolve to its font.
+COPY locales.json /etc/livellm/locales.json
+COPY scripts/check_fonts.py /tmp/check_fonts.py
+RUN uv run python /tmp/check_fonts.py /etc/livellm/locales.json && rm /tmp/check_fonts.py
+
+COPY --from=keeper /out/livellm-keeper /usr/local/bin/livellm-keeper
 
 # Now copy the rest of the application code
 COPY . .

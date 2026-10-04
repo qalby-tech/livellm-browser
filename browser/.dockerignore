@@ -3,4 +3,5 @@
 __pycache__
 .pytest_cache
 .github
-profileskeeper/keeper
+profiles
+keeper/keeper

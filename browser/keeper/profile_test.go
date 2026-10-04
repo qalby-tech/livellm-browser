@@ -73,7 +73,7 @@ func TestArchiveExclusionsAndSymlinks(t *testing.T) {
 	root := t.TempDir()
 	fakeProfile(t, root, "c1")
 	var buf bytes.Buffer
-	if err := writeArchive(&buf, filepath.Join(root, "default"), Manifest{ChromeMajor: 154}); err != nil {
+	if err := writeArchive(&buf, openRoot(t, root), "default", Manifest{ChromeMajor: 154}); err != nil {
 		t.Fatal(err)
 	}
 	names := tarNames(t, bytes.NewReader(buf.Bytes()))
@@ -139,32 +139,32 @@ func TestExtractRefusesTraversalAndLinks(t *testing.T) {
 	}
 	for name, entries := range cases {
 		dst := t.TempDir()
-		_, err := extractArchive(bytes.NewReader(buildTar(t, entries, m)), dst, extractOpts{runningMajor: 154})
+		_, err := extractArchive(bytes.NewReader(buildTar(t, entries, m)), openRoot(t, dst), ".", extractOpts{runningMajor: 154})
 		if ae, ok := err.(*apiErr); !ok || ae.status != 422 {
 			t.Errorf("%s: %v, want 422", name, err)
 		}
 	}
 	// no manifest = not a LiveLLM profile
-	_, err := extractArchive(bytes.NewReader(buildTar(t, []tar.Header{{Name: "profile/x", Typeflag: tar.TypeReg}}, nil)), t.TempDir(), extractOpts{})
+	_, err := extractArchive(bytes.NewReader(buildTar(t, []tar.Header{{Name: "profile/x", Typeflag: tar.TypeReg}}, nil)), openRoot(t, t.TempDir()), ".", extractOpts{})
 	if err != errNoManifest {
 		t.Fatalf("no manifest: %v", err)
 	}
 	// newer Chrome: 409 unless forced
 	newer := &Manifest{Format: 1, ChromeMajor: 155}
 	ok := []tar.Header{{Name: "profile/Default/", Typeflag: tar.TypeDir}, {Name: "profile/Default/Prefs", Typeflag: tar.TypeReg}}
-	_, err = extractArchive(bytes.NewReader(buildTar(t, ok, newer)), t.TempDir(), extractOpts{runningMajor: 154})
+	_, err = extractArchive(bytes.NewReader(buildTar(t, ok, newer)), openRoot(t, t.TempDir()), ".", extractOpts{runningMajor: 154})
 	if ae, isAE := err.(*apiErr); !isAE || ae.code != "profile_newer" || !strings.Contains(ae.message, "Chrome 155; this browser runs 154") {
 		t.Fatalf("newer: %v", err)
 	}
 	dst := t.TempDir()
-	if _, err := extractArchive(bytes.NewReader(buildTar(t, ok, newer)), dst, extractOpts{runningMajor: 154, force: true}); err != nil {
+	if _, err := extractArchive(bytes.NewReader(buildTar(t, ok, newer)), openRoot(t, dst), ".", extractOpts{runningMajor: 154, force: true}); err != nil {
 		t.Fatalf("forced: %v", err)
 	}
 	if b, _ := os.ReadFile(filepath.Join(dst, "Default", "Prefs")); string(b) != "data" {
 		t.Fatal("forced import did not write")
 	}
 	// size cap
-	_, err = extractArchive(bytes.NewReader(buildTar(t, ok, m)), t.TempDir(), extractOpts{runningMajor: 154, maxBytes: 2})
+	_, err = extractArchive(bytes.NewReader(buildTar(t, ok, m)), openRoot(t, t.TempDir()), ".", extractOpts{runningMajor: 154, maxBytes: 2})
 	if err != errTooBig {
 		t.Fatalf("cap: %v", err)
 	}

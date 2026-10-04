@@ -102,23 +102,65 @@ type fileEntry struct {
 	mod  time.Time
 }
 
-// listProfile walks the profile without following symlinks; symlinks,
-// devices and sockets are skipped.
-func listProfile(root string) ([]fileEntry, int64, error) {
+// Every keeper file operation on the profile volume goes through one
+// *os.Root opened at the volume's mount. The browser container can write
+// anywhere on that volume, so it can plant a symlink in any path component,
+// also between a listing and the open that follows it; O_NOFOLLOW only covers
+// the last one. An os.Root resolves every component itself and refuses any
+// that leads outside the volume, so nothing the keeper reads into an archive
+// or writes out of one can be the sidecar's own Secret or state, which live
+// outside it. Paths below are slash-separated and relative to that root.
+
+// openNoBlock opens name in r for reading without following a final symlink
+// and without blocking: a FIFO swapped in for a listed file would otherwise
+// hold the open (and the profile lock, with Chrome paused) forever. Anything
+// but a regular file is refused.
+func openNoBlock(r *os.Root, name string) (*os.File, os.FileInfo, error) {
+	f, err := r.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	if !st.Mode().IsRegular() {
+		f.Close()
+		return nil, nil, errors.New("not a regular file")
+	}
+	return f, st, nil
+}
+
+// readSmall reads a regular file of at most max bytes.
+func readSmall(r *os.Root, name string, max int64) ([]byte, error) {
+	f, st, err := openNoBlock(r, name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if st.Size() > max {
+		return nil, errors.New("too large")
+	}
+	return io.ReadAll(io.LimitReader(f, max))
+}
+
+// listProfile walks dir (relative to r) without following symlinks;
+// symlinks, devices, fifos and sockets are skipped.
+func listProfile(r *os.Root, dir string) ([]fileEntry, int64, error) {
 	var out []fileEntry
 	var total int64
-	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+	err := fs.WalkDir(r.FS(), dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			if p == root {
+			if p == dir {
 				return err
 			}
 			return nil // vanished or unreadable: skip
 		}
-		if p == root {
+		if p == dir {
 			return nil
 		}
-		rel, _ := filepath.Rel(root, p)
-		rel = filepath.ToSlash(rel)
+		rel := strings.TrimPrefix(p, dir+"/")
 		t := d.Type()
 		switch {
 		case t.IsDir():
@@ -154,11 +196,19 @@ func newZstdReader(r io.Reader) (*zstd.Decoder, error) {
 	return zstd.NewReader(r, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(64<<20), zstd.WithDecoderMaxMemory(64<<20))
 }
 
-// writeArchive writes zstd(tar) of the profile at root, manifest first.
-func writeArchive(w io.Writer, root string, m Manifest) error {
-	entries, total, err := listProfile(root)
+// archiveListed, when set (tests only), runs between writeArchive's listing
+// and its first open: where a swap in the browser container would land.
+var archiveListed func()
+
+// writeArchive writes zstd(tar) of the profile at dir (relative to r),
+// manifest first.
+func writeArchive(w io.Writer, r *os.Root, dir string, m Manifest) error {
+	entries, total, err := listProfile(r, dir)
 	if err != nil {
 		return err
+	}
+	if archiveListed != nil {
+		archiveListed()
 	}
 	m.Format = archiveFormat
 	m.SizeBytes = total
@@ -186,14 +236,9 @@ func writeArchive(w io.Writer, root string, m Manifest) error {
 			}
 			continue
 		}
-		f, err := os.OpenFile(filepath.Join(root, filepath.FromSlash(e.rel)), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		f, st, err := openNoBlock(r, path.Join(dir, e.rel))
 		if err != nil {
-			continue // vanished: skip
-		}
-		st, err := f.Stat()
-		if err != nil || !st.Mode().IsRegular() {
-			f.Close()
-			continue
+			continue // vanished, replaced or outside the volume: skip
 		}
 		hdr := &tar.Header{Name: name, Mode: int64(e.mode | 0o600), Size: st.Size(), ModTime: st.ModTime(), Typeflag: tar.TypeReg, Format: tar.FormatPAX}
 		if err := tw.WriteHeader(hdr); err != nil {
@@ -241,8 +286,9 @@ func profileNewer(n, m int) *apiErr {
 
 func isNoSpace(err error) bool { return errors.Is(err, syscall.ENOSPC) }
 
-// extractArchive validates and unpacks zstd(tar) into dst (a fresh dir).
-func extractArchive(r io.Reader, dst string, o extractOpts) (*Manifest, error) {
+// extractArchive validates and unpacks zstd(tar) into dst, a fresh dir
+// relative to fsr.
+func extractArchive(r io.Reader, fsr *os.Root, dst string, o extractOpts) (*Manifest, error) {
 	zr, err := newZstdReader(r)
 	if err != nil {
 		return nil, errBadArchive
@@ -291,10 +337,10 @@ func extractArchive(r io.Reader, dst string, o extractOpts) (*Manifest, error) {
 		if !ok {
 			return nil, errBadArchive
 		}
-		target := filepath.Join(dst, filepath.FromSlash(rel))
+		target := path.Join(dst, rel)
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := mkdirNoFollow(dst, rel); err != nil {
+			if err := mkdirIn(fsr, target); err != nil {
 				if isNoSpace(err) {
 					return nil, errNoRoom
 				}
@@ -306,14 +352,14 @@ func extractArchive(r io.Reader, dst string, o extractOpts) (*Manifest, error) {
 				return nil, errTooBig
 			}
 			if dir := path.Dir(rel); dir != "." {
-				if err := mkdirNoFollow(dst, dir); err != nil {
+				if err := mkdirIn(fsr, path.Join(dst, dir)); err != nil {
 					if isNoSpace(err) {
 						return nil, errNoRoom
 					}
 					return nil, errBadArchive
 				}
 			}
-			f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+			f, err := fsr.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 			if err != nil {
 				if isNoSpace(err) {
 					return nil, errNoRoom
@@ -331,7 +377,7 @@ func extractArchive(r io.Reader, dst string, o extractOpts) (*Manifest, error) {
 				}
 				return nil, errBadArchive
 			}
-			os.Chtimes(target, hdr.ModTime, hdr.ModTime)
+			fsr.Chtimes(target, hdr.ModTime, hdr.ModTime)
 		default:
 			// Symlinks, hard links, devices, fifos: never.
 			return nil, errBadArchive
@@ -358,47 +404,56 @@ func cleanEntry(name string) (string, bool) {
 	return rel, true
 }
 
-// mkdirNoFollow creates dst/rel one level at a time, refusing symlinks.
-func mkdirNoFollow(dst, rel string) error {
-	cur := dst
-	for _, part := range strings.Split(rel, "/") {
-		cur = filepath.Join(cur, part)
-		st, err := os.Lstat(cur)
-		if err == nil {
-			if !st.IsDir() {
-				return errors.New("not a directory")
-			}
-			continue
-		}
-		if !os.IsNotExist(err) {
-			return err
-		}
-		if err := os.Mkdir(cur, 0o700); err != nil && !os.IsExist(err) {
-			return err
-		}
-	}
-	return nil
+// mkdirIn creates dir (relative to r) and its parents; an existing
+// non-directory on the way is an error.
+func mkdirIn(r *os.Root, dir string) error {
+	return r.MkdirAll(dir, 0o700)
 }
 
 // ── the profile store ──
 
+// Paths on the profile volume, relative to its root.
+const (
+	liveRel  = "default"
+	metaRel  = ".livellm"
+	snapRel  = ".livellm/snapshots"
+	trashRel = ".livellm/trash"
+)
+
 type profileStore struct {
-	root        string // …/profiles
-	live        string // …/profiles/default
-	meta        string // …/profiles/.livellm
+	root        string // …/profiles, the volume's mount
 	k           *Keeper
 	maxSnaps    int
 	maxArchive  int64
 	pauseFor    int // seconds asked of the launcher
 	busy        sync.Mutex
 	freeBytesFn func(string) int64
+
+	fsMu sync.Mutex
+	fsr  *os.Root
 }
 
 func newProfileStore(root string, k *Keeper, maxSnaps int, maxArchiveMiB int64) *profileStore {
 	return &profileStore{
-		root: root, live: filepath.Join(root, "default"), meta: filepath.Join(root, ".livellm"),
-		k: k, maxSnaps: maxSnaps, maxArchive: maxArchiveMiB << 20, pauseFor: 300, freeBytesFn: freeBytes,
+		root: root, k: k, maxSnaps: maxSnaps, maxArchive: maxArchiveMiB << 20, pauseFor: 300, freeBytesFn: freeBytes,
 	}
+}
+
+// vol returns the os.Root of the profile volume, opened once. The mount
+// path's parents are the sidecar's own read-only image, so the browser
+// container can't redirect the open itself.
+func (s *profileStore) vol() (*os.Root, error) {
+	s.fsMu.Lock()
+	defer s.fsMu.Unlock()
+	if s.fsr != nil {
+		return s.fsr, nil
+	}
+	r, err := os.OpenRoot(s.root)
+	if err != nil {
+		return nil, err
+	}
+	s.fsr = r
+	return r, nil
 }
 
 // sweep removes what a profile change cut short by a keeper or pod restart
@@ -406,29 +461,33 @@ func newProfileStore(root string, k *Keeper, maxSnaps int, maxArchiveMiB int64) 
 // half-written files, temporary export snapshots and sealed snapshots whose
 // listing entry was never written. Run once at start, before any change.
 func (s *profileStore) sweep() {
-	if ents, err := os.ReadDir(s.meta); err == nil {
+	r, err := s.vol()
+	if err != nil {
+		return
+	}
+	if ents, err := fs.ReadDir(r.FS(), metaRel); err == nil {
 		for _, e := range ents {
 			name := e.Name()
 			if (name == "trash" && e.IsDir()) || strings.HasPrefix(name, "staging-") {
-				os.RemoveAll(filepath.Join(s.meta, name))
+				r.RemoveAll(path.Join(metaRel, name))
 			}
 		}
 	}
-	ents, err := os.ReadDir(s.snapDir())
+	ents, err := fs.ReadDir(r.FS(), snapRel)
 	if err != nil {
 		return
 	}
 	for _, e := range ents {
 		name := e.Name()
-		p := filepath.Join(s.snapDir(), name)
+		p := path.Join(snapRel, name)
 		switch {
 		case !e.Type().IsRegular():
 		case strings.HasSuffix(name, ".partial"), strings.HasPrefix(name, "tmp-export-"):
-			os.Remove(p)
+			r.Remove(p)
 		case strings.HasSuffix(name, ".llcprofile.age"):
 			id := strings.TrimSuffix(name, ".llcprofile.age")
-			if _, err := os.Lstat(filepath.Join(s.snapDir(), id+".json")); os.IsNotExist(err) {
-				os.Remove(p)
+			if _, err := r.Lstat(path.Join(snapRel, id+".json")); os.IsNotExist(err) {
+				r.Remove(p)
 			}
 		}
 	}
@@ -452,15 +511,18 @@ func freeBytes(p string) int64 {
 	return int64(st.Bavail) * int64(st.Bsize)
 }
 
-func (s *profileStore) snapDir() string { return filepath.Join(s.meta, "snapshots") }
+func snapFile(id string) string { return path.Join(snapRel, id+".llcprofile.age") }
+func metaFile(id string) string { return path.Join(snapRel, id+".json") }
 
-func (s *profileStore) ensureDirs() error {
-	for _, d := range []string{s.meta, s.snapDir()} {
-		if err := mkdirNoFollow(s.root, strings.TrimPrefix(d, s.root+"/")); err != nil {
-			return err
-		}
+func (s *profileStore) ensureDirs() (*os.Root, error) {
+	r, err := s.vol()
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	if err := mkdirIn(r, snapRel); err != nil {
+		return nil, err
+	}
+	return r, nil
 }
 
 func (s *profileStore) tryLock() bool { return s.busy.TryLock() }
@@ -472,7 +534,11 @@ func (s *profileStore) manifest(ctx context.Context) Manifest {
 		// The browser container's settings (keeper's own env has none of them).
 		m.Timezone, m.Locale = v.Timezone, v.Locale
 	}
-	if b, err := os.ReadFile(filepath.Join(s.live, "Default", ".livellm-locale")); err == nil {
+	r, err := s.vol()
+	if err != nil {
+		return m
+	}
+	if b, err := readSmall(r, path.Join(liveRel, "Default", ".livellm-locale"), 64<<10); err == nil {
 		var mk struct {
 			Locale string `json:"locale"`
 		}
@@ -480,7 +546,7 @@ func (s *profileStore) manifest(ctx context.Context) Manifest {
 			m.Locale = mk.Locale
 		}
 	}
-	if ents, err := os.ReadDir(filepath.Join(s.live, "Default", "Extensions")); err == nil {
+	if ents, err := fs.ReadDir(r.FS(), path.Join(liveRel, "Default", "Extensions")); err == nil {
 		for _, e := range ents {
 			if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
 				m.Extensions = append(m.Extensions, e.Name())
@@ -501,7 +567,11 @@ func (s *profileStore) runningMajor(ctx context.Context) int {
 
 func (s *profileStore) listSnapshots() []SnapshotMeta {
 	out := []SnapshotMeta{}
-	ents, err := os.ReadDir(s.snapDir())
+	r, err := s.vol()
+	if err != nil {
+		return out
+	}
+	ents, err := fs.ReadDir(r.FS(), snapRel)
 	if err != nil {
 		return out
 	}
@@ -513,11 +583,11 @@ func (s *profileStore) listSnapshots() []SnapshotMeta {
 		if !snapshotIDRe.MatchString(id) {
 			continue
 		}
-		if _, err := os.Lstat(s.snapPath(id)); err != nil {
+		if _, err := r.Lstat(snapFile(id)); err != nil {
 			continue
 		}
-		b, err := os.ReadFile(filepath.Join(s.snapDir(), e.Name()))
-		if err != nil || len(b) > 64<<10 {
+		b, err := readSmall(r, metaFile(id), 64<<10)
+		if err != nil {
 			continue
 		}
 		var m SnapshotMeta
@@ -529,10 +599,6 @@ func (s *profileStore) listSnapshots() []SnapshotMeta {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt < out[j].CreatedAt })
 	return out
-}
-
-func (s *profileStore) snapPath(id string) string {
-	return filepath.Join(s.snapDir(), id+".llcprofile.age")
 }
 
 func newSnapshotID() string {
@@ -549,29 +615,36 @@ type ProfileInfo struct {
 }
 
 func (s *profileStore) info(ctx context.Context) ProfileInfo {
-	_, size, _ := listProfile(s.live)
-	pi := ProfileInfo{SizeBytes: size, Snapshots: s.listSnapshots(), FreeBytes: s.freeBytesFn(s.root)}
+	pi := ProfileInfo{Snapshots: s.listSnapshots(), FreeBytes: s.freeBytesFn(s.root)}
+	if r, err := s.vol(); err == nil {
+		_, pi.SizeBytes, _ = listProfile(r, liveRel)
+	}
 	if v, err := s.k.launcher.version(ctx); err == nil {
 		pi.ChromeVersion = v.Chrome
 	}
 	return pi
 }
 
-// sealTo writes the live profile (Chrome paused) as an age-sealed archive.
+// sealLive writes the live profile (Chrome paused) as an age-sealed archive
+// at dst (relative to the volume).
 func (s *profileStore) sealLive(ctx context.Context, dst string, m Manifest) (int64, error) {
 	ks := s.k.keys.Load()
 	if ks == nil {
 		return 0, errNotReady
 	}
+	r, err := s.vol()
+	if err != nil {
+		return 0, err
+	}
 	tmp := dst + ".partial"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
+	f, err := r.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return 0, err
 	}
 	bw := bufio.NewWriterSize(f, 256<<10)
 	aw, err := age.Encrypt(bw, ks.snap.Recipient())
 	if err == nil {
-		err = writeArchive(aw, s.live, m)
+		err = writeArchive(aw, r, liveRel, m)
 	}
 	if err == nil {
 		err = aw.Close()
@@ -587,17 +660,17 @@ func (s *profileStore) sealLive(ctx context.Context, dst string, m Manifest) (in
 		err = cerr
 	}
 	if err != nil {
-		os.Remove(tmp)
+		r.Remove(tmp)
 		if isNoSpace(err) {
 			return 0, errNoRoom
 		}
 		return 0, err
 	}
-	if err := os.Rename(tmp, dst); err != nil {
-		os.Remove(tmp)
+	if err := r.Rename(tmp, dst); err != nil {
+		r.Remove(tmp)
 		return 0, err
 	}
-	_, size, _ := listProfile(s.live)
+	_, size, _ := listProfile(r, liveRel)
 	return size, nil
 }
 
@@ -618,7 +691,11 @@ func (s *profileStore) withPause(ctx context.Context, fn func() error) error {
 }
 
 func (s *profileStore) roomFor() (int64, error) {
-	_, size, err := listProfile(s.live)
+	r, err := s.vol()
+	if err != nil {
+		return 0, err
+	}
+	_, size, err := listProfile(r, liveRel)
 	if err != nil && !os.IsNotExist(err) {
 		return 0, err
 	}
@@ -629,13 +706,26 @@ func (s *profileStore) roomFor() (int64, error) {
 }
 
 func (s *profileStore) writeMeta(m SnapshotMeta) error {
-	b, _ := json.Marshal(m)
-	p := filepath.Join(s.snapDir(), m.ID+".json")
-	tmp := p + ".partial"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	r, err := s.vol()
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, p)
+	b, _ := json.Marshal(m)
+	p := metaFile(m.ID)
+	tmp := p + ".partial"
+	f, err := r.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(b)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		r.Remove(tmp)
+		return err
+	}
+	return r.Rename(tmp, p)
 }
 
 // snapshot takes a snapshot of the live profile.
@@ -648,7 +738,8 @@ func (s *profileStore) snapshot(ctx context.Context, name string) (*SnapshotMeta
 }
 
 func (s *profileStore) snapshotLocked(ctx context.Context, name string, pause bool) (*SnapshotMeta, error) {
-	if err := s.ensureDirs(); err != nil {
+	r, err := s.ensureDirs()
+	if err != nil {
 		return nil, err
 	}
 	if len(s.listSnapshots()) >= s.maxSnaps {
@@ -665,10 +756,9 @@ func (s *profileStore) snapshotLocked(ctx context.Context, name string, pause bo
 	var size int64
 	take := func() error {
 		var err error
-		size, err = s.sealLive(ctx, s.snapPath(id), m)
+		size, err = s.sealLive(ctx, snapFile(id), m)
 		return err
 	}
-	var err error
 	if pause {
 		err = s.withPause(ctx, take)
 	} else {
@@ -679,7 +769,7 @@ func (s *profileStore) snapshotLocked(ctx context.Context, name string, pause bo
 	}
 	meta := SnapshotMeta{ID: id, Name: truncate(name, 100), CreatedAt: m.CreatedAt, SizeBytes: size, ChromeVersion: m.ChromeVersion}
 	if err := s.writeMeta(meta); err != nil {
-		os.Remove(s.snapPath(id))
+		r.Remove(snapFile(id))
 		return nil, err
 	}
 	return &meta, nil
@@ -700,11 +790,15 @@ func (s *profileStore) deleteSnapshot(id string) error {
 		return errBusy
 	}
 	defer s.busy.Unlock()
-	if _, err := os.Lstat(s.snapPath(id)); err != nil {
+	r, err := s.vol()
+	if err != nil {
+		return err
+	}
+	if _, err := r.Lstat(snapFile(id)); err != nil {
 		return errNotFound
 	}
-	os.Remove(s.snapPath(id))
-	os.Remove(filepath.Join(s.snapDir(), id+".json"))
+	r.Remove(snapFile(id))
+	r.Remove(metaFile(id))
 	return nil
 }
 
@@ -717,11 +811,15 @@ func (s *profileStore) openSnapshot(id string) (io.Reader, io.Closer, error) {
 	if ks == nil {
 		return nil, nil, errNotReady
 	}
-	f, err := os.OpenFile(s.snapPath(id), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	r, err := s.vol()
+	if err != nil {
+		return nil, nil, err
+	}
+	f, _, err := openNoBlock(r, snapFile(id))
 	if err != nil {
 		return nil, nil, errNotFound
 	}
-	r, err := age.Decrypt(bufio.NewReaderSize(f, 256<<10), ks.snap)
+	dr, err := age.Decrypt(bufio.NewReaderSize(f, 256<<10), ks.snap)
 	if err != nil {
 		f.Close()
 		var nim *age.NoIdentityMatchError
@@ -730,64 +828,88 @@ func (s *profileStore) openSnapshot(id string) (io.Reader, io.Closer, error) {
 		}
 		return nil, nil, errBadArchive
 	}
-	return r, f, nil
+	return dr, f, nil
 }
 
-// stage extracts an archive stream into a fresh staging directory.
-func (s *profileStore) stage(ctx context.Context, r io.Reader, force bool) (string, *Manifest, error) {
-	if err := s.ensureDirs(); err != nil {
+// stage extracts an archive stream into a fresh staging directory and
+// returns its path relative to the volume.
+func (s *profileStore) stage(ctx context.Context, rd io.Reader, force bool) (string, *Manifest, error) {
+	r, err := s.ensureDirs()
+	if err != nil {
 		return "", nil, err
 	}
-	dst, err := os.MkdirTemp(s.meta, "staging-")
-	if err != nil {
+	var dst string
+	for i := 0; ; i++ {
+		b := make([]byte, 8)
+		rand.Read(b)
+		dst = path.Join(metaRel, "staging-"+hex.EncodeToString(b))
+		err = r.Mkdir(dst, 0o700)
+		if err == nil {
+			break
+		}
 		if isNoSpace(err) {
 			return "", nil, errNoRoom
 		}
-		return "", nil, err
+		if !os.IsExist(err) || i >= 5 {
+			return "", nil, err
+		}
 	}
 	limit := s.freeBytesFn(s.root) - headroom
 	if s.maxArchive > 0 && 4*s.maxArchive < limit {
 		limit = 4 * s.maxArchive
 	}
 	if limit <= 0 {
-		os.RemoveAll(dst)
+		r.RemoveAll(dst)
 		return "", nil, errNoRoom
 	}
-	m, err := extractArchive(r, dst, extractOpts{runningMajor: s.runningMajor(ctx), force: force, maxBytes: limit})
+	m, err := extractArchive(rd, r, dst, extractOpts{runningMajor: s.runningMajor(ctx), force: force, maxBytes: limit})
 	if err != nil {
-		os.RemoveAll(dst)
+		r.RemoveAll(dst)
 		return "", nil, err
 	}
 	return dst, m, nil
 }
 
+// discard removes a staged directory.
+func (s *profileStore) discard(staged string) {
+	if staged == "" {
+		return
+	}
+	if r, err := s.vol(); err == nil {
+		r.RemoveAll(staged)
+	}
+}
+
 // swapIn replaces the live profile with a staged one (Chrome paused).
 func (s *profileStore) swapIn(ctx context.Context, staged string, keepCurrent bool) error {
+	r, err := s.vol()
+	if err != nil {
+		return err
+	}
 	return s.withPause(ctx, func() error {
 		if keepCurrent {
 			if _, err := s.snapshotLocked(ctx, "before-"+time.Now().UTC().Format("20060102-150405"), false); err != nil {
 				return err
 			}
 		}
-		trashRoot := filepath.Join(s.meta, "trash")
-		if err := mkdirNoFollow(s.meta, "trash"); err != nil {
+		if err := mkdirIn(r, trashRel); err != nil {
 			return err
 		}
-		trash := filepath.Join(trashRoot, fmt.Sprintf("%d", time.Now().UnixNano()))
+		trash := path.Join(trashRel, fmt.Sprintf("%d", time.Now().UnixNano()))
 		hadLive := true
-		if err := os.Rename(s.live, trash); err != nil {
+		if err := r.Rename(liveRel, trash); err != nil {
 			if !os.IsNotExist(err) {
 				return err
 			}
 			hadLive = false
 		}
-		if err := os.Rename(staged, s.live); err != nil {
+		if err := r.Rename(staged, liveRel); err != nil {
 			if hadLive {
-				os.Rename(trash, s.live) // roll back
+				r.Rename(trash, liveRel) // roll back
 			}
 			return err
 		}
-		go os.RemoveAll(trash)
+		go r.RemoveAll(trash)
 		return nil
 	})
 }
@@ -798,17 +920,17 @@ func (s *profileStore) restore(ctx context.Context, id string, keepCurrent bool)
 		return errBusy
 	}
 	defer s.busy.Unlock()
-	r, c, err := s.openSnapshot(id)
+	rd, c, err := s.openSnapshot(id)
 	if err != nil {
 		return err
 	}
-	staged, _, err := s.stage(ctx, r, true)
+	staged, _, err := s.stage(ctx, rd, true)
 	c.Close()
 	if err != nil {
 		return err
 	}
 	if err := s.swapIn(ctx, staged, keepCurrent); err != nil {
-		os.RemoveAll(staged)
+		s.discard(staged)
 		return err
 	}
 	return nil
@@ -851,16 +973,14 @@ func (s *profileStore) importArchive(ctx context.Context, body io.Reader, passwo
 	}
 	staged, m, err := s.stage(ctx, stream, force)
 	if counted.over {
-		if staged != "" {
-			os.RemoveAll(staged)
-		}
+		s.discard(staged)
 		return nil, errTooBig
 	}
 	if err != nil {
 		return nil, err
 	}
 	if err := s.swapIn(ctx, staged, false); err != nil {
-		os.RemoveAll(staged)
+		s.discard(staged)
 		return nil, err
 	}
 	return m, nil
@@ -893,7 +1013,8 @@ func (s *profileStore) export(ctx context.Context, w io.Writer, snapshot, passwo
 	defer s.busy.Unlock()
 	id := snapshot
 	if id == "" {
-		if err := s.ensureDirs(); err != nil {
+		r, err := s.ensureDirs()
+		if err != nil {
 			return err
 		}
 		if _, err := s.roomFor(); err != nil {
@@ -902,12 +1023,12 @@ func (s *profileStore) export(ctx context.Context, w io.Writer, snapshot, passwo
 		id = "tmp-export-" + strings.TrimPrefix(newSnapshotID(), "s")
 		m := s.manifest(ctx)
 		if err := s.withPause(ctx, func() error {
-			_, err := s.sealLive(ctx, s.snapPath(id), m)
+			_, err := s.sealLive(ctx, snapFile(id), m)
 			return err
 		}); err != nil {
 			return err
 		}
-		defer os.Remove(s.snapPath(id))
+		defer r.Remove(snapFile(id))
 	}
 	r, c, err := s.openSnapshot(id)
 	if err != nil {

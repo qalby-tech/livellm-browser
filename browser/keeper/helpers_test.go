@@ -427,3 +427,21 @@ func getThrough(t *testing.T, c net.Conn, br *bufio.Reader, host string) map[str
 }
 
 func timeNow() time.Time { return time.Now() }
+
+// openRoot opens dir as an os.Root for the archive helpers.
+func openRoot(t *testing.T, dir string) *os.Root {
+	t.Helper()
+	r, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.Close() })
+	return r
+}
+
+// snapDir and snapPath are the absolute paths of the store's snapshot files,
+// for tests that damage or read them directly.
+func (s *profileStore) snapDir() string { return filepath.Join(s.root, filepath.FromSlash(snapRel)) }
+func (s *profileStore) snapPath(id string) string {
+	return filepath.Join(s.root, filepath.FromSlash(snapFile(id)))
+}

@@ -96,9 +96,21 @@ ARG CHROME_MAJOR=154
 RUN v="$(google-chrome --version | grep -oE '[0-9]+' | head -1)" && \
     echo "Chrome major $v (expected $CHROME_MAJOR)" && test "$v" = "$CHROME_MAJOR"
 
-# Fonts for every offered locale, installed explicitly (install-deps above may fail).
+# Fonts for every offered locale, installed explicitly (install-deps above may
+# fail). Exactly the set the image had before: a new font family would change
+# the default fonts and the font list of every browser, so its look and its
+# fingerprint (fonts-noto-core did both: sans/serif went to Noto, 245 to 516
+# families, and no locale's font changed).
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends fonts-noto-core && \
+    apt-get install -y --no-install-recommends \
+    fonts-freefont-ttf \
+    fonts-ipafont-gothic \
+    fonts-liberation \
+    fonts-noto-color-emoji \
+    fonts-tlwg-loma-otf \
+    fonts-unifont \
+    xfonts-cyrillic \
+    xfonts-scalable && \
     fc-cache -f && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*

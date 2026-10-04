@@ -70,4 +70,12 @@ func TestTenantAPIVectors(t *testing.T) {
 	if _, err := unsealPassword(ks, v["passwordSealedHeader"], "another-nonce"); err == nil {
 		t.Fatal("a password bound to one request opened for another")
 	}
+	// the sealed export settings, bound to the request's nonce
+	if v["exportBodyHex"] != "" {
+		eb, _ := hex.DecodeString(v["exportBodyHex"])
+		plain, err := unseal(ks.cfg, eb, v["exportAad"])
+		if err != nil || string(plain) != v["exportPlaintext"] {
+			t.Fatalf("tenant-api's export settings: %q %v", plain, err)
+		}
+	}
 }

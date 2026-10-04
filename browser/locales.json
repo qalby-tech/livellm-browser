@@ -1,0 +1,182 @@
+{
+  "en-US": {
+    "chromeUi": "en-US",
+    "glibc": "en_US",
+    "font": "DejaVu Sans"
+  },
+  "en-GB": {
+    "chromeUi": "en-GB",
+    "glibc": "en_GB",
+    "font": "DejaVu Sans"
+  },
+  "ru-RU": {
+    "chromeUi": "ru",
+    "glibc": "ru_RU",
+    "font": "DejaVu Sans"
+  },
+  "uk-UA": {
+    "chromeUi": "uk",
+    "glibc": "uk_UA",
+    "font": "DejaVu Sans"
+  },
+  "kk-KZ": {
+    "chromeUi": "kk",
+    "glibc": "kk_KZ",
+    "font": "DejaVu Sans"
+  },
+  "de-DE": {
+    "chromeUi": "de",
+    "glibc": "de_DE",
+    "font": "DejaVu Sans"
+  },
+  "fr-FR": {
+    "chromeUi": "fr",
+    "glibc": "fr_FR",
+    "font": "DejaVu Sans"
+  },
+  "es-ES": {
+    "chromeUi": "es",
+    "glibc": "es_ES",
+    "font": "DejaVu Sans"
+  },
+  "es-MX": {
+    "chromeUi": "es-419",
+    "glibc": "es_MX",
+    "font": "DejaVu Sans"
+  },
+  "it-IT": {
+    "chromeUi": "it",
+    "glibc": "it_IT",
+    "font": "DejaVu Sans"
+  },
+  "pt-BR": {
+    "chromeUi": "pt-BR",
+    "glibc": "pt_BR",
+    "font": "DejaVu Sans"
+  },
+  "pt-PT": {
+    "chromeUi": "pt-PT",
+    "glibc": "pt_PT",
+    "font": "DejaVu Sans"
+  },
+  "nl-NL": {
+    "chromeUi": "nl",
+    "glibc": "nl_NL",
+    "font": "DejaVu Sans"
+  },
+  "pl-PL": {
+    "chromeUi": "pl",
+    "glibc": "pl_PL",
+    "font": "DejaVu Sans"
+  },
+  "cs-CZ": {
+    "chromeUi": "cs",
+    "glibc": "cs_CZ",
+    "font": "DejaVu Sans"
+  },
+  "sv-SE": {
+    "chromeUi": "sv",
+    "glibc": "sv_SE",
+    "font": "DejaVu Sans"
+  },
+  "da-DK": {
+    "chromeUi": "da",
+    "glibc": "da_DK",
+    "font": "DejaVu Sans"
+  },
+  "fi-FI": {
+    "chromeUi": "fi",
+    "glibc": "fi_FI",
+    "font": "DejaVu Sans"
+  },
+  "nb-NO": {
+    "chromeUi": "nb",
+    "glibc": "nb_NO",
+    "font": "DejaVu Sans"
+  },
+  "tr-TR": {
+    "chromeUi": "tr",
+    "glibc": "tr_TR",
+    "font": "DejaVu Sans"
+  },
+  "el-GR": {
+    "chromeUi": "el",
+    "glibc": "el_GR",
+    "font": "DejaVu Sans"
+  },
+  "ro-RO": {
+    "chromeUi": "ro",
+    "glibc": "ro_RO",
+    "font": "DejaVu Sans"
+  },
+  "hu-HU": {
+    "chromeUi": "hu",
+    "glibc": "hu_HU",
+    "font": "DejaVu Sans"
+  },
+  "bg-BG": {
+    "chromeUi": "bg",
+    "glibc": "bg_BG",
+    "font": "DejaVu Sans"
+  },
+  "he-IL": {
+    "chromeUi": "he",
+    "glibc": "he_IL",
+    "font": "DejaVu Sans"
+  },
+  "ar-SA": {
+    "chromeUi": "ar",
+    "glibc": "ar_SA",
+    "font": "DejaVu Sans"
+  },
+  "fa-IR": {
+    "chromeUi": "fa",
+    "glibc": "fa_IR",
+    "font": "DejaVu Sans"
+  },
+  "hi-IN": {
+    "chromeUi": "hi",
+    "glibc": "hi_IN",
+    "font": "FreeSans"
+  },
+  "th-TH": {
+    "chromeUi": "th",
+    "glibc": "th_TH",
+    "font": "Loma"
+  },
+  "vi-VN": {
+    "chromeUi": "vi",
+    "glibc": "vi_VN",
+    "font": "DejaVu Sans"
+  },
+  "id-ID": {
+    "chromeUi": "id",
+    "glibc": "id_ID",
+    "font": "DejaVu Sans"
+  },
+  "ms-MY": {
+    "chromeUi": "ms",
+    "glibc": "ms_MY",
+    "font": "DejaVu Sans"
+  },
+  "ja-JP": {
+    "chromeUi": "ja",
+    "glibc": "ja_JP",
+    "font": "WenQuanYi Zen Hei"
+  },
+  "ko-KR": {
+    "chromeUi": "ko",
+    "glibc": "ko_KR",
+    "font": "WenQuanYi Zen Hei"
+  },
+  "zh-CN": {
+    "chromeUi": "zh-CN",
+    "glibc": "zh_CN",
+    "font": "Noto Sans CJK SC"
+  },
+  "zh-TW": {
+    "chromeUi": "zh-TW",
+    "glibc": "zh_TW",
+    "font": "Noto Sans CJK TC"
+  }
+}

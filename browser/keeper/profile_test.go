@@ -405,3 +405,33 @@ func TestExcludedMatcher(t *testing.T) {
 		t.Fatalf("excluded %v", got)
 	}
 }
+
+// tenant-api's export form: the settings sealed to the request's own nonce.
+func TestExportSealedEnvelope(t *testing.T) {
+	e := newEnv(t, false)
+	fakeProfile(t, e.profiles, "env")
+	ks, _ := deriveKeys(testControlKey)
+	nonce := randNonce()
+	plain, _ := json.Marshal(map[string]string{"password": "pw-env"})
+	body := seal(ks.cfg, plain, "export|"+nonce)
+	req, _ := http.NewRequest("POST", e.api.URL+"/v1/profile/export", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	signRequest(req, ks.auth, body, false, timeNow(), nonce)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != 200 || resp.Header.Get("X-Profile-Extension") != ".llcprofile.age" {
+		t.Fatalf("sealed export: %v %v", err, resp)
+	}
+	enc, _ := io.ReadAll(resp.Body)
+	id, _ := age.NewScryptIdentity("pw-env")
+	if _, err := age.Decrypt(bytes.NewReader(enc), id); err != nil {
+		t.Fatalf("export password: %v", err)
+	}
+	// the same envelope under another request's nonce does not open
+	n2 := randNonce()
+	req2, _ := http.NewRequest("POST", e.api.URL+"/v1/profile/export", bytes.NewReader(body))
+	signRequest(req2, ks.auth, body, false, timeNow(), n2)
+	resp2, _ := http.DefaultClient.Do(req2)
+	if resp2.StatusCode != 400 {
+		t.Fatalf("envelope replayed into another request: %d", resp2.StatusCode)
+	}
+}

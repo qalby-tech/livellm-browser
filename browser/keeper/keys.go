@@ -122,19 +122,37 @@ func unseal(key, sealed []byte, aad string) ([]byte, error) {
 	return out, nil
 }
 
-// Profile passwords travel as base64(seal(K_cfg, password, "profile-password")).
+// Profile passwords travel sealed with K_cfg. tenant-api binds each one to
+// the request it rides in: base64url (no padding) of seal(password, AAD
+// "profile-password|<the request's auth nonce>"). The unbound form (standard
+// base64, AAD "profile-password") is accepted too: only a holder of the
+// control key can make either, and the request itself is signed.
 const aadPassword = "profile-password"
 
-func unsealPassword(k *keys, b64 string) (string, error) {
-	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
+func decodeSealed(v string) ([]byte, error) {
+	v = strings.TrimSpace(v)
+	for _, enc := range []*base64.Encoding{base64.RawURLEncoding, base64.URLEncoding, base64.StdEncoding, base64.RawStdEncoding} {
+		if b, err := enc.DecodeString(v); err == nil {
+			return b, nil
+		}
+	}
+	return nil, errSeal
+}
+
+func unsealPassword(k *keys, b64, nonce string) (string, error) {
+	if k == nil {
+		return "", errSeal
+	}
+	raw, err := decodeSealed(b64)
 	if err != nil {
 		return "", errSeal
 	}
-	pw, err := unseal(k.cfg, raw, aadPassword)
-	if err != nil {
-		return "", err
+	for _, aad := range []string{aadPassword + "|" + nonce, aadPassword} {
+		if pw, err := unseal(k.cfg, raw, aad); err == nil {
+			return string(pw), nil
+		}
 	}
-	return string(pw), nil
+	return "", errSeal
 }
 
 // ── Bech32 (BIP 173), only the encoder age needs ──

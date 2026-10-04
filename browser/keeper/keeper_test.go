@@ -290,11 +290,11 @@ func TestNoSecretsInLogsOrStatus(t *testing.T) {
 func TestPasswordSealRoundTrip(t *testing.T) {
 	ks, _ := deriveKeys(testControlKey)
 	sealed := base64.StdEncoding.EncodeToString(seal(ks.cfg, []byte("pw-123"), aadPassword))
-	if pw, err := unsealPassword(ks, sealed); err != nil || pw != "pw-123" {
+	if pw, err := unsealPassword(ks, sealed, "n"); err != nil || pw != "pw-123" {
 		t.Fatalf("unseal: %q %v", pw, err)
 	}
 	other := base64.StdEncoding.EncodeToString(seal(ks.cfg, []byte("pw-123"), "config|1"))
-	if _, err := unsealPassword(ks, other); err == nil {
+	if _, err := unsealPassword(ks, other, "n"); err == nil {
 		t.Fatal("a seal for another purpose opened as a password")
 	}
 }

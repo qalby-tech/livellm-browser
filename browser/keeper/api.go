@@ -188,29 +188,52 @@ func (s *server_) restore(w http.ResponseWriter, r *http.Request, body []byte) {
 	writeJSON(w, 200, map[string]bool{"restored": true})
 }
 
-// Export body: {"snapshot": "<id>"?, "passwordSealed": "<base64 seal>"?}
+// requestNonce is the (already verified) auth nonce of a request.
+func requestNonce(r *http.Request) string {
+	a, _ := parseAuth(r.Header.Get("Authorization"))
+	return a.nonce
+}
+
+type exportReq struct {
+	Snapshot       string `json:"snapshot"`
+	Password       string `json:"password"`       // only inside the sealed form
+	PasswordSealed string `json:"passwordSealed"` // the plain-JSON form
+}
+
+// Export body: application/octet-stream seal({"snapshot"?,"password"?},
+// AAD "export|<the request's auth nonce>") as tenant-api sends it, or plain
+// JSON {"snapshot"?,"passwordSealed"?}.
 func (s *server_) export(w http.ResponseWriter, r *http.Request, body []byte) {
-	var req struct {
-		Snapshot       string `json:"snapshot"`
-		PasswordSealed string `json:"passwordSealed"`
-	}
-	if len(body) > 0 && json.Unmarshal(body, &req) != nil {
-		writeJSON(w, 400, map[string]string{"code": "bad_request"})
-		return
-	}
-	password := ""
-	if req.PasswordSealed != "" {
-		pw, err := unsealPassword(s.k.keys.Load(), req.PasswordSealed)
-		if err != nil || pw == "" {
-			writeJSON(w, 400, map[string]string{"code": "bad_password_seal"})
+	var req exportReq
+	nonce := requestNonce(r)
+	trimmed := strings.TrimSpace(string(body))
+	switch {
+	case trimmed == "":
+	case strings.HasPrefix(trimmed, "{"):
+		if json.Unmarshal(body, &req) != nil {
+			writeJSON(w, 400, map[string]string{"code": "bad_request"})
 			return
 		}
-		password = pw
+		req.Password = ""
+		if req.PasswordSealed != "" {
+			pw, err := unsealPassword(s.k.keys.Load(), req.PasswordSealed, nonce)
+			if err != nil || pw == "" {
+				writeJSON(w, 400, map[string]string{"code": "bad_password_seal"})
+				return
+			}
+			req.Password = pw
+		}
+	default:
+		plain, err := unseal(s.k.keys.Load().cfg, body, "export|"+nonce)
+		if err != nil || json.Unmarshal(plain, &req) != nil {
+			writeJSON(w, 400, map[string]string{"code": "bad_request"})
+			return
+		}
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Minute)
 	defer cancel()
 	started := false
-	err := s.p.export(ctx, w, req.Snapshot, password, func(ext string) {
+	err := s.p.export(ctx, w, req.Snapshot, req.Password, func(ext string) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("X-Profile-Extension", ext)
 		w.WriteHeader(200)
@@ -224,7 +247,7 @@ func (s *server_) export(w http.ResponseWriter, r *http.Request, body []byte) {
 func (s *server_) importProfile(w http.ResponseWriter, r *http.Request, _ []byte) {
 	password := ""
 	if h := r.Header.Get("X-Profile-Password-Sealed"); h != "" {
-		pw, err := unsealPassword(s.k.keys.Load(), h)
+		pw, err := unsealPassword(s.k.keys.Load(), h, requestNonce(r))
 		if err != nil {
 			writeJSON(w, 400, map[string]string{"code": "bad_password_seal"})
 			return

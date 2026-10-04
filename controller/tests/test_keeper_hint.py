@@ -113,22 +113,33 @@ async def test_session_start_bounds_the_connect_and_remembers_a_missing_sidecar(
             raise httpx.ConnectTimeout("dropped")
         return httpx.Response(200, json={"rotated": True})
 
+    class Conn:
+        pass
+
+    one, two = Conn(), Conn()
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    assert await keeper_hint.session_start("silent", 0, client, conn=1) == (False, None)
+    assert await keeper_hint.session_start("silent", 0, client, conn=one) == (False, None)
     assert timeouts[0]["connect"] == keeper_hint.CONNECT_TIMEOUT
     assert timeouts[0]["read"] == keeper_hint.SESSION_START_TIMEOUT
     # Same connection: not asked again.
-    assert await keeper_hint.session_start("silent", 0, client, conn=1) == (False, None)
+    assert await keeper_hint.session_start("silent", 0, client, conn=one) == (False, None)
     assert hits == ["silent"]
     # The browser reconnected (its pod restarted): asked again.
-    assert await keeper_hint.session_start("silent", 0, client, conn=2) == (False, None)
+    assert await keeper_hint.session_start("silent", 0, client, conn=two) == (False, None)
     assert hits == ["silent", "silent"]
-    # Long enough later: asked again too.
-    keeper_hint._no_sidecar["silent"] = (time.monotonic() - keeper_hint.NO_SIDECAR_SECONDS - 1, 2)
-    await keeper_hint.session_start("silent", 0, client, conn=2)
+    # The remembered connection is gone (a new one may reuse its id): asked again.
+    del two
+    import gc
+    gc.collect()
+    three = Conn()
+    await keeper_hint.session_start("silent", 0, client, conn=three)
     assert hits == ["silent"] * 3
+    # Long enough later: asked again too.
+    keeper_hint._no_sidecar["silent"] = (time.monotonic() - keeper_hint.NO_SIDECAR_SECONDS - 1, keeper_hint._ref(three))
+    await keeper_hint.session_start("silent", 0, client, conn=three)
+    assert hits == ["silent"] * 4
     # A sidecar that answers is never remembered as missing.
-    assert await keeper_hint.session_start("b1", 0, client, conn=1) == (True, None)
+    assert await keeper_hint.session_start("b1", 0, client, conn=one) == (True, None)
     assert "b1" not in keeper_hint._no_sidecar
     keeper_hint._no_sidecar.clear()
 

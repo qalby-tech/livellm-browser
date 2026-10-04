@@ -21,7 +21,8 @@ instead of preferring it for having no open tabs.
 import asyncio
 import logging
 import time
-from typing import Dict, Iterable, Optional, Tuple
+import weakref
+from typing import Any, Dict, Iterable, Optional, Tuple
 from urllib.parse import urlsplit
 
 import httpx
@@ -54,8 +55,24 @@ def local_host(ws_url: Optional[str]) -> Optional[str]:
     return host
 
 
-# host -> (monotonic time, connection token) of a sidecar that didn't answer.
-_no_sidecar: Dict[str, Tuple[float, Optional[int]]] = {}
+# host -> (monotonic time, the connection then) of a sidecar that didn't
+# answer. A weak reference: an id() could be reused by the next connection.
+_no_sidecar: Dict[str, Tuple[float, Any]] = {}
+
+
+def _ref(conn: Any) -> Any:
+    if conn is None:
+        return None
+    try:
+        return weakref.ref(conn)
+    except TypeError:
+        return None
+
+
+def _same_connection(stored: Any, conn: Any) -> bool:
+    if stored is None:
+        return conn is None
+    return conn is not None and stored() is conn
 
 
 def _timeout() -> httpx.Timeout:
@@ -66,16 +83,17 @@ async def session_start(
     host: str,
     open_sessions: int,
     client: Optional[httpx.AsyncClient] = None,
-    conn: Optional[int] = None,
+    conn: Any = None,
 ) -> Tuple[bool, Optional[str]]:
     """Tell the browser's control sidecar a session started. Returns
     (rotated, reason); (False, None) when the sidecar isn't there.
 
-    ``conn`` identifies the controller's current connection to that browser;
-    a sidecar remembered as missing is tried again once it changes.
+    ``conn`` is the controller's current connection (its Browser object) to
+    that browser; a sidecar remembered as missing is tried again once it
+    changes.
     """
     seen = _no_sidecar.get(host)
-    if seen is not None and seen[1] == conn and time.monotonic() - seen[0] < NO_SIDECAR_SECONDS:
+    if seen is not None and _same_connection(seen[1], conn) and time.monotonic() - seen[0] < NO_SIDECAR_SECONDS:
         return False, None
     url = f"http://{host}:{KEEPER_PORT}/v1/session-start"
     own = client is None
@@ -88,7 +106,7 @@ async def session_start(
         data = resp.json()
         return bool(data.get("rotated")), data.get("reason")
     except (httpx.ConnectError, httpx.ConnectTimeout):
-        _no_sidecar[host] = (time.monotonic(), conn)
+        _no_sidecar[host] = (time.monotonic(), _ref(conn))
         return False, None
     except (httpx.HTTPError, ValueError, OSError):
         return False, None

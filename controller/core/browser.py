@@ -70,6 +70,12 @@ class BrowserManager:
         # session outlives a reconnect of its browser: it stays there and
         # gets a new tab. Dropped on end_session and when the browser leaves.
         self.sessions: dict[str, str] = {}
+        # session id -> monotonic time of its last call (per-session proxy
+        # rotation counts only recently used sessions).
+        self.session_used: dict[str, float] = {}
+        # browser id -> True while its launcher says it is paused (set by
+        # core.keeper_hint before a pick; read here with no await).
+        self.paused: dict[str, bool] = {}
         # Calls running on each browser, counted from the moment the browser
         # is chosen until the response is sent (see pick_browser/end_call).
         self._in_flight: dict[str, int] = {}
@@ -280,6 +286,7 @@ class BrowserManager:
 
     def add_session(self, browser_id: str, session_id: str, page: Page) -> None:
         self.sessions[session_id] = browser_id
+        self.session_used[session_id] = time.monotonic()
         info = self.browsers.get(browser_id)
         if info is not None:  # absent mid-reconnect: the session gets a new tab next call
             info.pages[session_id] = page
@@ -287,11 +294,24 @@ class BrowserManager:
     def end_session(self, session_id: str) -> Optional[Page]:
         """Forget a session; returns its tab (if it has one) for the caller to close."""
         browser_id = self.sessions.pop(session_id, None)
+        self.session_used.pop(session_id, None)
         info = self.browsers.get(browser_id) if browser_id else None
         return info.pages.pop(session_id, None) if info else None
 
     def session_count(self, browser_id: str) -> int:
         return sum(1 for b in self.sessions.values() if b == browser_id)
+
+    def touch_session(self, session_id: str) -> None:
+        if session_id in self.sessions:
+            self.session_used[session_id] = time.monotonic()
+
+    def recent_sessions(self, browser_id: str, exclude: str = "", window: float = 600.0) -> int:
+        """Other sessions on this browser used within ``window`` seconds."""
+        now = time.monotonic()
+        return sum(
+            1 for sid, b in self.sessions.items()
+            if b == browser_id and sid != exclude and now - self.session_used.get(sid, 0.0) < window
+        )
 
     # ── load and health ──────────────────────────────────────
 
@@ -362,7 +382,9 @@ class BrowserManager:
         rank = {}
         for b in options:
             load = self.load(b)
-            away = not self.is_healthy(b) or self.slow_to_connect(b)
+            # Paused: Chrome closed for a moment while its profile is copied.
+            away = (not self.is_healthy(b) or self.slow_to_connect(b)
+                    or (self.paused.get(b, False) and not self.is_connected(b)))
             rank[b] = (away, load >= MAX_PAGES_PER_BROWSER, load)
         best = min(rank.values())
         ties = [b for b in options if rank[b] == best]

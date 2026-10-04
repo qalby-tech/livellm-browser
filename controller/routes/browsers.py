@@ -8,7 +8,8 @@ from core.browser import browser_manager
 from core.dependencies import (
     SessionIdDep, BrowserIdDep, browser_pool, close_page, resolve_page, session_owner,
 )
-from core.registry import managed
+from core import keeper_hint
+from core.registry import browser_registry, managed
 from models.requests import ConnectBrowserRequest, StartSessionRequest
 from models.responses import BrowserResponse
 
@@ -112,14 +113,25 @@ async def start_session(
     browser_info, page = await resolve_page(request, browser_id or body.browser_id)
 
     session_id = str(uuid.uuid4())
-    browser_manager.add_session(browser_info.browser_id, session_id, page)
-    logger.info(f"Started new session: {session_id} in browser '{browser_info.browser_id}'")
+    bid = browser_info.browser_id
+    browser_manager.add_session(bid, session_id, page)
+    logger.info(f"Started new session: {session_id} in browser '{bid}'")
 
-    return {
+    out = {
         "session_id": session_id,
-        "browser_id": browser_info.browser_id,
+        "browser_id": bid,
         "message": "Session started. Send X-Session-Id on later calls; it stays on this browser.",
+        "proxyRotated": False,
     }
+    # A workspace browser that rotates its proxy per session moves to its next
+    # proxy now, when no other session there was used recently.
+    host = keeper_hint.local_host(browser_registry.get_browser_ws_url(bid))
+    if host:
+        rotated, reason = await keeper_hint.session_start(host, browser_manager.recent_sessions(bid, exclude=session_id))
+        out["proxyRotated"] = rotated
+        if reason and not rotated:
+            out["proxyRotateReason"] = reason
+    return out
 
 
 @router.delete("/end_session")

@@ -8,6 +8,7 @@ from patchright.async_api import Page
 
 from core import browser as browser_mod
 from core.browser import BrowserInfo, BrowserManager
+from core.keeper_hint import local_host, pause_watch
 from core.registry import browser_registry, managed
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,7 @@ async def browser_pool(manager: BrowserManager) -> List[str]:
         for sid, bid in list(manager.sessions.items()):
             if bid not in registry_ids:
                 manager.sessions.pop(sid, None)
+                manager.session_used.pop(sid, None)
         for bid in [b for b in manager._unhealthy_until if b not in registry_ids]:
             manager._unhealthy_until.pop(bid, None)
         return registry_ids
@@ -80,6 +82,7 @@ def session_owner(
     owner = manager.session_browser(session_id)
     if owner is None:
         raise unknown_session(session_id)
+    manager.touch_session(session_id)
     if named and named != owner:
         request.state.browser_id = owner
         raise HTTPException(
@@ -159,6 +162,14 @@ async def resolve_page(
             else "No browsers available. Register one first via POST /browsers."
         )
         raise HTTPException(status_code=503, detail=detail)
+
+    # A disconnected local browser may only be paused (its profile is being
+    # copied): read its launcher's /health first, so the pick sees it away.
+    down = [(b, local_host(browser_registry.get_browser_ws_url(b))) for b in pool if not manager.is_connected(b)]
+    if down:
+        await pause_watch.refresh(down)
+    for b in pool:
+        manager.paused[b] = pause_watch.paused(b)
 
     tried: List[str] = []
     while True:

@@ -238,9 +238,11 @@ LOCAL_HEADER = "x-livellm-keeper"
 MAX_PAUSE_SECONDS = 600
 
 
-def _require_local(request: Request) -> None:
+def _require_local(request: Request, header: bool = True) -> None:
     host = request.client.host if request.client else ""
-    if host not in ("127.0.0.1", "::1") or request.headers.get(LOCAL_HEADER) != "1":
+    if host not in ("127.0.0.1", "::1"):
+        raise HTTPException(status_code=403, detail="forbidden")
+    if header and request.headers.get(LOCAL_HEADER) != "1":
         raise HTTPException(status_code=403, detail="forbidden")
 
 
@@ -299,7 +301,9 @@ async def resume_default(request: Request) -> dict:
 
 @app.get("/version")
 async def version(request: Request) -> dict:
-    _require_local(request)
+    # Read-only and answered without CORS headers (a page can't read it), so
+    # loopback alone is enough here; pause/resume also need the header.
+    _require_local(request, header=False)
     info = local_browser_manager.browsers.get(DEFAULT_BROWSER_ID)
     chrome = ""
     if info is not None and info.browser is not None:

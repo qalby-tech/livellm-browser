@@ -43,7 +43,7 @@ def test_start_session_hints_the_browser(hints):
     answers.update(rotated=False, reason="other sessions in use")
     r2 = pool.client.post("/start_session", headers={"X-Browser-Id": "agent-1"})
     body = r2.json()
-    assert body["proxyRotated"] is False and body["proxyRotateReason"] == "other sessions in use"
+    assert body["proxyRotated"] is False and body["proxyReason"] == "other sessions in use"
     assert calls[-1] == ("agent-1.svc", 1)
 
 

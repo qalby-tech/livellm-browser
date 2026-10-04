@@ -355,7 +355,7 @@ func TestImportWorkFactorCap(t *testing.T) {
 	w.Write(buildTar(t, nil, &Manifest{Format: 1}))
 	w.Close()
 	resp := e.call("POST", "/v1/profile/import", buf.Bytes(), map[string]string{"X-Profile-Password-Sealed": sealedPassword("pw")})
-	if m := readJSON(t, resp); resp.StatusCode != 422 || m["code"] != "work_factor_too_high" {
+	if m := readJSON(t, resp); resp.StatusCode != 422 || m["code"] != "password_too_strong" {
 		t.Fatalf("wf 17: %d %v", resp.StatusCode, m)
 	}
 }

@@ -130,7 +130,7 @@ async def start_session(
         rotated, reason = await keeper_hint.session_start(host, browser_manager.recent_sessions(bid, exclude=session_id))
         out["proxyRotated"] = rotated
         if reason and not rotated:
-            out["proxyRotateReason"] = reason
+            out["proxyReason"] = reason
     return out
 
 

@@ -42,7 +42,8 @@ async def test_pod_local_endpoints_refuse_others(fake_manager, host, headers):
     async with client(host) as c:
         assert (await c.post("/browsers/default/pause", json={"maxSeconds": 30}, headers=headers)).status_code == 403
         assert (await c.post("/browsers/default/resume", headers=headers)).status_code == 403
-        assert (await c.get("/version", headers=headers)).status_code == 403
+        if host != "127.0.0.1":
+            assert (await c.get("/version", headers=headers)).status_code == 403
     _, pause, resume = fake_manager
     pause.assert_not_called()
     resume.assert_not_called()
@@ -118,3 +119,10 @@ async def test_profile_uid_accepts_existing_ids(fake_manager, monkeypatch, uid):
     async with client("10.0.0.1") as c:
         r = await c.post("/browsers", json={"profile_uid": uid})
     assert r.status_code == 200, r.text
+
+
+async def test_version_needs_loopback_only(fake_manager):
+    async with client("127.0.0.1") as c:
+        assert (await c.get("/version")).status_code == 200
+    async with client("10.0.0.9") as c:
+        assert (await c.get("/version", headers=LOCAL)).status_code == 403

@@ -215,7 +215,7 @@ func writeArchive(w io.Writer, root string, m Manifest) error {
 // ── extraction with validation ──
 
 var (
-	errNoManifest    = &apiErr{422, "not_a_livellm_profile", "Only profiles exported from LiveLLM browsers can be imported. Import cookies instead."}
+	errNoManifest    = &apiErr{422, "not_livellm_profile", "Only profiles exported from LiveLLM browsers can be imported. Import cookies instead."}
 	errBadArchive    = &apiErr{422, "invalid_profile", "This file is not a valid browser profile."}
 	errTooBig        = &apiErr{413, "too_large", "This profile is too large."}
 	errNoRoom        = &apiErr{507, "no_room", "Not enough room in this browser's storage. Grow it or delete a snapshot."}
@@ -223,7 +223,7 @@ var (
 	errKeyChanged    = &apiErr{409, "snapshot_key_changed", "This snapshot was sealed under an older key and can't be restored."}
 	errNeedsPassword = &apiErr{422, "password_required", "This profile file is password protected. Send its password."}
 	errWrongPassword = &apiErr{422, "wrong_password", "The password does not open this profile file."}
-	errStrongWF      = &apiErr{422, "work_factor_too_high", "This file's password protection is stronger than LiveLLM makes. Export it again from LiveLLM."}
+	errStrongWF      = &apiErr{422, "password_too_strong", "This file's password protection is stronger than LiveLLM makes. Export it again from LiveLLM."}
 	errNotFound      = &apiErr{404, "not_found", "No such snapshot."}
 	errSnapLimit     = &apiErr{409, "snapshot_limit", "This browser has the most snapshots it can keep. Delete one first."}
 	errNotReady      = &apiErr{503, "not_ready", "not ready"}

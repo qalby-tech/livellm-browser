@@ -98,7 +98,7 @@ func TestArchiveSkipsSwappedFifo(t *testing.T) {
 	archiveListed = func() {
 		os.Remove(prefs)
 		if err := syscall.Mkfifo(prefs, 0o600); err != nil {
-			t.Fatal(err)
+			t.Error(err) // runs on writeArchive's goroutine: no FailNow here
 		}
 	}
 	defer func() { archiveListed = nil }()

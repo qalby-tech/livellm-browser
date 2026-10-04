@@ -24,7 +24,7 @@ def hints(pool, monkeypatch):
     answers = {"rotated": True, "reason": None}
     monkeypatch.setattr(keeper_hint, "local_host", lambda ws: ws.split("://", 1)[1].split(":", 1)[0] + ".svc" if ws else None)
 
-    async def fake_start(host, n, client=None):
+    async def fake_start(host, n, client=None, conn=None):
         calls.append((host, n))
         return answers["rotated"], answers["reason"]
 
@@ -71,7 +71,7 @@ def test_ended_session_does_not_count(hints):
 def test_remote_browsers_are_not_called(pool, monkeypatch):
     called = []
 
-    async def fake_start(host, n, client=None):
+    async def fake_start(host, n, client=None, conn=None):
         called.append(host)
         return True, None
 
@@ -99,6 +99,38 @@ async def test_session_start_ignores_a_missing_sidecar():
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(refused))
     assert await keeper_hint.session_start("b1", 0, client) == (False, None)
+    keeper_hint._no_sidecar.clear()
+
+
+async def test_session_start_bounds_the_connect_and_remembers_a_missing_sidecar(monkeypatch):
+    keeper_hint._no_sidecar.clear()
+    timeouts, hits = [], []
+
+    def handler(request):
+        hits.append(request.url.host)
+        timeouts.append(request.extensions.get("timeout"))
+        if request.url.host == "silent":
+            raise httpx.ConnectTimeout("dropped")
+        return httpx.Response(200, json={"rotated": True})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    assert await keeper_hint.session_start("silent", 0, client, conn=1) == (False, None)
+    assert timeouts[0]["connect"] == keeper_hint.CONNECT_TIMEOUT
+    assert timeouts[0]["read"] == keeper_hint.SESSION_START_TIMEOUT
+    # Same connection: not asked again.
+    assert await keeper_hint.session_start("silent", 0, client, conn=1) == (False, None)
+    assert hits == ["silent"]
+    # The browser reconnected (its pod restarted): asked again.
+    assert await keeper_hint.session_start("silent", 0, client, conn=2) == (False, None)
+    assert hits == ["silent", "silent"]
+    # Long enough later: asked again too.
+    keeper_hint._no_sidecar["silent"] = (time.monotonic() - keeper_hint.NO_SIDECAR_SECONDS - 1, 2)
+    await keeper_hint.session_start("silent", 0, client, conn=2)
+    assert hits == ["silent"] * 3
+    # A sidecar that answers is never remembered as missing.
+    assert await keeper_hint.session_start("b1", 0, client, conn=1) == (True, None)
+    assert "b1" not in keeper_hint._no_sidecar
+    keeper_hint._no_sidecar.clear()
 
 
 async def test_pause_watch_reads_and_caches_health():

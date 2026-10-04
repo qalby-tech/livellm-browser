@@ -127,7 +127,11 @@ async def start_session(
     # proxy now, when no other session there was used recently.
     host = keeper_hint.local_host(browser_registry.get_browser_ws_url(bid))
     if host:
-        rotated, reason = await keeper_hint.session_start(host, browser_manager.recent_sessions(bid, exclude=session_id))
+        rotated, reason = await keeper_hint.session_start(
+            host,
+            browser_manager.recent_sessions(bid, exclude=session_id),
+            conn=id(browser_info.browser),
+        )
         out["proxyRotated"] = rotated
         if reason and not rotated:
             out["proxyReason"] = reason

@@ -7,6 +7,13 @@ person's "rotate per session" setting the sidecar then moves to the next
 proxy. A browser without the sidecar (refused, 404) is skipped silently, and
 remote browsers are never called.
 
+A browser without the sidecar has no port 9300 on its Service, and on this
+network such a connection is dropped, not refused: without a short connect
+bound every session start on it would wait the whole rotation timeout. So the
+connect is bounded on its own, and a browser that didn't answer is not asked
+again until its connection changes (the pod restarted, perhaps with the
+sidecar) or NO_SIDECAR_SECONDS pass.
+
 A browser whose profile is being copied closes Chrome for a few seconds; its
 launcher answers /health {"status":"paused"}, and the picker treats it as away
 instead of preferring it for having no open tabs.
@@ -24,6 +31,9 @@ logger = logging.getLogger(__name__)
 KEEPER_PORT = 9300
 LAUNCHER_PORT = 9000
 SESSION_START_TIMEOUT = 120.0
+# Reaching the sidecar, apart from the (long) wait for a rotation.
+CONNECT_TIMEOUT = 2.0
+NO_SIDECAR_SECONDS = 600.0
 HEALTH_TIMEOUT = 2.0
 HEALTH_CACHE_SECONDS = 2.0
 # A session used within this window blocks a per-session rotation.
@@ -44,18 +54,42 @@ def local_host(ws_url: Optional[str]) -> Optional[str]:
     return host
 
 
-async def session_start(host: str, open_sessions: int, client: Optional[httpx.AsyncClient] = None) -> Tuple[bool, Optional[str]]:
+# host -> (monotonic time, connection token) of a sidecar that didn't answer.
+_no_sidecar: Dict[str, Tuple[float, Optional[int]]] = {}
+
+
+def _timeout() -> httpx.Timeout:
+    return httpx.Timeout(SESSION_START_TIMEOUT, connect=CONNECT_TIMEOUT)
+
+
+async def session_start(
+    host: str,
+    open_sessions: int,
+    client: Optional[httpx.AsyncClient] = None,
+    conn: Optional[int] = None,
+) -> Tuple[bool, Optional[str]]:
     """Tell the browser's control sidecar a session started. Returns
-    (rotated, reason); (False, None) when the sidecar isn't there."""
+    (rotated, reason); (False, None) when the sidecar isn't there.
+
+    ``conn`` identifies the controller's current connection to that browser;
+    a sidecar remembered as missing is tried again once it changes.
+    """
+    seen = _no_sidecar.get(host)
+    if seen is not None and seen[1] == conn and time.monotonic() - seen[0] < NO_SIDECAR_SECONDS:
+        return False, None
     url = f"http://{host}:{KEEPER_PORT}/v1/session-start"
     own = client is None
-    client = client or httpx.AsyncClient(timeout=SESSION_START_TIMEOUT)
+    client = client or httpx.AsyncClient(timeout=_timeout())
     try:
-        resp = await client.post(url, json={"openSessions": open_sessions}, timeout=SESSION_START_TIMEOUT)
+        resp = await client.post(url, json={"openSessions": open_sessions}, timeout=_timeout())
+        _no_sidecar.pop(host, None)
         if resp.status_code != 200:
             return False, None
         data = resp.json()
         return bool(data.get("rotated")), data.get("reason")
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        _no_sidecar[host] = (time.monotonic(), conn)
+        return False, None
     except (httpx.HTTPError, ValueError, OSError):
         return False, None
     finally:

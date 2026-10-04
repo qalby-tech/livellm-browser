@@ -143,6 +143,10 @@ func (k *Keeper) boot() {
 		if st.LastChangeIP != nil {
 			k.lastChangeIP = st.LastChangeIP
 		}
+		if st.Config != nil && st.Current < len(st.Config.Upstreams) {
+			// Keeps the current upstream across a container restart.
+			k.cfg = st.Config
+		}
 	}
 	switch {
 	case fs.cfg != nil && (st == nil || st.Config == nil || fs.cfg.Version >= st.Config.Version):

@@ -48,6 +48,16 @@ jobs:
         working-directory: browser
         run: uv run pytest tests/ -v --tb=short
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: browser/keeper/go.mod
+          cache-dependency-path: browser/keeper/go.sum
+
+      - name: Run keeper tests
+        working-directory: browser/keeper
+        run: go vet ./... && go test -count=1 ./...
+
   build-and-push:
     needs: test
     runs-on: ubuntu-latest

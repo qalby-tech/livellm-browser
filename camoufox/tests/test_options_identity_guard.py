@@ -58,8 +58,11 @@ def test_launch_server_options():
     assert out["args"] == ["-allow-downgrade"]
     assert out["env"]["LANG"] == "de_DE.UTF-8" and out["env"]["N"] == "5" and out["env"]["DISPLAY"] == ":1"
     assert out["proxy"] == {"server": "http://127.0.0.1:3128"}
-    for k, v in options.CONTEXT_DEFAULTS_OFF.items():
-        assert out[k] == v
+    # literally (a test that walked the constant passed with a key deleted
+    # from it): without noDefaultViewport contexts[0] is 1280x720 under the
+    # window and a second new_page() can hang (daijro/camoufox#666)
+    assert out["noDefaultViewport"] is True
+    assert out["colorScheme"] == out["reducedMotion"] == out["forcedColors"] == out["contrast"] == "no-override"
     assert out["_userDataDir"] == "/p/default" and out["_sharedBrowser"] is True
     assert out["host"] == "127.0.0.1" and out["port"] == 0 and out["timeout"] == 120000
     assert len(out["wsPath"]) == 33 and out["wsPath"][0] == "/" and int(out["wsPath"][1:], 16) >= 0
@@ -87,6 +90,80 @@ def test_identity_pins_what_camoufox_resolved(tmp_path):
     assert identity.load(tmp_path) is None
     identity.path_of(tmp_path).write_text(json.dumps({"format": 9, "fingerprint": {}}))
     assert identity.load(tmp_path) is None
+
+
+def test_the_window_fits_its_screen_with_the_frame():
+    # Camoufox sizes the window's inside to window.outer*; the window
+    # manager's frame (10 x 34) comes on top, and pages read it
+    fp = {"window": {"outerWidth": 1920, "outerHeight": 1080, "innerWidth": 1920, "innerHeight": 994, "screenX": 0, "screenY": 13}}
+    config = {"screen.width": 1920, "screen.height": 1080, "screen.availWidth": 1920, "screen.availHeight": 1053,
+              "window.outerWidth": 1920, "window.outerHeight": 1053, "window.innerWidth": 1920, "window.innerHeight": 967,
+              "window.screenX": 0, "window.screenY": 0}
+    assert identity.fit_window(fp, config, (10, 34))
+    w = fp["window"]
+    assert (w["outerWidth"], w["outerHeight"]) == (1910, 1019)
+    assert (w["innerWidth"], w["innerHeight"]) == (1910, 933)  # the chrome between outer and inner kept
+    assert (w["screenX"], w["screenY"]) == (0, 0)
+    # a smaller screen, a window placed so its frame would cross the edge
+    fp = {"window": {"outerWidth": 1200, "outerHeight": 700, "screenX": 160, "screenY": 30}}
+    config = {"screen.availWidth": 1366, "screen.availHeight": 741, "window.outerWidth": 1200, "window.outerHeight": 700,
+              "window.screenX": 160, "window.screenY": 30}
+    assert identity.fit_window(fp, config, (10, 34))
+    assert fp["window"] == {"outerWidth": 1200, "outerHeight": 700, "screenX": 156, "screenY": 7}
+    # already fits: untouched
+    fp = {"window": {"outerWidth": 1000, "outerHeight": 600}}
+    config = {"screen.availWidth": 1366, "screen.availHeight": 741, "window.outerWidth": 1000, "window.outerHeight": 600,
+              "window.screenX": 10, "window.screenY": 10}
+    assert not identity.fit_window(fp, config, (10, 34)) and fp == {"window": {"outerWidth": 1000, "outerHeight": 600}}
+    assert not identity.fit_window({}, config, (10, 34))
+
+
+def test_a_new_identity_resolves_the_fitted_window(tmp_path):
+    fp = {"window": {"outerWidth": 1920, "outerHeight": 1080, "innerWidth": 1920, "innerHeight": 994, "screenX": 0, "screenY": 0}}
+    seen = []
+
+    def resolve(f):
+        seen.append(f)
+        w = f["window"]
+        config = {"screen.availWidth": 1920, "screen.availHeight": 1053, "window.outerWidth": min(w["outerWidth"], 1920),
+                  "window.outerHeight": min(w["outerHeight"], 1053), "window.innerHeight": min(w["innerHeight"], 967),
+                  "window.screenX": 0, "window.screenY": 0, "navigator.hardwareConcurrency": 32}
+        return {"env": {"CAMOU_CONFIG_1": json.dumps(config)}}
+
+    ident = identity.create(lambda: fp, resolve, "en-US", "", "x", frame=(10, 34))
+    assert len(seen) == 2 and seen[1]["window"]["outerWidth"] == 1910
+    assert ident["fingerprint"]["window"]["outerHeight"] == 1019
+    assert ident["pinned"] == {"navigator.hardwareConcurrency": 32}
+
+
+@pytest.mark.parametrize("resolved,limit,want", [
+    (32, 2, 4),      # a 2-CPU browser on a 32-core node: the table's floor
+    (32, 0.5, 4),
+    (32, 4, 4),
+    (32, 5, 4),      # snapped DOWN into real desktop counts
+    (32, 6, 6),
+    (16, 12.5, 12),  # 13 is no desktop's count
+    (16, 64, 16),    # never more than the node has
+    (32, None, 32),  # no CPU limit: what Camoufox resolved
+    ("x", 2, "x"),
+])
+def test_the_core_count_follows_the_cpu_limit(resolved, limit, want):
+    assert identity.fit_cores(resolved, limit) == want
+
+
+def test_cpu_limit_from_the_cgroup(tmp_path):
+    assert identity.cpu_limit(tmp_path) is None
+    (tmp_path / "cpu.max").write_text("200000 100000\n")
+    assert identity.cpu_limit(tmp_path) == 2.0
+    (tmp_path / "cpu.max").write_text("max 100000\n")
+    assert identity.cpu_limit(tmp_path) is None
+    v1 = tmp_path / "v1"
+    (v1 / "cpu").mkdir(parents=True)
+    (v1 / "cpu" / "cpu.cfs_quota_us").write_text("150000\n")
+    (v1 / "cpu" / "cpu.cfs_period_us").write_text("100000\n")
+    assert identity.cpu_limit(v1) == 1.5
+    (v1 / "cpu" / "cpu.cfs_quota_us").write_text("-1\n")
+    assert identity.cpu_limit(v1) is None
 
 
 def test_chrome_profile_is_recognised(tmp_path):
@@ -124,10 +201,19 @@ def test_a_newer_major_is_refused_unless_imported_on_purpose(tmp_path):
     assert "newer Camoufox" in str(e.value)
     marker = tmp_path / profile_guard.DOWNGRADE_MARKER
     marker.write_text("157.0-beta.1\n")
+    assert profile_guard.downgrade_marker(tmp_path)
     assert profile_guard.downgrade_args(tmp_path, OWN) == ["-allow-downgrade"]
-    assert not marker.exists()  # used once
+    # still there: a launch that fails is retried with it; the launcher
+    # removes it once the browser is up
+    assert marker.exists()
+    assert profile_guard.downgrade_args(tmp_path, OWN) == ["-allow-downgrade"]
+    profile_guard.consume_downgrade_marker(tmp_path)
+    assert not marker.exists() and not profile_guard.downgrade_marker(tmp_path)
+    profile_guard.consume_downgrade_marker(tmp_path)  # gone already: fine
     with pytest.raises(profile_guard.ProfileNewer):
         profile_guard.downgrade_args(tmp_path, OWN)
+    # what the caller read decides, not the disk
+    assert profile_guard.downgrade_args(tmp_path, OWN, forced=True) == ["-allow-downgrade"]
 
 
 def test_no_compatibility_file_and_a_stray_marker(tmp_path):
@@ -135,7 +221,6 @@ def test_no_compatibility_file_and_a_stray_marker(tmp_path):
     (tmp_path / profile_guard.DOWNGRADE_MARKER).write_text("x")
     compat(tmp_path, "155.0-beta.9", "1")
     assert profile_guard.downgrade_args(tmp_path, OWN) == []
-    assert not (tmp_path / profile_guard.DOWNGRADE_MARKER).exists()
 
 
 def fake_proc(root: Path, pid: int, argv, state="S"):

@@ -64,7 +64,11 @@ def fake_statvfs(total_bytes):
 
 def test_managed_prefs(tmp_path):
     four_gi = fake_statvfs(4 << 30)
-    assert prefs.managed_prefs(Settings.from_env({}), tmp_path, four_gi) == {prefs.QUOTA_PREF: (4 << 30) // 2 // 1024}
+    assert prefs.managed_prefs(Settings.from_env({}), tmp_path, four_gi) == {
+        prefs.QUOTA_PREF: (4 << 30) // 2 // 1024,
+        # camoufox.cfg ships false: a file:// page could read the profile
+        "security.fileuri.strict_origin_policy": True,
+    }
     off = prefs.managed_prefs(Settings.from_env({"BROWSER_GEOLOCATION": "off"}), tmp_path, four_gi)
     assert off[prefs.GEO_PREF] == 2
     fixed = prefs.managed_prefs(Settings.from_env({"BROWSER_GEOLOCATION": "fixed:1,2,3"}), tmp_path, four_gi)
@@ -122,3 +126,27 @@ def test_strip_tolerates_odd_files(tmp_path):
     (tmp_path / "prefs.js").write_text('user_pref("a\\"b", 1);\nuser_pref("a", 2);\ngarbage\n')
     assert prefs.strip_prefs_js(tmp_path, ['a"b']) == 1
     assert (tmp_path / "prefs.js").read_text() == 'user_pref("a", 2);\ngarbage\n'
+
+
+def test_every_launch_strips_every_managed_name_whatever_the_record_says(tmp_path):
+    """The record travels in archives: one shorter than its prefs.js (a
+    hand-edited export, an older image's) must not keep a managed pref live."""
+    write_prefs_js(tmp_path, [("network.proxy.type", 1), ("network.proxy.http", "203.0.113.9"), ("network.proxy.http_port", 8080),
+                              (prefs.QUOTA_PREF, 5), ("security.fileuri.strict_origin_policy", False), ("ui.x", 1)])
+    prefs.record(tmp_path, [prefs.QUOTA_PREF])
+    assert prefs.clear_previous(tmp_path) == 5
+    text = (tmp_path / "prefs.js").read_text()
+    assert "network.proxy" not in text and "strict_origin_policy" not in text
+    assert 'user_pref("ui.x", 1);' in text
+    # and a recorded name outside the managed set (a library pref) goes too
+    write_prefs_js(tmp_path, [("webgl.force-enabled", True), ("ui.x", 1)])
+    prefs.record(tmp_path, ["webgl.force-enabled"])
+    assert prefs.clear_previous(tmp_path) == 1
+
+
+def test_the_managed_set_covers_every_pref_this_module_passes(tmp_path):
+    every = {}
+    for env in ({}, {"BROWSER_GEOLOCATION": "off"}, {"BROWSER_PROXY_SERVER": "http://127.0.0.1:3128"},
+                {"BROWSER_PROXY_SERVER": "socks5://10.0.0.1:1080"}):
+        every.update(prefs.managed_prefs(Settings.from_env(env), tmp_path, fake_statvfs(4 << 30)))
+    assert set(every) <= set(prefs.FIRST_LAUNCH_NAMES)

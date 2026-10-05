@@ -17,6 +17,7 @@ class Upstream:
         self.heads = []
         self.server = None
         self.port = None
+        self.answer = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
 
     async def start(self):
         self.server = await asyncio.start_server(self.handle, "127.0.0.1", 0)
@@ -26,8 +27,21 @@ class Upstream:
     async def handle(self, r, w):
         head = await r.readuntil(b"\r\n\r\n")
         self.heads.append(head.decode("latin-1"))
-        w.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+        w.write(self.answer)
         await w.drain()
+        if not self.answer.split(b"\r\n", 1)[0].endswith(b"101 Switching Protocols"):
+            # a plain HTTP answer kept alive (as Playwright's own handler does):
+            # every further request on this connection is recorded too
+            while True:
+                try:
+                    head = await r.readuntil(b"\r\n\r\n")
+                except (asyncio.IncompleteReadError, ConnectionError):
+                    break
+                self.heads.append(head.decode("latin-1"))
+                w.write(b'HTTP/1.1 200 OK\r\nContent-Length: 40\r\n\r\n{"wsEndpointPath":"/0123456789abcdef01"}')
+                await w.drain()
+            w.close()
+            return
         while True:
             data = await r.read(65536)
             if not data:
@@ -98,6 +112,10 @@ async def test_a_playwright_upgrade_reaches_the_live_server(world):
     (upgrade("/playwright/default/x"), "404"),
     (upgrade("/"), "404"),
     (upgrade(upgrade_hdr=False), "400"),
+    # Upgrade without "Connection: upgrade": Node would answer it as a plain
+    # request and keep the connection open for an unchecked second one
+    (upgrade(upgrade_hdr=False, extra="Upgrade: websocket\r\n"), "400"),
+    (upgrade(upgrade_hdr=False, extra="Upgrade: websocket\r\nConnection: keep-alive\r\n"), "400"),
     (upgrade(method="POST"), "400"),
     (b"GET /playwright/default HTTP/1.1\r\nX: " + b"a" * 17000 + b"\r\n\r\n", "431"),
     (b"garbage\r\n\r\n", "400"),
@@ -127,6 +145,27 @@ async def test_a_restart_holds_new_connections_then_503(world):
     line, r, w = await send(proxy.bind_port, upgrade())
     assert line == "HTTP/1.1 101 Switching Protocols"
     assert up.heads[-1].startswith("GET /ffff HTTP/1.1")
+    w.close()
+
+
+async def test_only_a_101_is_tunnelled(world):
+    """A server answer other than 101 (Playwright's 428 for a client of
+    another version) reaches the client with its body; the connection then
+    closes, so a second request on it never reaches the server."""
+    proxy, up = world
+    body = b"Playwright version mismatch: server v1.62, client v1.63"
+    up.answer = (b"HTTP/1.1 428 Precondition Required\r\nContent-Length: " + str(len(body)).encode()
+                 + b"\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\n\r\n" + body)
+    second = b"GET /json HTTP/1.1\r\nHost: localhost\r\nOrigin: http://evil.example\r\n\r\n"
+    r, w = await asyncio.open_connection("127.0.0.1", proxy.bind_port)
+    w.write(upgrade() + second)
+    await w.drain()
+    got = await asyncio.wait_for(r.read(), timeout=10)  # read() returns once the proxy closed
+    assert got.startswith(b"HTTP/1.1 428 Precondition Required\r\n")
+    assert got.endswith(b"\r\n\r\n" + body)
+    assert b"Connection: close\r\n" in got and b"keep-alive" not in got.lower()
+    assert len(up.heads) == 1 and "/json" not in up.heads[0]
+    assert proxy.clients == 0
     w.close()
 
 

@@ -4,9 +4,10 @@ A pref Firefox was once given stays in the profile's prefs.js after the
 launch that set it (Playwright also rewrites user.js at every launch, but
 prefs.js keeps what Firefox saved). So before every launch, with Firefox not
 running, every pref the PREVIOUS launch passed (recorded in
-.livellm-managed-prefs.json; a fixed list before the first) is removed from
-prefs.js, and only what the current settings need is passed again. A
-setting cleared on the Browser really goes back to the browser's default.
+.livellm-managed-prefs.json) and every name this module can manage is
+removed from prefs.js, and only what the current settings need is passed
+again. A setting cleared on the Browser really goes back to the browser's
+default.
 """
 import json
 import logging
@@ -26,6 +27,15 @@ INT32_MAX = 2**31 - 1
 
 GEO_PREF = "permissions.default.geo"
 GEO_DENY, GEO_ALLOW = 2, 1
+
+# Passed at every launch, whatever the settings. camoufox.cfg ships
+# security.fileuri.strict_origin_policy=false, which lets a file:// page
+# read any file the browser's user can (the profile's cookies included);
+# Firefox's own default, true, keeps a local file to itself. Not visible to
+# web pages.
+ALWAYS = {
+    "security.fileuri.strict_origin_policy": True,
+}
 
 
 def proxied_prefs(proxy: dict) -> dict:
@@ -75,9 +85,10 @@ def proxied_prefs(proxy: dict) -> dict:
     return prefs
 
 
-# Before any record exists: every name this module can manage.
+# Every name this module can manage: stripped before every launch (and all
+# a missing record would have listed).
 _EVERY_PROXY_NAME = sorted(set(proxied_prefs({"server": "http://127.0.0.1:3128"})) | set(proxied_prefs({"server": "socks5://127.0.0.1:1080"})))
-FIRST_LAUNCH_NAMES = tuple(sorted({GEO_PREF, QUOTA_PREF, *_EVERY_PROXY_NAME}))
+FIRST_LAUNCH_NAMES = tuple(sorted({GEO_PREF, QUOTA_PREF, *ALWAYS, *_EVERY_PROXY_NAME}))
 
 
 def quota_limit_kb(profile_dir: Path, statvfs=os.statvfs) -> Optional[int]:
@@ -100,7 +111,7 @@ def quota_limit_kb(profile_dir: Path, statvfs=os.statvfs) -> Optional[int]:
 
 def managed_prefs(settings: Settings, profile_dir: Path, statvfs=os.statvfs) -> dict:
     """The prefs this launch passes for the browser's settings."""
-    prefs: dict = {}
+    prefs: dict = dict(ALWAYS)
     if settings.geolocation == "off":
         prefs[GEO_PREF] = GEO_DENY
     elif isinstance(settings.geolocation, dict):
@@ -160,8 +171,11 @@ def previous_names(profile_dir: Path) -> list:
 
 
 def clear_previous(profile_dir: Path) -> int:
-    """Before a launch: drop from prefs.js what the previous launch passed."""
-    removed = strip_prefs_js(profile_dir, previous_names(profile_dir))
+    """Before a launch: drop from prefs.js what the previous launch passed,
+    and always every name this module manages. The record travels with the
+    profile (snapshots, exports, imports), so it may be shorter than the
+    prefs.js beside it; a managed name it leaves out still goes."""
+    removed = strip_prefs_js(profile_dir, set(FIRST_LAUNCH_NAMES) | set(previous_names(profile_dir)))
     if removed:
         logger.info(f"Cleared {removed} prefs the last launch had set")
     return removed

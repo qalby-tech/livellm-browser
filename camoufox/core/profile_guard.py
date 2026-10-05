@@ -8,7 +8,8 @@ leaves behind.
   Opened by a newer build of the same major (a rollback), Camoufox starts
   with -allow-downgrade; by a newer major, it does not start, unless the
   keeper imported that profile on purpose (it leaves .livellm-allow-downgrade,
-  used once).
+  used once: removed only after a launch that read it got the browser up, so
+  a launch that fails is retried with it).
 - Playwright starts Firefox in a process group of its own, so killing the
   server does not kill Firefox: every Camoufox process is found in /proc and
   killed before a relaunch.
@@ -85,17 +86,30 @@ class ProfileNewer(Exception):
         self.own_version = own_version
 
 
-def downgrade_args(profile_dir: Path, own: Tuple[str, str]) -> List[str]:
+def downgrade_marker(profile_dir: Path) -> bool:
+    """The keeper left the forced-import marker."""
+    marker = Path(profile_dir) / DOWNGRADE_MARKER
+    return marker.exists() or marker.is_symlink()
+
+
+def consume_downgrade_marker(profile_dir: Path) -> None:
+    """After a launch that read the marker got the browser up: it is used."""
+    try:
+        (Path(profile_dir) / DOWNGRADE_MARKER).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning(f"Could not remove {DOWNGRADE_MARKER}: {e}")
+
+
+def downgrade_args(profile_dir: Path, own: Tuple[str, str], forced: Optional[bool] = None) -> List[str]:
     """The extra arguments this profile needs, or ProfileNewer.
 
-    The keeper's marker is used once: removed here whatever it decided."""
-    marker = Path(profile_dir) / DOWNGRADE_MARKER
-    forced = marker.exists() or marker.is_symlink()
-    if forced:
-        try:
-            marker.unlink()
-        except OSError:
-            pass
+    ``forced``: the keeper's marker is there (read from the disk when None).
+    The marker is never removed here: the launcher removes it once the launch
+    that read it has the browser up (consume_downgrade_marker)."""
+    if forced is None:
+        forced = downgrade_marker(profile_dir)
     last = last_opened_by(profile_dir)
     if not last or not own[0] or compare(last, own) <= 0:
         return []

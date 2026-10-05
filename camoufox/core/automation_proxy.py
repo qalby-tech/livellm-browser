@@ -5,15 +5,19 @@ proxy at the stable path /playwright/default; the server itself listens on
 loopback at an ephemeral port and a random path that change with every
 launch, so this proxy is the only way in, and it admits only:
 
-- a WebSocket upgrade (GET) of exactly /playwright/default (the query is
-  dropped: the console's ?token= never reaches Playwright);
+- a WebSocket upgrade (GET, Upgrade: websocket, Connection: upgrade) of
+  exactly /playwright/default (the query is dropped: the console's ?token=
+  never reaches Playwright);
 - with no Origin header. Playwright clients send none; a web page always
   does, so a page in the browser (or anywhere) can't drive it.
 
 The whole request head is read (up to 16 KiB, else 431) before anything is
 decided or forwarded. The path is rewritten to the live one and Host to the
-server's, then bytes are tunnelled (one request per connection). During a
-restart a new connection waits up to 30 s for the next server, else 503.
+server's. Bytes are tunnelled only once the server answered 101 (one request
+per connection): any other answer (Playwright's 428 for a client of another
+version, say) is passed on with its body and the connection closes, so no
+second request on it ever reaches the server unchecked. During a restart a
+new connection waits up to 30 s for the next server, else 503.
 Connections are counted: the browser's housekeeping closes the contexts
 clients left once none has been connected for a while.
 """
@@ -26,7 +30,9 @@ from urllib.parse import urlsplit
 logger = logging.getLogger(__name__)
 
 MAX_HEAD = 16 * 1024
-REASONS = {400: "Bad Request", 403: "Forbidden", 404: "Not Found", 431: "Request Header Fields Too Large", 503: "Service Unavailable"}
+MAX_REFUSAL_BODY = 64 * 1024   # the body of a server answer that is not 101
+REASONS = {400: "Bad Request", 403: "Forbidden", 404: "Not Found", 431: "Request Header Fields Too Large",
+           502: "Bad Gateway", 503: "Service Unavailable"}
 
 
 def parse_head(head: bytes):
@@ -48,6 +54,23 @@ def parse_head(head: bytes):
         name, _, value = line.partition(":")
         headers.append((name.strip(), value.strip()))
     return parts[0], parts[1], parts[2], headers
+
+
+def parse_response_head(head: bytes):
+    """(status, {lowercased name: value}) of a response head, or None."""
+    try:
+        lines = head.decode("latin-1").split("\r\n")
+        parts = lines[0].split(" ", 2)
+        if len(parts) < 2 or not parts[0].startswith("HTTP/1.") or not parts[1].isdigit():
+            return None
+        headers = {}
+        for line in lines[1:]:
+            name, sep, value = line.partition(":")
+            if sep:
+                headers.setdefault(name.strip().lower(), value.strip())
+        return int(parts[1]), headers
+    except UnicodeDecodeError:
+        return None
 
 
 class AutomationProxy:
@@ -145,7 +168,8 @@ class AutomationProxy:
             return await self._answer(writer, 403)
         if urlsplit(target).path != self.path:
             return await self._answer(writer, 404)
-        if method != "GET" or lower.get("upgrade", "").lower() != "websocket":
+        connection = {t.strip().lower() for t in lower.get("connection", "").split(",")}
+        if method != "GET" or lower.get("upgrade", "").lower() != "websocket" or "upgrade" not in connection:
             return await self._answer(writer, 400)
 
         upstream = await self._connect()
@@ -159,8 +183,25 @@ class AutomationProxy:
                 continue
             out.append(f"{name}: {value}")
         out.insert(1, f"Host: 127.0.0.1:{port}")
-        up_writer.write(("\r\n".join(out) + "\r\n\r\n").encode("latin-1") + rest)
+        # Only the head: a WebSocket client sends nothing before the 101, and
+        # bytes after the head (a pipelined request) wait for that answer.
+        up_writer.write(("\r\n".join(out) + "\r\n\r\n").encode("latin-1"))
 
+        try:
+            got = await asyncio.wait_for(self._read_head(up_reader), timeout=30)
+        except (OverflowError, asyncio.TimeoutError, ConnectionError, OSError):
+            got = None
+        if got is None:
+            up_writer.close()
+            return await self._answer(writer, 502)
+        answer, early = got
+        status_line = answer.split(b"\r\n", 1)[0].split(b" ")
+        if len(status_line) < 2 or status_line[1] != b"101":
+            return await self._refused(answer, early, up_reader, up_writer, writer)
+
+        writer.write(answer + early)
+        if rest:
+            up_writer.write(rest)
         self.clients += 1
         try:
             await asyncio.gather(self._pipe(reader, up_writer), self._pipe(up_reader, writer), return_exceptions=True)
@@ -168,6 +209,35 @@ class AutomationProxy:
             self.clients -= 1
             if self.clients == 0:
                 self._idle_since = time.monotonic()
+
+    async def _refused(self, answer: bytes, early: bytes, up_reader, up_writer, writer) -> None:
+        """The server answered something other than 101: pass it on (head and
+        a bounded body, Connection: close), then close both sides."""
+        parsed = parse_response_head(answer[:-4])
+        body = early
+        try:
+            if parsed is not None:
+                length = parsed[1].get("content-length")
+                if length is not None and length.isdigit():
+                    want = min(int(length), MAX_REFUSAL_BODY)
+                    while len(body) < want:
+                        chunk = await asyncio.wait_for(up_reader.read(want - len(body)), timeout=5)
+                        if not chunk:
+                            break
+                        body += chunk
+                    body = body[:want]
+            head = answer[:-4].split(b"\r\n")
+            kept = [head[0]] + [h for h in head[1:] if h.split(b":", 1)[0].strip().lower() not in (b"connection", b"keep-alive", b"content-length", b"transfer-encoding")]
+            if parsed is not None and "transfer-encoding" in parsed[1]:
+                body = b""  # a chunked body is not relayed
+            kept += [b"Content-Length: " + str(len(body)).encode(), b"Connection: close"]
+            writer.write(b"\r\n".join(kept) + b"\r\n\r\n" + body)
+            await writer.drain()
+        except (asyncio.TimeoutError, ConnectionError, OSError):
+            pass
+        finally:
+            up_writer.close()
+            writer.close()
 
     async def _connect(self):
         """Open a connection to the live server, waiting out a restart."""

@@ -20,6 +20,12 @@ UBO_DIR = Path(os.environ.get("LIVELLM_UBO_DIR") or "/opt/camoufox-addons/ubo")
 
 # The window: the desktop's whole display (startup.sh runs Xvnc at 1920x1080).
 DISPLAY_SIZE = (1920, 1080)
+# The frame xfwm4 (the desktop's window manager, its Default theme) draws
+# around the browser window: 5 px left and right, a 29 px title bar and 5 px
+# below. Camoufox sizes the window's inside to the identity's window size and
+# pages read outerWidth/outerHeight WITH the frame, so the identity's window
+# is drawn this much smaller than its screen's available area.
+WINDOW_FRAME = (10, 34)
 
 
 def automation_port() -> int:

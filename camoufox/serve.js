@@ -33,18 +33,8 @@ const readline = require('readline');
 
 const out = process.stdout;
 const send = (obj) => out.write(JSON.stringify(obj) + '\n');
-// Playwright and anything else that logs write to stderr, never stdout.
-for (const k of ['log', 'info', 'debug']) console[k] = (...a) => console.error(...a);
 
-const driverPackage = process.argv[2];
-let pw;
-try {
-  pw = require(path.join(driverPackage, 'index.js'));
-} catch (e) {
-  console.error('serve.js: cannot load Playwright from ' + driverPackage + ': ' + e.message);
-  process.exit(2);
-}
-
+let pw = null;
 let server = null;
 let client = null;
 let closing = false;
@@ -73,9 +63,23 @@ function clean(c, now) {
 }
 
 const keyOf = (c) => [c.name, c.domain, c.path].join('\u0000');
+const bare = (domain) => String(domain || '').replace(/^\./, '');
 
-async function addCookies(args) {
-  const ctx = defaultContext();
+function hostOf(c) {
+  try { return new URL(c.url).hostname; } catch (e) { return ''; }
+}
+
+// The path Playwright gives a cookie set by url: the url's directory.
+function urlPath(c) {
+  try {
+    const u = new URL(c.url).pathname;
+    return u.slice(0, u.lastIndexOf('/') + 1) || '/';
+  } catch (e) {
+    return '/';
+  }
+}
+
+async function addCookies(ctx, args) {
   const given = Array.isArray(args.cookies) ? args.cookies : [];
   const now = Math.floor(Date.now() / 1000);
   let cookies = given.filter((c) => c && typeof c === 'object').map((c) => clean(c, now));
@@ -105,24 +109,25 @@ async function addCookies(args) {
     }
   }
   // Firefox may take a cookie without an error and still not keep it: count
-  // what the browser really holds afterwards. A cookie given by url is matched
-  // by name and that url's host.
-  const have = new Set((await ctx.cookies()).map((c) => [c.name, c.domain.replace(/^\./, ''), c.path].join('\u0000')));
-  const hostOf = (c) => { try { return new URL(c.url).hostname; } catch (e) { return ''; } };
+  // what the browser really holds afterwards, value included (a refused
+  // cookie must not count because an older one of the same name is there).
+  // A cookie given by url is matched by name and that url's host.
+  const held = (name, domain, p, value) => [name, domain, p, value].join('\u0000');
+  const have = new Set((await ctx.cookies()).map((c) => held(c.name, bare(c.domain), c.path, c.value)));
   let added = 0;
   for (const c of cookies) {
-    const domain = (c.domain || hostOf(c)).replace(/^\./, '');
-    const p = c.path || (c.url ? (() => { try { const u = new URL(c.url).pathname; return u.slice(0, u.lastIndexOf('/') + 1) || '/'; } catch (e) { return '/'; } })() : '/');
-    if (have.has([c.name, domain, p].join('\u0000')) || have.has([c.name, domain, '/'].join('\u0000'))) added++;
+    const domain = bare(c.domain || hostOf(c));
+    const p = c.path || (c.url ? urlPath(c) : '/');
+    const value = c.value === undefined ? '' : String(c.value);
+    if (have.has(held(c.name, domain, p, value)) || have.has(held(c.name, domain, '/', value))) added++;
     else dropped++;
   }
   return { added, dropped, skipped };
 }
 
-async function prune(args) {
+async function prune(ctxs, args) {
   const idleMs = Math.max(0, Number(args.idleSeconds || 60) * 1000);
   const now = Date.now();
-  const ctxs = client.contexts();
   let closed = 0;
   for (const ctx of ctxs.slice(1)) {
     if (!args.closeAll) {
@@ -140,7 +145,7 @@ async function prune(args) {
       console.error('serve.js: closing a context failed: ' + String(e.message).split('\n')[0]);
     }
   }
-  return { closed, open: client.contexts().length };
+  return { closed, open: ctxs.length - closed };
 }
 
 async function shutdown(code) {
@@ -160,9 +165,9 @@ async function handle(req) {
     case 'cookies.get':
       return await defaultContext().cookies();
     case 'cookies.add':
-      return await addCookies(req.args || {});
+      return await addCookies(defaultContext(), req.args || {});
     case 'contexts.prune':
-      return await prune(req.args || {});
+      return await prune(client.contexts(), req.args || {});
     case 'close':
       setImmediate(() => shutdown(0));
       return { closing: true };
@@ -182,31 +187,46 @@ async function main(options) {
   send({ event: 'listening', port: Number(u.port), wsPath: u.pathname, pid: proc ? proc.pid : null, version: client.version() });
 }
 
-const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-let started = false;
-rl.on('line', (line) => {
-  if (!line.trim()) return;
-  let msg;
+function run() {
+  // Playwright and anything else that logs write to stderr, never stdout.
+  for (const k of ['log', 'info', 'debug']) console[k] = (...a) => console.error(...a);
+  const driverPackage = process.argv[2];
   try {
-    msg = JSON.parse(line);
+    pw = require(path.join(driverPackage, 'index.js'));
   } catch (e) {
-    console.error('serve.js: a line that is not JSON');
-    return;
+    console.error('serve.js: cannot load Playwright from ' + driverPackage + ': ' + e.message);
+    process.exit(2);
   }
-  if (!started) {
-    started = true;
-    main(msg.options || {}).catch((e) => {
-      console.error('serve.js: launch failed: ' + e.message);
-      send({ event: 'failed', error: String(e.message || e).split('\n').slice(0, 6).join('\n') });
-      process.exit(1);
-    });
-    return;
-  }
-  Promise.resolve()
-    .then(() => handle(msg))
-    .then((result) => send({ id: msg.id, ok: true, result }))
-    .catch((e) => send({ id: msg.id, ok: false, error: String(e.message || e).split('\n')[0] }));
-});
-// The launcher went away: take the browser with us.
-rl.on('close', () => shutdown(0));
-process.on('SIGTERM', () => shutdown(0));
+  const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  let started = false;
+  rl.on('line', (line) => {
+    if (!line.trim()) return;
+    let msg;
+    try {
+      msg = JSON.parse(line);
+    } catch (e) {
+      console.error('serve.js: a line that is not JSON');
+      return;
+    }
+    if (!started) {
+      started = true;
+      main(msg.options || {}).catch((e) => {
+        console.error('serve.js: launch failed: ' + e.message);
+        send({ event: 'failed', error: String(e.message || e).split('\n').slice(0, 6).join('\n') });
+        process.exit(1);
+      });
+      return;
+    }
+    Promise.resolve()
+      .then(() => handle(msg))
+      .then((result) => send({ id: msg.id, ok: true, result }))
+      .catch((e) => send({ id: msg.id, ok: false, error: String(e.message || e).split('\n')[0] }));
+  });
+  // The launcher went away: take the browser with us.
+  rl.on('close', () => shutdown(0));
+  process.on('SIGTERM', () => shutdown(0));
+}
+
+if (require.main === module) run();
+
+module.exports = { clean, addCookies, prune, MAX_AGE_S };

@@ -1,10 +1,11 @@
 """The one Camoufox browser of this pod: launch, close, restart, pause, the
 watchdog and the housekeeping.
 
-States: starting -> running; restarting (a relaunch is under way); paused
-(closed on purpose while the keeper copies the profile, bounded); error
-(the browser can't start: a Chrome profile on the disk, a profile from a
-newer Camoufox, or a launch that failed and is retried).
+States: starting -> running; restarting (a relaunch is under way, or the
+running browser stopped answering and the watchdog is about to relaunch
+it); paused (closed on purpose while the keeper copies the profile,
+bounded); error (the browser can't start: a Chrome profile on the disk, a
+profile from a newer Camoufox, or a launch that failed and is retried).
 """
 import asyncio
 import json
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 RESTART_GRACE = 90.0   # /health says "restarting" (200) this long into a relaunch
 CLOSE_TIMEOUT = 15.0
 PING_TIMEOUT = 10.0
+PING_OVERDUE = 5.0     # a ping unanswered this long: /health says "restarting"
 MISSES_TO_RELAUNCH = 3
 WATCHDOG_EVERY = 10.0
 SAVE_COOKIES_TICKS = 6  # x WATCHDOG_EVERY
@@ -38,17 +40,18 @@ PROFILE_ENGINE_MESSAGE = "This disk holds a Chrome browser's profile; a Camoufox
 
 def default_lib():
     """The camoufox library calls the launcher uses (a seam for the tests)."""
+    from camoufox import fingerprints
     from camoufox.addons import DefaultAddons
-    from camoufox.fingerprints import Screen, generate_fingerprint
     from camoufox.server import to_camel_case_dict
     from camoufox.utils import launch_options
 
     return SimpleNamespace(
         launch_options=launch_options,
-        generate_fingerprint=generate_fingerprint,
-        Screen=Screen,
+        generate_fingerprint=fingerprints.generate_fingerprint,
+        Screen=fingerprints.Screen,
         UBO=DefaultAddons.UBO,
         to_camel=to_camel_case_dict,
+        core_counts=tuple(getattr(fingerprints, "PLAUSIBLE_CORE_COUNTS", identity.CORE_COUNTS)),
     )
 
 
@@ -65,7 +68,8 @@ class CamoufoxManager:
     def __init__(self, proxy: AutomationProxy, profile_dir: Path = const.PROFILE_DIR,
                  camoufox_dir: Path = const.CAMOUFOX_DIR, lib=None,
                  serve_factory: Callable[[], ServeProcess] = default_serve,
-                 settings_fn: Callable[[], Settings] = Settings.from_env, proc_root: Path = Path("/proc")):
+                 settings_fn: Callable[[], Settings] = Settings.from_env, proc_root: Path = Path("/proc"),
+                 cgroup_root: Path = Path("/sys/fs/cgroup")):
         self.proxy = proxy
         self.profile_dir = Path(profile_dir)
         self.camoufox_dir = Path(camoufox_dir)
@@ -73,6 +77,7 @@ class CamoufoxManager:
         self.serve_factory = serve_factory
         self.settings_fn = settings_fn
         self.proc_root = proc_root
+        self.cgroup_root = Path(cgroup_root)
         self.proc: Optional[ServeProcess] = None
         self.state = "stopped"
         self.error: Optional[str] = None
@@ -82,6 +87,8 @@ class CamoufoxManager:
         self.paused_until: Optional[float] = None
         self.misses = 0
         self.relaunches = 0
+        self._forced = False
+        self._ping_since: Optional[float] = None
         self._ticks = 0
         self._booted = False
         self._lock: Optional[asyncio.Lock] = None
@@ -113,6 +120,12 @@ class CamoufoxManager:
         if self.paused():
             return 200, {"status": "paused"}
         if self.running():
+            # Firefox stopped answering (a parent hang): the watchdog
+            # relaunches it after MISSES_TO_RELAUNCH, so it is restarting
+            # already. Bounded by the watchdog: a miss resets on an answer,
+            # and the relaunch has its own RESTART_GRACE.
+            if self.misses > 0 or self._ping_overdue(now):
+                return 200, {"status": "restarting"}
             return 200, {"status": "ok"}
         if self.error in ("profile_engine", "profile_newer"):
             return 503, {"error": self.error, "message": self.error_message}
@@ -122,6 +135,9 @@ class CamoufoxManager:
         if self.error:
             body["error"] = self.error
         return 503, body
+
+    def _ping_overdue(self, now: float) -> bool:
+        return self._ping_since is not None and now - self._ping_since >= PING_OVERDUE
 
     def version(self) -> dict:
         v, _build = const.browser_version(self.camoufox_dir)
@@ -160,7 +176,12 @@ class CamoufoxManager:
             return lib.launch_options(**kw)
 
         ident = identity.create(generate, resolve, settings.locale, settings.timezone,
-                                f"camoufox-{const.CAMOUFOX_LIB_VERSION}/v{version}")
+                                f"camoufox-{const.CAMOUFOX_LIB_VERSION}/v{version}", frame=const.WINDOW_FRAME)
+        cores = ident["pinned"].get(identity.CORES_KEY)
+        fitted = identity.fit_cores(cores, identity.cpu_limit(self.cgroup_root),
+                                    getattr(lib, "core_counts", None) or identity.CORE_COUNTS)
+        if fitted != cores:
+            ident["pinned"][identity.CORES_KEY] = fitted
         identity.save(self.profile_dir, ident)
         logger.info(f"A new browser identity ({ident['pinned']})")
         return ident
@@ -174,8 +195,11 @@ class CamoufoxManager:
         profile_guard.kill_all(self.camoufox_dir, self.proc_root)
         profile.mkdir(parents=True, exist_ok=True)
         profile_guard.remove_locks(profile)
+        # The keeper's forced-import marker is removed only once this launch
+        # has the browser up (_launch): a launch that fails is retried with it.
+        self._forced = profile_guard.downgrade_marker(profile)
         try:
-            extra = profile_guard.downgrade_args(profile, const.browser_version(self.camoufox_dir))
+            extra = profile_guard.downgrade_args(profile, const.browser_version(self.camoufox_dir), forced=self._forced)
         except profile_guard.ProfileNewer as e:
             return None, ("profile_newer", str(e))
         prefs.clear_previous(profile)
@@ -209,6 +233,9 @@ class CamoufoxManager:
             await proc.wait(5)
             return self._fail("launch_failed", str(e))
         self.proc = proc
+        if self._forced:
+            self._forced = False
+            await asyncio.to_thread(profile_guard.consume_downgrade_marker, self.profile_dir)
         await self._restore_cookies(proc, settings)
         self.proxy.retarget(int(listening["port"]), listening["wsPath"])
         self.state, self.error, self.error_message = "running", None, ""
@@ -381,6 +408,7 @@ class CamoufoxManager:
             await self._relaunch(self.proc)
             return
         proc = self.proc
+        self._ping_since = time.monotonic()
         try:
             await proc.request("ping", timeout=PING_TIMEOUT)
             self.misses = 0
@@ -392,6 +420,8 @@ class CamoufoxManager:
                 proc.kill()
                 await self._relaunch(proc)
             return
+        finally:
+            self._ping_since = None
         if self._ticks % SAVE_COOKIES_TICKS == 0:
             await self._save_session_cookies(proc)
         if self._ticks % PRUNE_TICKS == 0:

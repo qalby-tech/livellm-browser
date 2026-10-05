@@ -214,10 +214,10 @@ Every response for which a browser was chosen carries `X-Browser-Id` naming it.
 |--------|------|
 | `400` | The path names one browser and `X-Browser-Id` another, or `start_session`'s body names another |
 | `404` | The named browser is not in the controller, or the session is unknown (never started, ended, or its browser was removed) |
-| `409` | A named browser contradicts the session's browser; `start_session` with an `engine` this Browser API holds no browser of, or that a named browser does not run |
+| `409` | A named browser contradicts the session's browser; `start_session` with an `engine` this Browser API holds no browser of (also when it holds no browser at all), or that a named browser does not run |
 | `502` | The named (or session's) browser cannot be reached |
 | `422` | `start_session`'s `engine` is neither `chrome` nor `camoufox` |
-| `503` | No browsers at all, or none of them (of the asked engine) can be reached |
+| `503` | No browsers at all (and no `engine` asked), or none of them (of the asked engine) can be reached |
 
 ### Sessions
 
@@ -390,4 +390,4 @@ curl -X POST http://localhost:8000/parser/search_videos \
 
 ## Running on Kubernetes
 
-For cluster deployments, use the [livellm-browser-operator](https://github.com/XvKuoMing/livellm-browser-operator) and its Helm chart. The operator manages `Browser` and `Controller` CRs: one pod per `Browser` (a stable Service + fixed CDP port), a per-namespace `Controller`, and the browser-registry ConfigMap that wires them together. It passes desired state (extensions, cookies, proxy) to the pod as env/volume and rolls it on change. The controller pod's `NODE_OPTIONS` is auto-sized from its memory limit (`max(limit/2, limit - 2 GiB)` MiB, clamped to 512-8192); the browser pod is left alone so Chrome keeps the memory budget. Override per-CR via `spec.env`, cluster-wide via `DEFAULT_*_ENV`.
+For cluster deployments, use the [livellm-browser-operator](https://github.com/XvKuoMing/livellm-browser-operator) and its Helm chart. The operator manages `Browser` and `Controller` CRs: one pod per `Browser` (a stable Service + fixed CDP port), a per-namespace `Controller`, and the browser-registry ConfigMap that wires them together. It passes desired state (extensions, cookies, proxy) to the pod as env/volume and rolls it on change. The controller pod's `NODE_OPTIONS` is auto-sized from its memory limit (`max(limit/2, limit - 2 GiB)` MiB, clamped to 512-8192); that `--max-old-space-size` is the Browser API's whole Node heap, and each engine's driver starts with half of it, so the two drivers of a mixed pool together stay within it; the browser pod is left alone so Chrome keeps the memory budget. Override per-CR via `spec.env`, cluster-wide via `DEFAULT_*_ENV`.

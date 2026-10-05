@@ -58,7 +58,8 @@ class TestShim:
 
 
 class TestRegistryEngine:
-    def test_entries(self, tmp_path):
+    def test_entries(self, tmp_path, caplog):
+        caplog.set_level("WARNING", logger="core.registry")
         reg = tmp_path / "b.json"
         reg.write_text(json.dumps({"browsers": {
             "chrome-str": "ws://a:9222/devtools/browser/default",
@@ -71,6 +72,8 @@ class TestRegistryEngine:
         assert r.get_browser_engine("chrome-obj") == "chrome"
         assert r.get_browser_engine("cf") == "camoufox"
         assert r.get_browser_engine("odd") == "chrome"
+        unknown = [m.getMessage() for m in caplog.records if "unknown engine" in m.getMessage()]
+        assert unknown == ["registry: browser 'odd' names an unknown engine 'netscape'; it is driven as a Chrome browser"]
         assert r.get_browser_engine("absent") is None
         assert r.get_browser_ws_url("cf") == "ws://c:9222/playwright/default"
         assert r.get_all_browsers()["cf"] == "ws://c:9222/playwright/default"
@@ -235,9 +238,17 @@ def test_no_chrome_member_is_409(pool):
     assert r.json()["detail"] == "This Browser API holds no Chrome browser."
 
 
-def test_an_empty_pool_with_an_engine_is_503_as_without(pool):
+def test_an_empty_pool_with_an_engine_is_409_and_503_without(pool):
+    # No member of that engine is a 409 even when the pool has no member at
+    # all; without an engine an empty pool stays 503.
     pool.set_registry()
     r = start(pool, {"engine": "camoufox"})
+    assert r.status_code == 409
+    assert r.json()["detail"] == "This Browser API holds no Camoufox browser."
+    r = start(pool, {"engine": "chrome"})
+    assert r.status_code == 409
+    assert r.json()["detail"] == "This Browser API holds no Chrome browser."
+    r = start(pool, {})
     assert r.status_code == 503
     assert r.json()["detail"] == "This Browser API has no browsers yet."
 

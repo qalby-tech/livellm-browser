@@ -94,6 +94,15 @@ class BrowserRegistry:
                 entry = self._normalize(v)
                 if entry:
                     cache[str(k)] = entry
+                    raw = v.get("engine") if isinstance(v, dict) else None
+                    if raw and raw not in ("chrome", "camoufox"):
+                        # Still Chrome, as an entry without one: said once per
+                        # load, or a mistyped engine reads only as "not
+                        # reachable" later.
+                        logger.warning(
+                            f"registry: browser {k!r} names an unknown engine {raw!r}; "
+                            "it is driven as a Chrome browser"
+                        )
             self._cache = cache
             self._mtime = st.st_mtime
             logger.info(

@@ -171,13 +171,8 @@ async def resolve_page(
                 logger.info(f"Session page {session_id} was closed, creating new one")
         return await open_page(manager, info)
 
-    if not pool:
-        detail = (
-            "This Browser API has no browsers yet."
-            if managed()
-            else "No browsers available. Register one first via POST /browsers."
-        )
-        raise HTTPException(status_code=503, detail=detail)
+    # An engine is asked before the pool's size: an empty pool holds no
+    # browser of that engine either (409), as a pool of the other engine.
     if engine is not None:
         pool = [b for b in pool if manager.engine_of(b) == engine]
         if not pool:
@@ -185,6 +180,13 @@ async def resolve_page(
                 status_code=409,
                 detail=f"This Browser API holds no {ENGINE_NAMES.get(engine, engine)} browser.",
             )
+    if not pool:
+        detail = (
+            "This Browser API has no browsers yet."
+            if managed()
+            else "No browsers available. Register one first via POST /browsers."
+        )
+        raise HTTPException(status_code=503, detail=detail)
 
     # A disconnected local browser may only be paused (its profile is being
     # copied): read its launcher's /health first, so the pick sees it away.

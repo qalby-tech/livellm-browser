@@ -50,6 +50,7 @@ services:
       # FastAPI Controller
       - "8000:8000"
     environment:
+      # The Browser API's whole Node heap: each engine's driver gets half.
       - NODE_OPTIONS=--max-old-space-size=3072
       # File-backed browser registry. In K8s the
       # operator writes this from the namespace's Browser CRs; here it's a

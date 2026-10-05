@@ -1,15 +1,20 @@
 [project]
 name = "livellm-controller"
-version = "2.5.0"
-description = "Controller API that connects to livellm-browser over CDP"
+version = "2.6.0"
+description = "The Browser API: one address over many browsers, Chrome (over CDP) and Camoufox (over its Playwright server) alike"
 readme = "README.md"
-requires-python = "==3.9.*"
+requires-python = "==3.12.*"
 dependencies = [
     "fastapi>=0.121.3",
     "pydantic>=2.12.4",
     "pydantic-settings>=2.0",
     "uvicorn>=0.38.0",
+    # Both clients, one per engine (core/pw.py). patchright drives Chrome over
+    # CDP and moves with browser/chrome's; playwright is the client a Camoufox
+    # browser's Playwright server accepts (the same minor, else 428) and moves
+    # with browser/camoufox's (.github/scripts/check-pins.sh).
     "patchright==1.56.0",
+    "playwright==1.62.0",
     "beautifulsoup4>=4.12.0",
     "lxml>=5.0.0",
     "httpx>=0.28.1",

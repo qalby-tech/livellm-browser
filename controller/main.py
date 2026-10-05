@@ -5,6 +5,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
+from core import pw
 from core.pw import async_playwright
 
 from core.browser import browser_manager
@@ -75,9 +76,10 @@ async def _stale_page_cleanup_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start Playwright
-    playwright = await async_playwright().start()
-    await browser_manager.start(playwright)
+    # Chrome's Playwright driver now; Camoufox's at the first Camoufox browser
+    # (the warm connect below, or a later call), through the same starter.
+    playwright = await async_playwright(pw.CHROME).start()
+    await browser_manager.start(playwright, starter=async_playwright)
 
     app.state.playwright = playwright
     app.state.browser_manager = browser_manager
@@ -121,14 +123,8 @@ async def lifespan(app: FastAPI):
         await browser_manager.shutdown(timeout=25.0)
     except Exception as e:
         logger.error(f"Error during browser shutdown: {e}")
-    # Use manager's playwright (may have been restarted during recovery)
-    pw = browser_manager.playwright or playwright
-    try:
-        await asyncio.wait_for(pw.stop(), timeout=5.0)
-    except asyncio.TimeoutError:
-        logger.warning("Timeout stopping playwright, continuing shutdown")
-    except Exception as e:
-        logger.warning(f"Error stopping playwright: {e}")
+    # Every driver the manager holds now (a recovery may have restarted one).
+    await browser_manager.stop_drivers(timeout=5.0)
     logger.info("Shutdown complete")
 
 

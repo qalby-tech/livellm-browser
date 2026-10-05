@@ -27,6 +27,14 @@ class StartSessionRequest(BaseModel):
     browser_id: Optional[str] = Field(
         default=None, description="Browser to start the session on. Omitted: the one with the fewest open tabs.",
     )
+    engine: Optional[Literal["chrome", "camoufox"]] = Field(
+        default=None,
+        description=(
+            "Only a browser of this engine. Omitted: any. With no browser named, the one of that "
+            "engine with the fewest open tabs (409 when this Browser API holds none); a named browser "
+            "of the other engine is 409."
+        ),
+    )
 
 
 class SearchRequest(BaseModel):

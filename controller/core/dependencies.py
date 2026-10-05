@@ -4,6 +4,7 @@ import logging
 from typing import Annotated, List, Optional, AsyncGenerator, Tuple
 
 from fastapi import Depends, Header, HTTPException, Request
+from core import pw
 from core.pw import Page
 
 from core import browser as browser_mod
@@ -49,6 +50,8 @@ async def browser_pool(manager: BrowserManager) -> List[str]:
 
 
 # ==================== Resolution ====================
+
+ENGINE_NAMES = {pw.CHROME: "Chrome", pw.CAMOUFOX: "Camoufox"}
 
 def _hold(request: Request, manager: BrowserManager, bid: str) -> None:
     """Name ``bid`` as the answering browser and keep its call counted until
@@ -96,7 +99,8 @@ def session_owner(
 
 
 async def resolve_page(
-    request: Request, named: Optional[str] = None, session_id: Optional[str] = None
+    request: Request, named: Optional[str] = None, session_id: Optional[str] = None,
+    engine: Optional[str] = None,
 ) -> Tuple[BrowserInfo, Page]:
     """Choose the browser for a call, make sure it is connected, and return
     it with the tab the call runs in.
@@ -115,6 +119,10 @@ async def resolve_page(
        cannot be reached, is slow to connect, or does not open a tab within
        a few seconds is skipped for a while and the next one is tried within
        the same call; 503 only when the pool is empty or none can be reached.
+
+    ``engine`` (POST /start_session's) keeps the call to browsers of that
+    engine: with nothing named, the pick is over those only (409 when the pool
+    holds none); a named browser of the other engine is 409.
 
     For 2 and 3 the tab is new and the caller owns it. For 1 it is the
     session's tab; a new one is not yet recorded on the session.
@@ -135,6 +143,14 @@ async def resolve_page(
             raise HTTPException(
                 status_code=404,
                 detail=f"Browser '{named}' not found. Ensure the browser is running.",
+            )
+        if engine is not None and manager.engine_of(named) != engine:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Browser '{named}' is a {ENGINE_NAMES.get(manager.engine_of(named))} browser, "
+                    f"not {ENGINE_NAMES.get(engine, engine)}."
+                ),
             )
         manager.begin_call(named)
         _hold(request, manager, named)
@@ -162,6 +178,13 @@ async def resolve_page(
             else "No browsers available. Register one first via POST /browsers."
         )
         raise HTTPException(status_code=503, detail=detail)
+    if engine is not None:
+        pool = [b for b in pool if manager.engine_of(b) == engine]
+        if not pool:
+            raise HTTPException(
+                status_code=409,
+                detail=f"This Browser API holds no {ENGINE_NAMES.get(engine, engine)} browser.",
+            )
 
     # A disconnected local browser may only be paused (its profile is being
     # copied): read its launcher's /health first, so the pick sees it away.

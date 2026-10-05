@@ -482,6 +482,7 @@ class TestBrowserManagement:
         assert isinstance(data, list)
         assert data[0] == {
             "browser_id": "test-browser",
+            "engine": "chrome",
             "connected": True,
             "healthy": True,
             "open_tabs": 0,

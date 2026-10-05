@@ -13,11 +13,13 @@ async def ping() -> PingResponse:
 
 @router.get("/healthz")
 async def healthz():
-    # A dead Node driver leaves every CDP connection unusable and, once the
-    # browsers dict is emptied by a failed recovery, the loop below is vacuous
-    # — check the driver itself so the liveness probe restarts the pod.
-    if not browser_manager.driver_alive():
-        return Response(status_code=503, content="Playwright driver is not running")
+    # A dead Node driver leaves every connection of its engine unusable and,
+    # once a failed recovery dropped them, the loop below is vacuous — check
+    # the drivers themselves (Chrome's, and Camoufox's once started) so the
+    # liveness probe restarts the pod.
+    dead = browser_manager.dead_drivers()
+    if dead:
+        return Response(status_code=503, content=f"Playwright driver is not running ({', '.join(dead)})")
     # One browser that dropped is that browser's problem: calls reconnect it
     # or go elsewhere, and restarting this pod would end every session on
     # every browser. Only when all of them dropped is the pod suspect.

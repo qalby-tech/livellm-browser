@@ -78,14 +78,15 @@ def fresh_manager(tmp_path):
     The manager is a module singleton, so every test gets its own browsers,
     sessions, in-flight counts and health marks, restored afterwards.
     """
+    from core import pw
     from core.browser import browser_manager
     from core.registry import browser_registry
 
     with patch.multiple(
         browser_manager,
         browsers={}, sessions={}, _in_flight={}, _unhealthy_until={}, _rr=0,
-        _connecting={}, _connect_started={}, _driver_lock=None,
-        playwright=None, _playwright_pid=None,
+        _connecting={}, _connect_started={}, paused={}, _closing=set(),
+        drivers={}, _driver_pids={}, _driver_locks={}, _starter=pw.async_playwright, _started=False,
     ), patch.multiple(
         browser_registry, path=str(tmp_path / "absent.json"), _cache={}, _mtime=-1.0,
     ):
@@ -226,6 +227,10 @@ class FakeNet:
         # (protocol, browser, headers) of every connect: "cdp" for
         # chromium.connect_over_cdp, "playwright" for firefox.connect.
         self.protocols = []
+        # (driver number, protocol, browser) of every connect: which Node
+        # driver made it (FakeNet.playwright() numbers them from 1).
+        self.via = []
+        self.drivers_made = 0
 
     def chrome(self, name):
         if name not in self.chromes:
@@ -241,13 +246,17 @@ class FakeNet:
     def open_connections(self, name):
         return [c for c in self.opened if c._chrome.name == name and c._open]
 
-    async def connect_over_cdp(self, ws_url, headers=None):
-        self.protocols.append(("cdp", ws_url.split("://", 1)[1].split(":", 1)[0], dict(headers or {})))
+    async def connect_over_cdp(self, ws_url, headers=None, driver=0):
+        name = ws_url.split("://", 1)[1].split(":", 1)[0]
+        self.protocols.append(("cdp", name, dict(headers or {})))
+        self.via.append((driver, "cdp", name))
         return await self._connect(ws_url, headers)
 
-    async def firefox_connect(self, ws_url, headers=None):
+    async def firefox_connect(self, ws_url, headers=None, driver=0):
         """A Camoufox browser's Playwright server (firefox.connect)."""
-        self.protocols.append(("playwright", ws_url.split("://", 1)[1].split(":", 1)[0], dict(headers or {})))
+        name = ws_url.split("://", 1)[1].split(":", 1)[0]
+        self.protocols.append(("playwright", name, dict(headers or {})))
+        self.via.append((driver, "playwright", name))
         return await self._connect(ws_url, headers)
 
     async def _connect(self, ws_url, headers=None):
@@ -267,10 +276,21 @@ class FakeNet:
         return conn
 
     def playwright(self):
-        # No private driver attributes: driver_alive() reads as alive.
+        """A new fake Node driver, numbered (``number``). No private driver
+        attributes: driver_alive() reads as alive while it is held."""
+        self.drivers_made += 1
+        n = self.drivers_made
+
+        async def cdp(ws_url, headers=None):
+            return await self.connect_over_cdp(ws_url, headers, driver=n)
+
+        async def ff(ws_url, headers=None):
+            return await self.firefox_connect(ws_url, headers, driver=n)
+
         return SimpleNamespace(
-            chromium=SimpleNamespace(connect_over_cdp=self.connect_over_cdp),
-            firefox=SimpleNamespace(connect=self.firefox_connect),
+            number=n,
+            chromium=SimpleNamespace(connect_over_cdp=cdp),
+            firefox=SimpleNamespace(connect=ff),
             stop=AsyncMock(),
         )
 
@@ -288,7 +308,9 @@ def pool(request, tmp_path, monkeypatch, fresh_manager, net):
     or a dict {id: Authorization header or None} for browsers that require
     one, or {id: "camoufox"} for Camoufox browsers (their registry entry
     names the engine). ``pool.set_registry(*ids)`` rewrites it the way the
-    operator does.
+    operator does. ``pool.starter`` is the patched core.pw.async_playwright:
+    each call is one driver start, with the engine as its argument, and gives
+    a new fake driver.
     """
     from core.registry import browser_registry
 
@@ -318,10 +340,11 @@ def pool(request, tmp_path, monkeypatch, fresh_manager, net):
     monkeypatch.setenv("BROWSERS_CONFIG", str(reg))
     with patch.object(browser_registry, "path", str(reg)), \
             patch("main.async_playwright") as mock_async_playwright:
-        mock_async_playwright.return_value.start = AsyncMock(return_value=net.playwright())
+        mock_async_playwright.return_value.start = AsyncMock(side_effect=lambda: net.playwright())
         from main import app
 
         with TestClient(app) as test_client:
             yield SimpleNamespace(
                 client=test_client, net=net, manager=fresh_manager, set_registry=set_registry,
+                starter=mock_async_playwright,
             )

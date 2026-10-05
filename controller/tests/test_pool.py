@@ -89,8 +89,8 @@ class TestManagementRoutes:
         r = pool.client.get("/browsers")
         assert r.status_code == 200
         assert r.json() == [
-            {"browser_id": "agent-1", "connected": True, "healthy": True, "open_tabs": 0, "session_count": 0},
-            {"browser_id": "agent-2", "connected": True, "healthy": True, "open_tabs": 0, "session_count": 0},
+            {"browser_id": "agent-1", "engine": "chrome", "connected": True, "healthy": True, "open_tabs": 0, "session_count": 0},
+            {"browser_id": "agent-2", "engine": "chrome", "connected": True, "healthy": True, "open_tabs": 0, "session_count": 0},
         ]
         assert "x-browser-id" not in r.headers
 
@@ -299,7 +299,7 @@ class TestConnecting:
         assert len(pool.net.open_connections("agent-2")) == 1
 
     async def test_connects_racing_keep_one_connection(self, fresh_manager, net):
-        fresh_manager.playwright = net.playwright()
+        await fresh_manager.start(net.playwright())
         net.delay["agent-1"] = 0.05
         url = "ws://agent-1:9222/devtools/browser/agent-1"
         first, second = await asyncio.gather(
@@ -392,7 +392,7 @@ class TestRegistryChanges:
 
 class TestDeadMember:
     def test_dead_member_does_not_touch_other_sessions(self, pool):
-        driver = pool.manager.playwright
+        driver = pool.manager.drivers["chrome"]
         sid, _ = start(pool, **{"X-Browser-Id": "agent-1"})
         pool.net.down("agent-2")  # its pod restarts; its address stays in the registry
         # agent-2 has the fewest tabs, so a call that names no browser tries
@@ -404,7 +404,7 @@ class TestDeadMember:
         r = pool.client.post("/content", json=CONTENT, headers={"X-Session-Id": sid})
         assert answered(r) == ("agent-1", "agent-1-p1")
         # The shared driver was not restarted.
-        assert pool.manager.playwright is driver
+        assert pool.manager.drivers["chrome"] is driver
 
     def test_dead_member_is_skipped_for_a_while(self, pool):
         pool.net.chrome("agent-1").context.pages.append(object())  # agent-2 is tried first
@@ -464,7 +464,7 @@ class TestDeadMember:
         assert r.status_code == 502
         assert restarts == []
         # A dead driver fails every connect: then it is restarted.
-        monkeypatch.setattr(manager, "driver_alive", lambda: False)
+        monkeypatch.setattr(manager, "driver_alive", lambda engine="chrome": False)
         r = pool.client.post("/content", json=CONTENT, headers={"X-Browser-Id": "agent-2"})
         assert r.status_code == 200
         assert r.headers["x-browser-id"] == "agent-2"

@@ -60,15 +60,26 @@ class BrowserInfo:
 
 class BrowserManager:
     """
-    Agnostic browser manager — connects to browsers purely via CDP WebSocket URLs.
+    Agnostic browser manager — connects to browsers purely by their addresses.
 
     The manager does NOT know about launchers, profiles, or orchestration.
     External systems (operator, API calls) register browsers by providing a
-    ``browser_id`` and a ``ws_url``.
+    ``browser_id`` and a ``ws_url``. A browser's engine (its registry entry's)
+    picks the client: Chrome over CDP, Camoufox through its Playwright server.
+    Each engine's client has its own Node driver (``drivers``): Chrome's from
+    ``start``, Camoufox's from the first Camoufox browser; a dead driver is
+    restarted alone and only its engine's browsers reconnect.
     """
 
     def __init__(self):
-        self.playwright: Optional[Playwright] = None
+        # engine -> the Node driver of its client (core.pw).
+        self.drivers: dict[str, Playwright] = {}
+        self._driver_pids: dict[str, int] = {}
+        # engine -> held while that driver starts or restarts. Made on first use.
+        self._driver_locks: dict[str, asyncio.Lock] = {}
+        # engine -> a client to .start() (core.pw.async_playwright); set by start().
+        self._starter = pw.async_playwright
+        self._started = False
         self.browsers: dict[str, BrowserInfo] = {}
         # session id -> browser id. Kept apart from BrowserInfo.pages so a
         # session outlives a reconnect of its browser: it stays there and
@@ -93,66 +104,111 @@ class BrowserManager:
         self._connecting: dict[str, asyncio.Future] = {}
         self._connect_started: dict[str, float] = {}
         self._rr = 0
-        # Held while the Playwright driver, shared by every browser, restarts.
-        # Made on first use: on Python 3.9 a lock binds to the loop current
-        # when it is created, and this object is created at import.
-        self._driver_lock: Optional[asyncio.Lock] = None
-        self._playwright_pid: Optional[int] = None
         # Closes of dropped connections still running in the background.
         self._closing: set = set()
 
-    async def start(self, playwright: Playwright):
-        """Initialise with a Playwright instance. No auto-connections."""
-        self.playwright = playwright
-        self._track_playwright_pid()
+    async def start(self, playwright: Playwright, starter=None):
+        """Begin with Chrome's driver, started by the caller. ``starter``
+        (engine -> a client to .start(); default core.pw.async_playwright)
+        starts another engine's driver at its first browser, and restarts
+        any. No auto-connections."""
+        if starter is not None:
+            self._starter = starter
+        self.drivers = {pw.CHROME: playwright}
+        self._started = True
+        self._track_driver(pw.CHROME)
         logger.info("Browser manager started (agnostic mode — waiting for registrations)")
 
-    def _driver_proc(self):
-        """The Node driver subprocess behind the pipe transport, or None.
+    def _lock(self, engine: str) -> asyncio.Lock:
+        lock = self._driver_locks.get(engine)
+        if lock is None:
+            lock = self._driver_locks[engine] = asyncio.Lock()
+        return lock
+
+    async def _driver(self, engine: str) -> Playwright:
+        """The engine's Node driver, started now when it has none yet (the
+        first Camoufox browser starts Camoufox's)."""
+        driver = self.drivers.get(engine)
+        if driver is not None:
+            return driver
+        async with self._lock(engine):
+            driver = self.drivers.get(engine)
+            if driver is None:
+                driver = await self._start_driver(engine)
+        return driver
+
+    async def _start_driver(self, engine: str) -> Playwright:
+        driver = await self._starter(engine).start()
+        self.drivers[engine] = driver
+        self._track_driver(engine)
+        logger.info(f"Playwright driver for {engine} started")
+        return driver
+
+    async def stop_drivers(self, timeout: float = 5.0) -> None:
+        """Stop every driver (the end of the process), each bounded."""
+        for engine, driver in list(self.drivers.items()):
+            try:
+                await asyncio.wait_for(driver.stop(), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout stopping the {engine} Playwright driver, continuing shutdown")
+            except Exception as e:
+                logger.warning(f"Error stopping the {engine} Playwright driver: {e}")
+        self.drivers.clear()
+
+    def _driver_proc(self, engine: str):
+        """The Node driver subprocess behind an engine's pipe transport, or None.
 
         Reaches through private attributes (impl connection -> pipe transport),
         so every step is guarded — a layout change just disables the feature.
         """
         try:
-            return self.playwright._impl_obj._connection._transport._proc
-        except AttributeError:
+            return self.drivers[engine]._impl_obj._connection._transport._proc
+        except (AttributeError, KeyError):
             return None
 
-    def _track_playwright_pid(self):
-        proc = self._driver_proc()
+    def _track_driver(self, engine: str):
+        proc = self._driver_proc(engine)
         if proc is not None:
-            self._playwright_pid = proc.pid
-            logger.info(f"Tracking Playwright driver PID: {self._playwright_pid}")
+            self._driver_pids[engine] = proc.pid
+            logger.info(f"Tracking the {engine} Playwright driver PID: {proc.pid}")
 
-    def driver_alive(self) -> bool:
-        """Whether the Playwright Node driver process is still running.
+    def driver_alive(self, engine: str = pw.CHROME) -> bool:
+        """Whether an engine's Node driver process is still running (False
+        for one not started).
 
         Returns True when the process can't be introspected (private layout
         changed) so a false negative can never crash-loop the pod.
         """
-        if not self.playwright:
+        if engine not in self.drivers:
             return False
-        proc = self._driver_proc()
+        proc = self._driver_proc(engine)
         if proc is None:
             return True
         # returncode is None while running, an int once exited. Only a
         # definite int counts as dead (doubles/mocks stay "alive").
         return not isinstance(proc.returncode, int)
 
-    def _kill_playwright_process(self):
-        if self._playwright_pid:
+    def dead_drivers(self) -> list:
+        """Chrome's driver when it is not running, and any other started one
+        that died (for /healthz). A driver never started is not dead."""
+        return [e for e in pw.ENGINES
+                if (e == pw.CHROME or e in self.drivers) and not self.driver_alive(e)]
+
+    def _kill_driver(self, engine: str):
+        pid = self._driver_pids.pop(engine, None)
+        if pid:
             try:
-                os.kill(self._playwright_pid, signal.SIGKILL)
-                logger.warning(f"Force-killed old Playwright driver PID {self._playwright_pid}")
+                os.kill(pid, signal.SIGKILL)
+                logger.warning(f"Force-killed the old {engine} Playwright driver PID {pid}")
             except (ProcessLookupError, PermissionError):
                 pass
-            self._playwright_pid = None
 
     # ── connect / disconnect ─────────────────────────────────
 
     async def connect_browser(self, browser_id: str, ws_url: str, headers: Optional[dict] = None) -> BrowserInfo:
         """
-        Connect to a remote browser over CDP.
+        Connect to a browser (Chrome over CDP, Camoufox through its
+        Playwright server, by its registry entry's engine).
 
         If ``browser_id`` is already connected **with the same URL** and the
         connection is still alive, the existing connection is returned.
@@ -162,7 +218,7 @@ class BrowserManager:
         ``headers`` are optional HTTP headers sent on the CDP connect, used for
         BYO/remote browsers that require auth (e.g. an Authorization bearer).
         """
-        if not self.playwright:
+        if not self._started:
             raise RuntimeError("Browser manager not started")
 
         if browser_id in self.browsers:
@@ -181,7 +237,7 @@ class BrowserManager:
 
         logger.info(f"Connecting to browser '{browser_id}' via {ws_url}")
         engine = self.engine_of(browser_id)
-        browser = await self._cdp_connect(ws_url, headers, engine)
+        browser = await self._open(ws_url, headers, engine)
         current = self.browsers.get(browser_id)
         if current is not None and current.ws_url == ws_url and self._alive(current):
             # Another call connected it while this one waited: keep that
@@ -201,22 +257,24 @@ class BrowserManager:
 
     @staticmethod
     def engine_of(browser_id: str) -> str:
-        """The engine of a browser: its registry entry's ("chrome" when the
-        entry names none), else (a browser connected through POST /browsers)
-        this controller's own."""
-        return browser_registry.get_browser_engine(browser_id) or pw.ENGINE
+        """The engine of a browser: its registry entry's, else Chrome (an
+        entry that names none, and a browser connected through POST /browsers)."""
+        return browser_registry.get_browser_engine(browser_id) or pw.CHROME
 
-    def _connect_call(self, ws_url: str, headers: Optional[dict], engine: str):
-        """The connect for a browser's engine: CDP for Chrome, the browser's
-        own Playwright server for Camoufox (Firefox)."""
+    @staticmethod
+    def _connect_call(driver: Playwright, ws_url: str, headers: Optional[dict], engine: str):
+        """The connect for a browser's engine on its driver: CDP for Chrome,
+        the browser's own Playwright server for Camoufox (Firefox)."""
         if engine == pw.CAMOUFOX:
-            return self.playwright.firefox.connect(ws_url, headers=headers or None)
-        return self.playwright.chromium.connect_over_cdp(ws_url, headers=headers or None)
+            return driver.firefox.connect(ws_url, headers=headers or None)
+        return driver.chromium.connect_over_cdp(ws_url, headers=headers or None)
 
-    async def _cdp_connect(self, ws_url: str, headers: Optional[dict], engine: str = pw.CHROME):
-        """One connect, given up after CONNECT_TIMEOUT."""
+    async def _open(self, ws_url: str, headers: Optional[dict], engine: str = pw.CHROME):
+        """One connect on the engine's driver (started first when it has none
+        yet), given up after CONNECT_TIMEOUT."""
+        driver = await self._driver(engine)
         return await asyncio.wait_for(
-            self._connect_call(ws_url, headers, engine),
+            self._connect_call(driver, ws_url, headers, engine),
             timeout=CONNECT_TIMEOUT,
         )
 
@@ -433,8 +491,8 @@ class BrowserManager:
         call that named no browser (``picked``) waits for it at most
         PICK_CONNECT_WAIT seconds and then gets ``asyncio.TimeoutError``; the
         attempt goes on. A failure marks the browser unhealthy and raises; it
-        never touches the other browsers unless the Playwright driver itself
-        is dead.
+        never touches the other browsers unless its engine's Playwright
+        driver itself is dead (then only that engine's).
         """
         info = self.browsers.get(browser_id)
         if info is None:
@@ -485,11 +543,6 @@ class BrowserManager:
         if not task.cancelled():
             task.exception()  # retrieved: an attempt nobody waits for any more stays quiet
 
-    def _driver_lock_now(self) -> asyncio.Lock:
-        if self._driver_lock is None:
-            self._driver_lock = asyncio.Lock()
-        return self._driver_lock
-
     async def _recover(self, browser_id: str, ws_url: str, headers: Optional[dict] = None) -> BrowserInfo:
         """
         Bring a browser's connection up, the first time or after it broke.
@@ -497,9 +550,10 @@ class BrowserManager:
         Runs as the one attempt for the browser (``_attempt``). Two levels:
 
         * Level 1 – drop the stale entry, if any, and connect via the
-          **existing** Playwright driver.
-        * Level 2 – only when the driver process is dead, restart it and
-          reconnect every browser.
+          **existing** Playwright driver of the browser's engine.
+        * Level 2 – only when that driver process is dead, restart it and
+          reconnect every browser of that engine (the other engine's driver
+          and browsers are not touched).
 
         ``headers`` defaults to the existing connection's headers (so BYO auth
         survives a reconnect) when not provided by the caller.
@@ -513,6 +567,7 @@ class BrowserManager:
             if existing.ws_url == ws_url and self._alive(existing):
                 return existing
 
+        engine = self.engine_of(browser_id)
         # ── Level 1: connect with the same Playwright driver ──
         try:
             info = await self._reconnect_same_driver(browser_id, ws_url, headers)
@@ -523,18 +578,18 @@ class BrowserManager:
             # With a live driver the fault is this browser (not ready,
             # offline, gone). Restarting the driver would drop every other
             # browser's connection and tabs, so fail this one alone.
-            if self.driver_alive():
+            if self.driver_alive(engine):
                 self.mark_unhealthy(browser_id)
                 raise
 
-        # ── Level 2: restart the Playwright driver entirely ──
-        async with self._driver_lock_now():
+        # ── Level 2: restart the engine's Playwright driver ──
+        async with self._lock(engine):
             # Another browser's attempt may have restarted it while this one waited.
             current = self.browsers.get(browser_id)
             if current is not None and current.ws_url == ws_url and self._alive(current):
                 return current
             try:
-                if self.driver_alive():
+                if self.driver_alive(engine):
                     info = await self._reconnect_same_driver(browser_id, ws_url, headers)
                 else:
                     info = await self._restart_playwright_and_reconnect(browser_id, ws_url, headers)
@@ -548,11 +603,11 @@ class BrowserManager:
         self, browser_id: str, ws_url: str, headers: Optional[dict] = None
     ) -> BrowserInfo:
         """Drop the stale entry (closed in the background) and open a fresh
-        CDP connection, bounded by CONNECT_TIMEOUT."""
+        connection, bounded by CONNECT_TIMEOUT."""
         self.drop_connection(browser_id)
 
         engine = self.engine_of(browser_id)
-        browser = await self._cdp_connect(ws_url, headers, engine)
+        browser = await self._open(ws_url, headers, engine)
         context = await self._default_context(browser, engine)
         info = BrowserInfo(browser, context, ws_url=ws_url, browser_id=browser_id, headers=headers or {}, engine=engine)
         self.browsers[browser_id] = info
@@ -562,39 +617,40 @@ class BrowserManager:
     async def _restart_playwright_and_reconnect(
         self, browser_id: str, fresh_ws_url: Optional[str] = None, headers: Optional[dict] = None
     ) -> BrowserInfo:
-        """Restart the Playwright driver process and reconnect every browser."""
-        logger.warning("Restarting Playwright driver for full recovery")
+        """Restart the Playwright driver of ``browser_id``'s engine and
+        reconnect that engine's browsers. The caller holds that engine's lock;
+        the other engine's driver and browsers are not touched."""
+        engine = self.engine_of(browser_id)
+        logger.warning(f"Restarting the {engine} Playwright driver for full recovery")
 
-        saved = {bid: (info.ws_url, info.headers) for bid, info in self.browsers.items()}
+        saved = {bid: (info.ws_url, info.headers) for bid, info in self.browsers.items() if info.engine == engine}
         if fresh_ws_url:
             saved[browser_id] = (fresh_ws_url, headers if headers is not None else saved.get(browser_id, (None, {}))[1])
-        self.browsers.clear()
+        for bid in saved:
+            self.browsers.pop(bid, None)
 
-        old_pw = self.playwright
-        self.playwright = None
-
+        old_pw = self.drivers.pop(engine, None)
         if old_pw is not None:
             try:
                 await asyncio.wait_for(old_pw.stop(), timeout=5.0)
             except Exception:
                 logger.warning(
-                    "Old Playwright driver did not stop cleanly, force-killing"
+                    f"Old {engine} Playwright driver did not stop cleanly, force-killing"
                 )
-                self._kill_playwright_process()
+                self._kill_driver(engine)
+        self._driver_pids.pop(engine, None)
 
         # Brief pause to let the OS reclaim sockets / pipes
         await asyncio.sleep(0.5)
 
-        self.playwright = await pw.async_playwright().start()
-        self._track_playwright_pid()
-        logger.info("Playwright driver restarted")
+        driver = await self._start_driver(engine)
+        logger.info(f"The {engine} Playwright driver restarted")
 
         new_info: Optional[BrowserInfo] = None
         for bid, (url, hdrs) in saved.items():
             try:
-                engine = self.engine_of(bid)
                 browser = await asyncio.wait_for(
-                    self._connect_call(url, hdrs, engine),
+                    self._connect_call(driver, url, hdrs, engine),
                     timeout=15.0,
                 )
                 context = await self._default_context(browser, engine)
@@ -602,7 +658,7 @@ class BrowserManager:
                 self.browsers[bid] = info
                 if bid == browser_id:
                     new_info = info
-                logger.info(f"Reconnected '{bid}' after Playwright restart")
+                logger.info(f"Reconnected '{bid}' after the {engine} Playwright restart")
             except Exception as e:
                 logger.error(
                     f"Failed to reconnect '{bid}' after Playwright restart: {e}"

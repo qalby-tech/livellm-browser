@@ -24,6 +24,7 @@ router = APIRouter(tags=["Browsers & Sessions"])
 def _status(browser_id: str) -> BrowserResponse:
     return BrowserResponse(
         browser_id=browser_id,
+        engine=browser_manager.engine_of(browser_id),
         connected=browser_manager.is_connected(browser_id),
         healthy=browser_manager.is_healthy(browser_id),
         open_tabs=browser_manager.open_tabs(browser_id),
@@ -102,15 +103,18 @@ async def start_session(
     """Start a session (a tab) and return its ID.
 
     The browser is the one named (X-Browser-Id, the /browsers/<name>/ path or
-    ``browser_id`` in the body), else the one with the fewest open tabs. Later
-    calls with X-Session-Id alone go to that browser.
+    ``browser_id`` in the body), else the one with the fewest open tabs. With
+    ``engine`` (chrome or camoufox), only a browser of that engine: the one of
+    that engine with the fewest open tabs (409 when this Browser API holds
+    none), and a named browser of the other engine is 409. Later calls with
+    X-Session-Id alone go to that browser.
     """
     if browser_id and body.browser_id and body.browser_id != browser_id:
         raise HTTPException(
             status_code=400,
             detail=f"The body names browser '{body.browser_id}' but the call names '{browser_id}'.",
         )
-    browser_info, page = await resolve_page(request, browser_id or body.browser_id)
+    browser_info, page = await resolve_page(request, browser_id or body.browser_id, engine=body.engine)
 
     session_id = str(uuid.uuid4())
     bid = browser_info.browser_id
@@ -120,6 +124,7 @@ async def start_session(
     out = {
         "session_id": session_id,
         "browser_id": bid,
+        "engine": browser_manager.engine_of(bid),
         "message": "Session started. Send X-Session-Id on later calls; it stays on this browser.",
         "proxyRotated": False,
     }

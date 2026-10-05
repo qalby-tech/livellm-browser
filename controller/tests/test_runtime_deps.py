@@ -1,4 +1,4 @@
-"""The image installs only [project].dependencies (uv sync with UV_NO_DEV=1),
+"""The image installs only [project].dependencies (uv sync --frozen --no-dev),
 while the tests run with the dev group too: a package the controller imports
 but only the dev group lists passes every test here and stops the container at
 start (ModuleNotFoundError). These read pyproject.toml and the code the image
@@ -58,37 +58,25 @@ def test_the_sidecar_client_is_a_runtime_dependency():
     assert "httpx" in _image_imports()
 
 
-# ── The Camoufox Browser API image (Dockerfile.camoufox) ──
+# ── Both clients (core/pw.py) ──
 #
-# It installs requirements-camoufox.txt (hashed, from requirements-camoufox.in)
-# instead of pyproject.toml: the same runtime dependencies with stock
-# Playwright in place of patchright. A dependency added to pyproject.toml
-# and not to requirements-camoufox.in would pass every test and stop that
-# image at start.
+# One image drives both engines: patchright (Chrome over CDP) and stock
+# Playwright (a Camoufox browser's Playwright server) are both runtime
+# dependencies, pinned exactly, and imported only through the shim.
 
-def _camoufox_in():
-    lines = (ROOT / "requirements-camoufox.in").read_text().splitlines()
-    reqs = [l.strip() for l in lines if l.strip() and not l.strip().startswith("#")]
-    return {re.split(r"[<>=!~\[; ]", r)[0].lower(): r for r in reqs}
-
-
-def test_the_camoufox_image_has_the_same_runtime_dependencies():
-    runtime, _ = _deps()
-    want = (runtime - {"patchright"}) | {"playwright"}
-    assert set(_camoufox_in()) == want
-
-
-def test_the_camoufox_image_pins_one_playwright_with_hashes():
-    pin = _camoufox_in()["playwright"]
-    assert re.fullmatch(r"playwright==\d+\.\d+\.\d+", pin), pin
-    txt = (ROOT / "requirements-camoufox.txt").read_text()
-    assert re.search(rf"^{re.escape(pin)} \\$", txt, re.M), "requirements-camoufox.txt is not compiled from requirements-camoufox.in"
-    for block in re.split(r"\n(?=[a-z0-9])", txt.split("\n", 2)[2] if txt.startswith("#") else txt):
-        if re.match(r"^[a-z0-9]", block):
-            assert "--hash=sha256:" in block, f"no hash: {block.splitlines()[0]}"
+def test_both_clients_are_runtime_dependencies_pinned_exactly():
+    text = (ROOT / "pyproject.toml").read_text()
+    block = re.search(r"^dependencies\s*=\s*\[(.*?)\]", text, re.S | re.M).group(1)
+    pins = dict(re.findall(r'"(patchright|playwright)==(\d+\.\d+\.\d+)"', block))
+    assert set(pins) == {"patchright", "playwright"}, pins
 
 
 def test_playwright_is_imported_only_through_the_shim():
     imports = _image_imports()
     assert imports.get("playwright") == {"core/pw.py"}
     assert imports.get("patchright") == {"core/pw.py"}
+
+
+def test_one_image_and_no_engine_files():
+    assert not (ROOT / "Dockerfile.camoufox").exists()
+    assert not list(ROOT.glob("requirements-camoufox*"))

@@ -506,4 +506,7 @@ async def toggle_extension(browser_id: str, extension_id: str, request: ToggleEx
         raise HTTPException(status_code=400, detail=str(e))
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=9000, log_level="info")
+    # A pod stop (TERM, 30 s grace) gives requests in flight 3 s, then the
+    # lifespan shutdown closes the browsers (at most 25 s) so Chrome writes
+    # its profile and session cookies out before the container goes.
+    uvicorn.run(app, host="0.0.0.0", port=9000, log_level="info", timeout_graceful_shutdown=3)

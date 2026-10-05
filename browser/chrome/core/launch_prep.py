@@ -224,9 +224,12 @@ def prepare_launch(
     None = an ephemeral browser (no prefs to write).
     """
     s = settings if settings is not None else LaunchSettings.from_env()
+    # No --remote-allow-origins: Chrome then refuses every DevTools
+    # WebSocket that carries an Origin (any web page's), and the CDP proxy
+    # on the public port refuses any request with one before Chrome sees it.
+    # Automation clients (Playwright, Puppeteer, CDP libraries) send none.
     args = list(BASE_ARGS) + [
         f"--remote-debugging-port={chrome_port}",
-        "--remote-allow-origins=*",
     ]
     if s.platform_proxy:
         # Not protection on its own (the pref below is): kept as a second say.

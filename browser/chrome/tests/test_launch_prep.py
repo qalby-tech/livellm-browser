@@ -26,7 +26,7 @@ def test_no_settings_is_todays_launch(tmp_path, monkeypatch):
         "channel": "chrome",
         "args": [
             "--start-maximized", "--ignore-gpu-blocklist", "--enable-webgl", "--enable-gpu",
-            "--remote-debugging-port=4444", "--remote-allow-origins=*",
+            "--remote-debugging-port=4444",
         ],
         "user_data_dir": str(tmp_path),
         "no_viewport": True,

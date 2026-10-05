@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 import launch
+from core.const import IMAGE_VERSION
 from core.local_browser import local_browser_manager
 
 LOCAL = {"x-livellm-keeper": "1"}
@@ -72,7 +73,7 @@ async def test_version(fake_manager, monkeypatch):
     async with client() as c:
         v = (await c.get("/version", headers=LOCAL)).json()
     assert v["chrome"] == "154.0.8037.57" and v["chromeMajor"] == 154
-    assert v["image"] == "2.3.0" and v["pid"] == 777
+    assert v["image"] == IMAGE_VERSION and v["pid"] == 777
     assert v["startedAt"] == "2023-11-14T22:13:20Z"
     assert v["timezone"] == "" and v["locale"] == ""
     monkeypatch.setenv("TZ", "Europe/Moscow")

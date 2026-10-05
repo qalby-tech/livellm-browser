@@ -143,6 +143,17 @@ RUN set -eu; \
 # checked against its sha256; at runtime it is only read.
 RUN UV_OFFLINE=0 .venv/bin/python -c "from camoufox.fpgen_model import ensure_fpgen_model, is_pinned; ensure_fpgen_model(); assert is_pinned()"
 
+# The address bar's search engine. Camoufox's build carries one inert
+# built-in engine, "None" (its search selector is stubbed to return only that,
+# a GET to 127.0.0.1), and the release's policies.json makes it the default,
+# so the bar read "Search with None". Firefox's own default for every offered
+# locale is Google (search-config-v2: globalDefault google; only zh-CN in
+# region cn differs), so the policy adds that and makes it the default, hides
+# "None", and still lets no site add engines. A policy engine has no icon to
+# fetch; the bar then shows Firefox's generic "Search or enter address". Its
+# own layer: the release above stays cached.
+RUN .venv/bin/python -c "import json; p = '/opt/camoufox/distribution/policies.json'; d = json.load(open(p)); d['policies']['SearchEngines'] = {'PreventInstalls': True, 'Add': [{'Name': 'Google', 'URLTemplate': 'https://www.google.com/search?q={searchTerms}', 'Method': 'GET'}], 'Default': 'Google', 'Remove': ['None']}; json.dump(d, open(p, 'w'), indent=2); print('default search engine:', d['policies']['SearchEngines']['Default'])"
+
 # The offered locales (the same table as the Chrome image).
 COPY browser/locales.json /etc/livellm/locales.json
 

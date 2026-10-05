@@ -28,7 +28,7 @@ fi
 
 base="${1:-}"
 if [ -n "$base" ] && ! printf '%s' "$base" | grep -qE '^0+$' && git cat-file -e "$base^{commit}" 2>/dev/null; then
-  ver() { git show "$1:$2" 2>/dev/null | sed -nE 's/^version = "(.*)"/\1/p' | head -1; }
+  ver() { { git show "$1:$2" 2>/dev/null || true; } | sed -nE 's/^version = "(.*)"/\1/p' | head -1; }
   c_old="$(ver "$base" controller/pyproject.toml)"; c_new="$(ver HEAD controller/pyproject.toml)"
   f_old="$(ver "$base" camoufox/pyproject.toml)"; f_new="$(ver HEAD camoufox/pyproject.toml)"
   echo "controller $c_old -> $c_new, camoufox $f_old -> $f_new"

@@ -1,0 +1,32 @@
+[project]
+name = "livellm-camoufox"
+# The version of BOTH Camoufox images: camoufox-<v> (this browser) and
+# camoufox-api-<v> (the Camoufox Browser API, built from ../controller).
+version = "1.0.0"
+description = "Camoufox (Firefox) in docker with VNC, served to Playwright clients over a launcher API"
+readme = "README.md"
+requires-python = "==3.12.*"
+dependencies = [
+    # camoufox and playwright move together: each Camoufox build speaks one
+    # Playwright minor (a client of another is refused with 428), and the
+    # Camoufox Browser API pins the same playwright (../controller/requirements-camoufox.in).
+    "camoufox==0.5.7",
+    "playwright==1.62.0",
+    "fastapi>=0.121.3",
+    "pydantic>=2.12.4",
+    "uvicorn>=0.38.0",
+    "httpx>=0.28.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

@@ -116,15 +116,10 @@ jobs:
           CONTROLLER_VERSION="${{ steps.version.outputs.CONTROLLER_VERSION }}"
           CAMOUFOX_VERSION="${{ steps.version.outputs.CAMOUFOX_VERSION }}"
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          if [ "${{ github.ref }}" = "refs/heads/develop" ]; then
-            echo "CHROME_TAG=${IMAGE}:dev-chrome-${CHROME_VERSION}" >> $GITHUB_OUTPUT
-            echo "CONTROLLER_TAG=${IMAGE}:dev-controller-${CONTROLLER_VERSION}" >> $GITHUB_OUTPUT
-            echo "CAMOUFOX_TAG=${IMAGE}:dev-camoufox-${CAMOUFOX_VERSION}" >> $GITHUB_OUTPUT
-          else
-            echo "CHROME_TAG=${IMAGE}:chrome-${CHROME_VERSION}" >> $GITHUB_OUTPUT
-            echo "CONTROLLER_TAG=${IMAGE}:controller-${CONTROLLER_VERSION}" >> $GITHUB_OUTPUT
-            echo "CAMOUFOX_TAG=${IMAGE}:camoufox-${CAMOUFOX_VERSION}" >> $GITHUB_OUTPUT
-          fi
+          # The tag rules live in .github/scripts/image-tags.sh (tested).
+          TAGS=$(bash .github/scripts/image-tags.sh "${{ github.ref }}" \
+            "$CHROME_VERSION" "$CONTROLLER_VERSION" "$CAMOUFOX_VERSION")
+          echo "$TAGS" | sed "s|=|=${IMAGE}:|" | tee -a $GITHUB_OUTPUT
 
       # Tags are immutable (.github/scripts/tag-guard.sh): an existing tag is
       # never rebuilt, and an unclear registry answer fails the job.
@@ -231,18 +226,13 @@ jobs:
           CHROME_VERSION="${{ steps.version.outputs.CHROME_VERSION }}"
           CONTROLLER_VERSION="${{ steps.version.outputs.CONTROLLER_VERSION }}"
           CAMOUFOX_VERSION="${{ steps.version.outputs.CAMOUFOX_VERSION }}"
-          if [ "${{ github.ref }}" = "refs/heads/develop" ]; then
-            APP_VERSION="dev-chrome-${CHROME_VERSION}"
-            CTRL_VERSION="dev-controller-${CONTROLLER_VERSION}"
-            CF_VERSION="dev-camoufox-${CAMOUFOX_VERSION}"
-          else
-            APP_VERSION="chrome-${CHROME_VERSION}"
-            CTRL_VERSION="controller-${CONTROLLER_VERSION}"
-            CF_VERSION="camoufox-${CAMOUFOX_VERSION}"
-          fi
+          # The same tags the build pushed (.github/scripts/image-tags.sh).
+          TAGS=$(bash .github/scripts/image-tags.sh "${{ github.ref }}" \
+            "$CHROME_VERSION" "$CONTROLLER_VERSION" "$CAMOUFOX_VERSION")
+          eval "$TAGS"
           python3 .github/scripts/update_chart.py chart-repo/Chart.yaml \
-            --app "$APP_VERSION" --controller "$CTRL_VERSION" \
-            --camoufox "$CF_VERSION" >> $GITHUB_OUTPUT
+            --app "$CHROME_TAG" --controller "$CONTROLLER_TAG" \
+            --camoufox "$CAMOUFOX_TAG" >> $GITHUB_OUTPUT
           echo "Chart.yaml now:"
           cat chart-repo/Chart.yaml
 

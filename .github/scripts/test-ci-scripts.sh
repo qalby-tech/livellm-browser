@@ -116,4 +116,27 @@ restore
 rm "$pins/controller/uv.lock"
 pinchk && bad "pins: a missing lock passes" || ok "pins: a missing lock fails"
 
+
+# ── image-tags.sh: the tags the build pushes and update-chart writes ──
+tags() { bash "$here/image-tags.sh" "$@" 2>/dev/null; }
+out="$(tags refs/heads/develop 2.4.0 2.6.0 1.0.0)"; rc=$?
+want=$'CHROME_TAG=dev-chrome-2.4.0\nCONTROLLER_TAG=dev-controller-2.6.0\nCAMOUFOX_TAG=dev-camoufox-1.0.0'
+[ $rc -eq 0 ] && [ "$out" = "$want" ] && ok "tags: develop -> dev-chrome-/dev-controller-/dev-camoufox-" || bad "tags: develop -> rc=$rc out=$out"
+out="$(tags refs/heads/main 2.4.0 2.6.0 1.0.0)"; rc=$?
+want=$'CHROME_TAG=chrome-2.4.0\nCONTROLLER_TAG=controller-2.6.0\nCAMOUFOX_TAG=camoufox-1.0.0'
+[ $rc -eq 0 ] && [ "$out" = "$want" ] && ok "tags: main -> chrome-/controller-/camoufox-" || bad "tags: main -> rc=$rc out=$out"
+for args in "refs/heads/camoufox-engine 2.4.0 2.6.0 1.0.0" "refs/tags/v1 2.4.0 2.6.0 1.0.0" \
+            "refs/heads/develop  2.6.0 1.0.0" "refs/heads/develop 2.4.0 2.6 1.0.0" \
+            "refs/heads/main 2.4.0 2.6.0 dev-1.0.0" "refs/heads/develop 2.4.0 2.6.0"; do
+  # shellcheck disable=SC2086
+  out="$(IFS=' '; tags $args)"; rc=$?
+  [ $rc -ne 0 ] && [ -z "$out" ] && ok "tags: '$args' fails" || bad "tags: '$args' -> rc=$rc out=$out"
+done
+out="$(tags refs/heads/develop '' 2.6.0 1.0.0)"; rc=$?
+[ $rc -ne 0 ] && [ -z "$out" ] && ok "tags: an empty version fails" || bad "tags: empty version -> rc=$rc out=$out"
+# ci.yml takes every tag from it (the build and the chart update alike).
+ci="$here/../workflows/ci.yml"
+[ "$(grep -c 'bash .github/scripts/image-tags.sh' "$ci")" = 2 ] && ok "tags: ci.yml computes both sets with image-tags.sh" || bad "tags: ci.yml does not call image-tags.sh twice"
+grep -nE '(dev-)?(chrome|controller|camoufox)-\$\{' "$ci" && bad "tags: ci.yml spells a tag inline" || ok "tags: ci.yml spells no tag inline"
+
 exit $fail

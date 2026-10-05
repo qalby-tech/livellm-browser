@@ -175,4 +175,6 @@ async def version(request: Request) -> dict:
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=9000, log_level="info")
+    # A stop (SIGTERM, the pod's 30 s grace) waits at most 3 s for requests
+    # in flight, then the lifespan closes the browser (its 25 s budget).
+    uvicorn.run(app, host="0.0.0.0", port=9000, log_level="info", timeout_graceful_shutdown=3)

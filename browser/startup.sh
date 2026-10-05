@@ -57,9 +57,13 @@ for i in $(seq 1 80); do
   sleep 1
 done
 
-# Start launch.py with logs to stdout (visible in docker logs)
+# Start launch.py with logs to stdout (visible in docker logs). A simple
+# command in the background, so $! is uv itself: a `cd ... && uv ...` list
+# runs in a forked subshell, and the trap's TERM then stopped only that
+# subshell, never the launcher (its graceful shutdown never ran on a stop).
 echo "Starting launch.py..."
-cd /home/headless/Desktop/app && /bin/uv run launch.py 2>&1 &
+cd /home/headless/Desktop/app
+/bin/uv run launch.py 2>&1 &
 APP_PID=$!
 echo "launch.py started (PID $APP_PID)"
 

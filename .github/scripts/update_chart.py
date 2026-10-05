@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """Write this repo's image versions into the operator chart's Chart.yaml.
 
-    update_chart.py Chart.yaml --app V --controller V --camoufox V --camoufox-api V
+    update_chart.py Chart.yaml --app V --controller V --camoufox V
 
 Each value lives on one anchored line:
 
-    appVersion: "<v>"                  (top level)
-      controllerVersion: "<v>"         (under annotations:)
-      camoufoxVersion: "<v>"           (under annotations:)
-      camoufoxApiVersion: "<v>"        (under annotations:)
+    appVersion: "<v>"                  (top level: the Chrome image's tag)
+      controllerVersion: "<v>"         (under annotations: the Browser API's)
+      camoufoxVersion: "<v>"           (under annotations: the Camoufox image's)
 
 Only a line whose value changed is rewritten; a missing annotation is
 inserted at the end of the annotations: block. Every other byte of the file
@@ -24,7 +23,6 @@ TOP = ("appVersion", "app")
 ANNOTATIONS = (
     ("controllerVersion", "controller"),
     ("camoufoxVersion", "camoufox"),
-    ("camoufoxApiVersion", "camoufox_api"),
 )
 
 
@@ -82,7 +80,6 @@ def main() -> int:
     ap.add_argument("--app", required=True)
     ap.add_argument("--controller", required=True)
     ap.add_argument("--camoufox", required=True)
-    ap.add_argument("--camoufox-api", dest="camoufox_api", required=True)
     a = ap.parse_args()
     with open(a.chart, encoding="utf-8") as f:
         text = f.read()

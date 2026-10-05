@@ -1,9 +1,10 @@
 services:
   livellm-browser:
     build:
+      # Both browser images build from browser/ (keeper/ and desktop/ are shared).
       context: ./browser
-      dockerfile: Dockerfile
-    image: kamasalyamov/livellm-browser:2.2.8
+      dockerfile: chrome/Dockerfile
+    image: kamasalyamov/livellm-browser:chrome-2.4.0
     container_name: livellm-browser
     ports:
       # VNC port
@@ -27,7 +28,8 @@ services:
       # Mount profiles directory from host with read/write access
       - profiles_volume:/home/headless/Desktop/app/profiles:rw
     restart: unless-stopped
-    stop_grace_period: 10s
+    # A pod stop gets 30 s too: requests in flight 3 s, then the browsers close.
+    stop_grace_period: 30s
     shm_size: '4gb'
     deploy:
       resources:
@@ -42,7 +44,7 @@ services:
     build:
       context: ./controller
       dockerfile: Dockerfile
-    image: kamasalyamov/livellm-browser:controller-2.4.0
+    image: kamasalyamov/livellm-browser:controller-2.6.0
     container_name: livellm-controller
     ports:
       # FastAPI Controller
@@ -65,6 +67,22 @@ services:
           cpus: '1'
           memory: '4gb'
 
+  # A Camoufox browser beside it: uncomment, and add its entry to the
+  # registry below ("camoufox": {"wsUrl": "ws://livellm-camoufox:9222/playwright/default",
+  # "engine": "camoufox"}); the same Browser API drives both.
+  # livellm-camoufox:
+  #   build:
+  #     context: ./browser
+  #     dockerfile: camoufox/Dockerfile
+  #   image: kamasalyamov/livellm-browser:camoufox-1.0.0
+  #   container_name: livellm-camoufox
+  #   ports:
+  #     - "6902:6901"
+  #   volumes:
+  #     - camoufox_profiles_volume:/home/headless/Desktop/app/profiles:rw
+  #   restart: unless-stopped
+  #   shm_size: '2gb'
+
 configs:
   browsers_json:
     content: |
@@ -73,3 +91,5 @@ configs:
 volumes:
   profiles_volume:
     driver: local
+  # camoufox_profiles_volume:
+  #   driver: local

@@ -1,6 +1,6 @@
 # LiveLLM Browser
 
-Dockerized Chrome browser with a FastAPI control plane for programmatic browser management, extension injection, cookie import/export, and CDP proxying.
+Dockerized browsers (Chrome and Camoufox, a Firefox build) with a FastAPI control plane for programmatic browser management, extension injection, cookie import/export, and automation proxying, plus one Browser API that drives browsers of both engines.
 
 ## Quick Start
 
@@ -8,17 +8,54 @@ Dockerized Chrome browser with a FastAPI control plane for programmatic browser 
 docker compose up --build
 ```
 
-This starts two services:
+This builds `browser/chrome` (context `browser/`) and `controller/` and starts two services:
 
 | Service | Port | Description |
 |---------|------|-------------|
 | **Browser** | `9000` (launcher), `9222` (CDP), `6901` (noVNC) | Chrome instance manager (extensions, cookies, profiles); noVNC password `headless` |
-| **Controller** | `8000` | Playwright automation API (search, scrape, interact) |
+| **Controller** | `8000` | The Browser API: Playwright automation (search, scrape, interact) over every browser in its registry |
+
+The browsers' own tests run from their directories: `cd browser/chrome && uv sync --all-extras && uv run pytest tests/` (Python 3.9), `cd browser/camoufox && uv sync --frozen && uv run pytest tests/` (3.12); the Browser API's from `controller/` (3.12).
 
 The browser pins its CDP proxy to a fixed port (`CDP_PORT=9222`), and the
 controller is handed a static registry file (compose `configs.browsers_json`)
 pointing at `ws://livellm-browser:9222/...`. The controller warm-connects on
 startup and lazily on first request — no registration step.
+
+## Engines and images
+
+The tree:
+
+| Path | What |
+|------|------|
+| `browser/chrome/` | The Chrome image's launcher (`launch.py`, `core/`, tests, `pyproject.toml`, `uv.lock`) and its `Dockerfile` |
+| `browser/camoufox/` | The Camoufox image: launcher, `serve.js` (its Playwright server), tests and `Dockerfile` |
+| `browser/keeper/` | The control sidecar (Go), the same binary in both browser images |
+| `browser/desktop/` | `startup.sh` (VNC, noVNC, the launcher) and `locales.json`, shared by both browser images |
+| `controller/` | The Browser API, one image for both engines |
+
+Both browser images build from the context `browser/` (one `browser/.dockerignore`): `docker build -f browser/chrome/Dockerfile browser` and `docker build -f browser/camoufox/Dockerfile browser`.
+
+Three images, all `kamasalyamov/livellm-browser`:
+
+| Image | Tag (main) | Tag (develop) | Version from |
+|-------|-----------|---------------|--------------|
+| Chrome browser | `chrome-<v>` | `dev-chrome-<v>` | `browser/chrome/pyproject.toml` |
+| Camoufox browser | `camoufox-<v>` | `dev-camoufox-<v>` | `browser/camoufox/pyproject.toml` |
+| Browser API | `controller-<v>` | `dev-controller-<v>` | `controller/pyproject.toml` |
+
+A tag is never rebuilt (`.github/scripts/tag-guard.sh`): bump the version to ship a change. CI writes the three tags into the operator chart: `appVersion` (Chrome), `annotations.controllerVersion` and `annotations.camoufoxVersion`.
+
+**One Browser API holds both engines.** Its image carries both clients, each with its own Node driver: patchright drives a Chrome browser over CDP, stock Playwright a Camoufox browser through the browser's own Playwright server (`firefox.connect`). A registry entry names its engine (a Chrome entry is a CDP address, or `{wsUrl, headers}` for a remote browser; a Camoufox entry is `{"wsUrl": "ws://<svc>:9222/playwright/default", "engine": "camoufox"}`), so one pool may mix them. `POST /start_session` takes `{"engine": "chrome" | "camoufox"}` to land on a browser of that engine (see [Sessions](#sessions)).
+
+Release rules (`.github/scripts/check-pins.sh` fails the job otherwise):
+
+- **A Playwright minor** moves `browser/camoufox` and `controller` together: a Camoufox browser's server refuses a client of another minor (428). Bump both images.
+- **A patchright bump** moves `browser/chrome` and `controller` together (the Browser API runs the patchright the Chrome image is tested with). Bump both images.
+- **A Firefox major** (a new Camoufox release) is announced: a profile written by a newer major is not opened by an older one, so a rollback past it needs the owner's go.
+- Every Browser API bump restarts every Browser API once; every Chrome or Camoufox bump restarts every browser of that engine once.
+
+**The automation port refuses web pages.** Chrome runs without `--remote-allow-origins`, and the CDP proxy on `9222` reads the whole request head (16 KiB at most, else 431) and refuses any request that carries an `Origin` header (403) before Chrome sees it; it tunnels only once Chrome answered 101, and passes any other answer on once and closes the connection. Automation clients (Playwright, Puppeteer, CDP libraries) send no Origin and connect as before; a CDP client running inside a web page (it always sends one) is refused. The Camoufox automation proxy does the same.
 
 ## How It Works
 
@@ -152,7 +189,7 @@ curl -X POST http://localhost:8000/parser/browsers \
 `GET /browsers` lists every browser a call can land on, without addresses:
 
 ```json
-[{"browser_id": "default", "connected": true, "healthy": true, "open_tabs": 2, "session_count": 1}]
+[{"browser_id": "default", "engine": "chrome", "connected": true, "healthy": true, "open_tabs": 2, "session_count": 1}]
 ```
 
 `healthy` turns false for 30 seconds after a browser could not be reached; calls that name no browser skip it meanwhile.
@@ -177,20 +214,26 @@ Every response for which a browser was chosen carries `X-Browser-Id` naming it.
 |--------|------|
 | `400` | The path names one browser and `X-Browser-Id` another, or `start_session`'s body names another |
 | `404` | The named browser is not in the controller, or the session is unknown (never started, ended, or its browser was removed) |
-| `409` | A named browser contradicts the session's browser |
+| `409` | A named browser contradicts the session's browser; `start_session` with an `engine` this Browser API holds no browser of, or that a named browser does not run |
 | `502` | The named (or session's) browser cannot be reached |
-| `503` | No browsers at all, or none of them can be reached |
+| `422` | `start_session`'s `engine` is neither `chrome` nor `camoufox` |
+| `503` | No browsers at all, or none of them (of the asked engine) can be reached |
 
 ### Sessions
 
-A session is a browser tab. Start one with `POST /start_session`, or omit `X-Session-Id` to get an ad-hoc tab that is created for the request and closed on the way out. A session stays on its browser: later calls send `X-Session-Id` alone. If its tab was closed or its browser reconnected, the session gets a new tab on the same browser. Sessions live in the controller's memory, so a controller restart ends them all.
+A session is a browser tab. Start one with `POST /start_session` (with `{"engine": "chrome"}` or `{"engine": "camoufox"}` to keep to browsers of that engine: without one, any browser; with one, the one of that engine with the fewest open tabs, 409 when the Browser API holds none, and 409 when the body, `X-Browser-Id` or the path names a browser of the other engine), or omit `X-Session-Id` to get an ad-hoc tab that is created for the request and closed on the way out. A session stays on its browser: later calls send `X-Session-Id` alone. If its tab was closed or its browser reconnected, the session gets a new tab on the same browser. Sessions live in the controller's memory, so a controller restart ends them all.
 
 After extraction, every page operation issues `window.stop()` so Chrome stops streaming bytes back over CDP into the Node driver heap — important for large/heavy pages that would otherwise keep loading resources after the response was already returned.
 
 ```bash
 # Start a persistent session (on a chosen browser: add -H "X-Browser-Id: default")
 curl -X POST http://localhost:8000/parser/start_session
-# Returns: {"session_id": "abc-123", "browser_id": "default", ...}
+# Returns: {"session_id": "abc-123", "browser_id": "default", "engine": "chrome", ...}
+
+# Or on a browser of one engine (the one of that engine with the fewest open tabs)
+curl -X POST http://localhost:8000/parser/start_session \
+  -H "Content-Type: application/json" -d '{"engine": "camoufox"}'
+# Returns: {"session_id": "def-456", "browser_id": "cf-1", "engine": "camoufox", ...}
 
 # Use it: X-Session-Id alone goes to its browser
 curl -X POST http://localhost:8000/parser/content \
@@ -333,7 +376,7 @@ curl -X POST http://localhost:8000/parser/search_videos \
 | `POST` | `/browsers` | Register browser via CDP (no `BROWSERS_CONFIG` only) |
 | `DELETE` | `/browsers/{id}` | Disconnect browser (no `BROWSERS_CONFIG` only) |
 | `*` | `/browsers/{id}/<path>` | `<path>` on browser `{id}` (same as `X-Browser-Id`) |
-| `POST` | `/start_session` | Create a tab |
+| `POST` | `/start_session` | Create a tab (optionally on a browser of one `engine`) |
 | `DELETE` | `/end_session` | Close a tab |
 | `POST` | `/content` | Get page text/HTML/screenshot |
 | `POST` | `/interact` | Click, type, scroll on a page |

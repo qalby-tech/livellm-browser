@@ -81,7 +81,8 @@ def test_proxied_prefs_cover_startup_dns_and_webrtc(tmp_path):
         "network.proxy.allow_hijacking_localhost": True, "network.proxy.failover_direct": False,
         "network.trr.mode": 5, "network.dns.disablePrefetch": True, "network.predictor.enabled": False,
         "network.prefetch-next": False, "network.http.speculative-parallel-limit": 0,
-        "network.http.http3.enable": False, "media.peerconnection.ice.proxy_only_if_behind_proxy": True,
+        "network.http.http3.enable": False, "media.peerconnection.ice.proxy_only": True,
+        "media.peerconnection.ice.proxy_only_if_behind_proxy": True,
         "media.peerconnection.ice.default_address_only": True, "media.peerconnection.ice.no_host": True,
     }
     for k, v in want.items():

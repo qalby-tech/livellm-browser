@@ -58,11 +58,17 @@ function defaultContext() {
 
 const CHROMIUM_ONLY = ['partitionKey', 'sourceScheme', 'sourcePort'];
 
-function clean(c) {
+// Firefox silently discards a cookie whose expiry lies more than 400 days
+// ahead (addCookies still succeeds), as Chromium caps such a date to 400
+// days: cap it the same way, so the cookie is kept.
+const MAX_AGE_S = 400 * 24 * 3600;
+
+function clean(c, now) {
   const o = {};
   for (const [k, v] of Object.entries(c || {})) {
     if (!CHROMIUM_ONLY.includes(k) && v !== null && v !== undefined) o[k] = v;
   }
+  if (typeof o.expires === 'number' && o.expires > now + MAX_AGE_S) o.expires = now + MAX_AGE_S - 60;
   return o;
 }
 
@@ -71,7 +77,8 @@ const keyOf = (c) => [c.name, c.domain, c.path].join('\u0000');
 async function addCookies(args) {
   const ctx = defaultContext();
   const given = Array.isArray(args.cookies) ? args.cookies : [];
-  let cookies = given.filter((c) => c && typeof c === 'object').map(clean);
+  const now = Math.floor(Date.now() / 1000);
+  let cookies = given.filter((c) => c && typeof c === 'object').map((c) => clean(c, now));
   let dropped = given.length - cookies.length;
   let skipped = 0;
   if (args.skipExisting) {
@@ -83,20 +90,31 @@ async function addCookies(args) {
     cookies = missing;
   }
   if (!cookies.length) return { added: 0, dropped, skipped };
+  let batch = true;
   try {
     await ctx.addCookies(cookies);
-    return { added: cookies.length, dropped, skipped };
   } catch (e) {
+    batch = false;
     console.error('serve.js: adding ' + cookies.length + ' cookies at once failed (' + String(e.message).split('\n')[0] + '); one by one');
   }
+  if (!batch) {
+    for (const c of cookies) {
+      try {
+        await ctx.addCookies([c]);
+      } catch (e) { /* refused: counted below */ }
+    }
+  }
+  // Firefox may take a cookie without an error and still not keep it: count
+  // what the browser really holds afterwards. A cookie given by url is matched
+  // by name and that url's host.
+  const have = new Set((await ctx.cookies()).map((c) => [c.name, c.domain.replace(/^\./, ''), c.path].join('\u0000')));
+  const hostOf = (c) => { try { return new URL(c.url).hostname; } catch (e) { return ''; } };
   let added = 0;
   for (const c of cookies) {
-    try {
-      await ctx.addCookies([c]);
-      added++;
-    } catch (e) {
-      dropped++; // refused by Firefox (SameSite=None without Secure, for one)
-    }
+    const domain = (c.domain || hostOf(c)).replace(/^\./, '');
+    const p = c.path || (c.url ? (() => { try { const u = new URL(c.url).pathname; return u.slice(0, u.lastIndexOf('/') + 1) || '/'; } catch (e) { return '/'; } })() : '/');
+    if (have.has([c.name, domain, p].join('\u0000')) || have.has([c.name, domain, '/'].join('\u0000'))) added++;
+    else dropped++;
   }
   return { added, dropped, skipped };
 }

@@ -49,6 +49,10 @@ def proxied_prefs(proxy: dict) -> dict:
         "network.prefetch-next": False,
         "network.http.speculative-parallel-limit": 0,
         "network.http.http3.enable": False,
+        # proxy_only_if_behind_proxy alone still let a STUN binding request
+        # out over UDP from a proxied browser (measured on the rc,
+        # 2026-10-05): proxy_only keeps every ICE candidate on the proxy.
+        "media.peerconnection.ice.proxy_only": True,
         "media.peerconnection.ice.proxy_only_if_behind_proxy": True,
         "media.peerconnection.ice.default_address_only": True,
         "media.peerconnection.ice.no_host": True,

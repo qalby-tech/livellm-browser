@@ -104,7 +104,8 @@ RUN apt-get update && \
 # ONE layer, so the font groups removed below never sit in a lower one.
 # Camoufox's bundle stores each face once, in a directory named for the OSes
 # that read it (fonts/groups.json); a Linux identity reads only L, LM, LW and
-# LMW, so M, W and MW (1.24 GB of macOS/Windows faces) go.
+# LMW, so M, W and MW (1.24 GB of macOS/Windows faces) are never unpacked
+# (unzip also exits 1 on their non-UTF-8 local names, which set -e refuses).
 ARG CAMOUFOX_TAG=v156.0.1-beta.34
 ARG CAMOUFOX_ZIP=camoufox-156.0.1-beta.34-lin.x86_64.zip
 ARG CAMOUFOX_SHA256=09effb44efec6f0617b6940b787054b4b8773f28d6573bcbabefe3163e75d0cc
@@ -113,10 +114,10 @@ RUN set -eu; \
     curl -fsSL --retry 5 -o /tmp/camoufox.zip "https://github.com/daijro/camoufox/releases/download/${CAMOUFOX_TAG}/${CAMOUFOX_ZIP}"; \
     echo "${CAMOUFOX_SHA256}  /tmp/camoufox.zip" | sha256sum -c -; \
     mkdir -p /opt/camoufox; \
-    unzip -q /tmp/camoufox.zip -d /opt/camoufox; \
+    unzip -q /tmp/camoufox.zip -x 'fonts/M/*' 'fonts/W/*' 'fonts/MW/*' -d /opt/camoufox; \
     rm -f /tmp/camoufox.zip; \
     .venv/bin/python -c "import json,sys; lin=set(json.load(open('/opt/camoufox/fonts/groups.json'))['readBy']['lin']); print('Linux reads font groups', sorted(lin)); sys.exit(0 if lin <= {'L','LM','LW','LMW'} else 1)"; \
-    rm -rf /opt/camoufox/fonts/M /opt/camoufox/fonts/W /opt/camoufox/fonts/MW; \
+    test ! -e /opt/camoufox/fonts/M && test ! -e /opt/camoufox/fonts/W && test ! -e /opt/camoufox/fonts/MW; \
     v="$(sed -n 's/^Version=//p' /opt/camoufox/application.ini)"; \
     echo "Camoufox $v (Firefox major expected ${FIREFOX_MAJOR})"; \
     test "${v%%.*}" = "${FIREFOX_MAJOR}"; \

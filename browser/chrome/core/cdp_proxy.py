@@ -8,8 +8,9 @@ For every connection it reads the whole request head first (up to 16 KiB,
 else 431), and before anything reaches Chrome:
 
 - a request that carries an Origin header is refused (403). A web page always
-  sends Origin on a WebSocket (and on cross-origin fetches); automation
-  clients (Playwright, Puppeteer, CDP libraries) send none. Chrome itself runs
+  sends Origin on a WebSocket (and on cross-origin fetches); Playwright,
+  patchright and Puppeteer send none, while websocket-client sends one unless
+  it is given suppress_origin=True (so such a client is refused too). Chrome itself runs
   without --remote-allow-origins, so it refuses such an upgrade too;
 - the stable path /devtools/browser/<anything> is rewritten to the browser's
   current ws endpoint (so an address stays valid across restarts);
@@ -192,7 +193,8 @@ class CDPProxy:
         if parsed is None:
             return await self._answer(writer, 400)
         method, target, version, headers = parsed
-        # A page always sends Origin; automation clients never do.
+        # A page always sends Origin; Playwright, patchright and Puppeteer never
+        # do (websocket-client does unless suppress_origin=True).
         if any(name.lower() == "origin" for name, _ in headers):
             return await self._answer(writer, 403)
 

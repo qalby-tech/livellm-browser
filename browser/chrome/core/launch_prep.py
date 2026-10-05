@@ -227,7 +227,8 @@ def prepare_launch(
     # No --remote-allow-origins: Chrome then refuses every DevTools
     # WebSocket that carries an Origin (any web page's), and the CDP proxy
     # on the public port refuses any request with one before Chrome sees it.
-    # Automation clients (Playwright, Puppeteer, CDP libraries) send none.
+    # Playwright, patchright and Puppeteer send none; websocket-client sends
+    # one unless it is given suppress_origin=True.
     args = list(BASE_ARGS) + [
         f"--remote-debugging-port={chrome_port}",
     ]

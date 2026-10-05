@@ -55,7 +55,7 @@ Release rules (`.github/scripts/check-pins.sh` fails the job otherwise):
 - **A Firefox major** (a new Camoufox release) is announced: a profile written by a newer major is not opened by an older one, so a rollback past it needs the owner's go.
 - Every Browser API bump restarts every Browser API once; every Chrome or Camoufox bump restarts every browser of that engine once.
 
-**The automation port refuses web pages.** Chrome runs without `--remote-allow-origins`, and the CDP proxy on `9222` reads the whole request head (16 KiB at most, else 431) and refuses any request that carries an `Origin` header (403) before Chrome sees it; it tunnels only once Chrome answered 101, and passes any other answer on once and closes the connection. Automation clients (Playwright, Puppeteer, CDP libraries) send no Origin and connect as before; a CDP client running inside a web page (it always sends one) is refused. The Camoufox automation proxy does the same.
+**The automation port refuses web pages.** Chrome runs without `--remote-allow-origins`, and the CDP proxy on `9222` reads the whole request head (16 KiB at most, else 431) and refuses any request that carries an `Origin` header (403) before Chrome sees it; it tunnels only once Chrome answered 101, and passes any other answer on once and closes the connection. A client must send no `Origin` header: Playwright, patchright and Puppeteer send none and connect as before; websocket-client sends one by default, so pass `suppress_origin=True` (`websocket.create_connection(url, suppress_origin=True)`); check any other CDP library the same way. A CDP client running inside a web page (it always sends one) is refused. The Camoufox automation proxy does the same.
 
 ## How It Works
 

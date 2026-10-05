@@ -56,3 +56,39 @@ def test_the_sidecar_client_is_a_runtime_dependency():
     runtime, _ = _deps()
     assert "httpx" in runtime  # core/keeper_hint.py reaches the browser's control sidecar with it
     assert "httpx" in _image_imports()
+
+
+# ── The Camoufox Browser API image (Dockerfile.camoufox) ──
+#
+# It installs requirements-camoufox.txt (hashed, from requirements-camoufox.in)
+# instead of pyproject.toml: the same runtime dependencies with stock
+# Playwright in place of patchright. A dependency added to pyproject.toml
+# and not to requirements-camoufox.in would pass every test and stop that
+# image at start.
+
+def _camoufox_in():
+    lines = (ROOT / "requirements-camoufox.in").read_text().splitlines()
+    reqs = [l.strip() for l in lines if l.strip() and not l.strip().startswith("#")]
+    return {re.split(r"[<>=!~\[; ]", r)[0].lower(): r for r in reqs}
+
+
+def test_the_camoufox_image_has_the_same_runtime_dependencies():
+    runtime, _ = _deps()
+    want = (runtime - {"patchright"}) | {"playwright"}
+    assert set(_camoufox_in()) == want
+
+
+def test_the_camoufox_image_pins_one_playwright_with_hashes():
+    pin = _camoufox_in()["playwright"]
+    assert re.fullmatch(r"playwright==\d+\.\d+\.\d+", pin), pin
+    txt = (ROOT / "requirements-camoufox.txt").read_text()
+    assert re.search(rf"^{re.escape(pin)} \\$", txt, re.M), "requirements-camoufox.txt is not compiled from requirements-camoufox.in"
+    for block in re.split(r"\n(?=[a-z0-9])", txt.split("\n", 2)[2] if txt.startswith("#") else txt):
+        if re.match(r"^[a-z0-9]", block):
+            assert "--hash=sha256:" in block, f"no hash: {block.splitlines()[0]}"
+
+
+def test_playwright_is_imported_only_through_the_shim():
+    imports = _image_imports()
+    assert imports.get("playwright") == {"core/pw.py"}
+    assert imports.get("patchright") == {"core/pw.py"}

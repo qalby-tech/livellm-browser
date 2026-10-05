@@ -4,7 +4,7 @@ import logging
 from typing import Annotated, List, Optional, AsyncGenerator, Tuple
 
 from fastapi import Depends, Header, HTTPException, Request
-from patchright.async_api import Page
+from core.pw import Page
 
 from core import browser as browser_mod
 from core.browser import BrowserInfo, BrowserManager

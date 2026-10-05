@@ -223,6 +223,9 @@ class FakeNet:
         self.connects = []
         self.opened = []
         self.delay = {}
+        # (protocol, browser, headers) of every connect: "cdp" for
+        # chromium.connect_over_cdp, "playwright" for firefox.connect.
+        self.protocols = []
 
     def chrome(self, name):
         if name not in self.chromes:
@@ -239,6 +242,15 @@ class FakeNet:
         return [c for c in self.opened if c._chrome.name == name and c._open]
 
     async def connect_over_cdp(self, ws_url, headers=None):
+        self.protocols.append(("cdp", ws_url.split("://", 1)[1].split(":", 1)[0], dict(headers or {})))
+        return await self._connect(ws_url, headers)
+
+    async def firefox_connect(self, ws_url, headers=None):
+        """A Camoufox browser's Playwright server (firefox.connect)."""
+        self.protocols.append(("playwright", ws_url.split("://", 1)[1].split(":", 1)[0], dict(headers or {})))
+        return await self._connect(ws_url, headers)
+
+    async def _connect(self, ws_url, headers=None):
         name = ws_url.split("://", 1)[1].split(":", 1)[0]
         self.connects.append(name)
         if self.delay.get(name):
@@ -258,6 +270,7 @@ class FakeNet:
         # No private driver attributes: driver_alive() reads as alive.
         return SimpleNamespace(
             chromium=SimpleNamespace(connect_over_cdp=self.connect_over_cdp),
+            firefox=SimpleNamespace(connect=self.firefox_connect),
             stop=AsyncMock(),
         )
 
@@ -273,17 +286,22 @@ def pool(request, tmp_path, monkeypatch, fresh_manager, net):
 
     Parametrize indirectly with a list of ids to start from another registry,
     or a dict {id: Authorization header or None} for browsers that require
-    one. ``pool.set_registry(*ids)`` rewrites it the way the operator does.
+    one, or {id: "camoufox"} for Camoufox browsers (their registry entry
+    names the engine). ``pool.set_registry(*ids)`` rewrites it the way the
+    operator does.
     """
     from core.registry import browser_registry
 
     param = getattr(request, "param", ["agent-1", "agent-2"])
     ids = list(param)
-    auth = {n: a for n, a in param.items() if a} if isinstance(param, dict) else {}
+    camoufox = {n for n, a in param.items() if a == "camoufox"} if isinstance(param, dict) else set()
+    auth = {n: a for n, a in param.items() if a and a != "camoufox"} if isinstance(param, dict) else {}
     reg = tmp_path / "browsers.json"
     stamp = itertools.count(1)
 
     def entry(n):
+        if n in camoufox:
+            return {"wsUrl": f"ws://{n}:9222/playwright/default", "engine": "camoufox"}
         ws_url = f"ws://{n}:9222/devtools/browser/{n}"
         if n in auth:
             return {"wsUrl": ws_url, "headers": {"Authorization": auth[n]}}

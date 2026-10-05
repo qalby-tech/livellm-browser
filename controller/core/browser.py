@@ -6,9 +6,11 @@ import signal
 import time
 from typing import Iterable, Optional
 
-from patchright.async_api import Playwright, Browser, BrowserContext, Page
+from core import pw
+from core.pw import Playwright, Browser, BrowserContext, Page
 
 from core.config import settings
+from core.registry import browser_registry
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +43,13 @@ PICK_CONNECT_WAIT = 3.0
 class BrowserInfo:
     """Container for a connected browser, its default context, and active pages."""
 
-    def __init__(self, browser: Browser, context: BrowserContext, ws_url: str = "", browser_id: str = "", headers: Optional[dict] = None):
+    def __init__(self, browser: Browser, context: BrowserContext, ws_url: str = "", browser_id: str = "", headers: Optional[dict] = None, engine: str = pw.CHROME):
         self.browser = browser
         self.context = context
         self.ws_url = ws_url
         self.browser_id = browser_id
+        # "chrome" (a CDP connection) or "camoufox" (a Playwright one).
+        self.engine = engine
         # Optional auth headers sent on CDP connect (BYO/remote browsers).
         self.headers = headers or {}
         # Tabs of the sessions that live on this browser, by session id.
@@ -176,7 +180,8 @@ class BrowserManager:
             await self.disconnect_browser(browser_id)
 
         logger.info(f"Connecting to browser '{browser_id}' via {ws_url}")
-        browser = await self._cdp_connect(ws_url, headers)
+        engine = self.engine_of(browser_id)
+        browser = await self._cdp_connect(ws_url, headers, engine)
         current = self.browsers.get(browser_id)
         if current is not None and current.ws_url == ws_url and self._alive(current):
             # Another call connected it while this one waited: keep that
@@ -186,20 +191,45 @@ class BrowserManager:
             except Exception:
                 pass
             return current
-        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        context = await self._default_context(browser, engine)
 
-        info = BrowserInfo(browser, context, ws_url=ws_url, browser_id=browser_id, headers=headers or {})
+        info = BrowserInfo(browser, context, ws_url=ws_url, browser_id=browser_id, headers=headers or {}, engine=engine)
         self.browsers[browser_id] = info
         self.mark_healthy(browser_id)
         logger.info(f"Connected to browser '{browser_id}'")
         return info
 
-    async def _cdp_connect(self, ws_url: str, headers: Optional[dict]):
-        """One CDP connect, given up after CONNECT_TIMEOUT."""
+    @staticmethod
+    def engine_of(browser_id: str) -> str:
+        """The engine of a browser: its registry entry's ("chrome" when the
+        entry names none), else (a browser connected through POST /browsers)
+        this controller's own."""
+        return browser_registry.get_browser_engine(browser_id) or pw.ENGINE
+
+    def _connect_call(self, ws_url: str, headers: Optional[dict], engine: str):
+        """The connect for a browser's engine: CDP for Chrome, the browser's
+        own Playwright server for Camoufox (Firefox)."""
+        if engine == pw.CAMOUFOX:
+            return self.playwright.firefox.connect(ws_url, headers=headers or None)
+        return self.playwright.chromium.connect_over_cdp(ws_url, headers=headers or None)
+
+    async def _cdp_connect(self, ws_url: str, headers: Optional[dict], engine: str = pw.CHROME):
+        """One connect, given up after CONNECT_TIMEOUT."""
         return await asyncio.wait_for(
-            self.playwright.chromium.connect_over_cdp(ws_url, headers=headers or None),
+            self._connect_call(ws_url, headers, engine),
             timeout=CONNECT_TIMEOUT,
         )
+
+    @staticmethod
+    async def _default_context(browser: Browser, engine: str) -> BrowserContext:
+        """The browser's default context (its cookies and sign-ins). Only a
+        browser that has none gets a new one; a Camoufox one sized by its
+        window, as its default context is (no fixed viewport)."""
+        if browser.contexts:
+            return browser.contexts[0]
+        if engine == pw.CAMOUFOX:
+            return await browser.new_context(no_viewport=True)
+        return await browser.new_context()
 
     async def disconnect_browser(self, browser_id: str) -> bool:
         """Drop a browser's connection; its session tabs and the connection
@@ -521,12 +551,10 @@ class BrowserManager:
         CDP connection, bounded by CONNECT_TIMEOUT."""
         self.drop_connection(browser_id)
 
-        browser = await self._cdp_connect(ws_url, headers)
-        context = (
-            browser.contexts[0] if browser.contexts
-            else await browser.new_context()
-        )
-        info = BrowserInfo(browser, context, ws_url=ws_url, browser_id=browser_id, headers=headers or {})
+        engine = self.engine_of(browser_id)
+        browser = await self._cdp_connect(ws_url, headers, engine)
+        context = await self._default_context(browser, engine)
+        info = BrowserInfo(browser, context, ws_url=ws_url, browser_id=browser_id, headers=headers or {}, engine=engine)
         self.browsers[browser_id] = info
         logger.info(f"Connected browser '{browser_id}' (same driver)")
         return info
@@ -557,23 +585,20 @@ class BrowserManager:
         # Brief pause to let the OS reclaim sockets / pipes
         await asyncio.sleep(0.5)
 
-        from patchright.async_api import async_playwright
-        self.playwright = await async_playwright().start()
+        self.playwright = await pw.async_playwright().start()
         self._track_playwright_pid()
         logger.info("Playwright driver restarted")
 
         new_info: Optional[BrowserInfo] = None
         for bid, (url, hdrs) in saved.items():
             try:
+                engine = self.engine_of(bid)
                 browser = await asyncio.wait_for(
-                    self.playwright.chromium.connect_over_cdp(url, headers=hdrs or None),
+                    self._connect_call(url, hdrs, engine),
                     timeout=15.0,
                 )
-                context = (
-                    browser.contexts[0] if browser.contexts
-                    else await browser.new_context()
-                )
-                info = BrowserInfo(browser, context, ws_url=url, browser_id=bid, headers=hdrs or {})
+                context = await self._default_context(browser, engine)
+                info = BrowserInfo(browser, context, ws_url=url, browser_id=bid, headers=hdrs or {}, engine=engine)
                 self.browsers[bid] = info
                 if bid == browser_id:
                     new_info = info

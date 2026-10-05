@@ -78,7 +78,9 @@ jobs:
         run: |
           python3.12 -m venv "$RUNNER_TEMP/cfctl"
           "$RUNNER_TEMP/cfctl/bin/pip" install --require-hashes --no-deps -r requirements-camoufox.txt
-          "$RUNNER_TEMP/cfctl/bin/pip" install "pytest>=8.0.0" "pytest-asyncio>=0.23.0"
+          # The test tools at the versions the Chrome run uses (uv.lock):
+          # pytest-asyncio 1.4 leaves no event loop for the sync tests after an async one.
+          "$RUNNER_TEMP/cfctl/bin/pip" install "pytest==8.4.2" "pytest-asyncio==1.2.0"
           "$RUNNER_TEMP/cfctl/bin/python" -m pytest tests/ -v --tb=short
 
       - name: Camoufox release rules (one Playwright pin; controller vs camoufox version)

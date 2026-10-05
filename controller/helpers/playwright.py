@@ -2,7 +2,7 @@ import asyncio
 import logging
 from typing import List, Optional
 
-from patchright.async_api import Page
+from core.pw import Page
 
 logger = logging.getLogger(__name__)
 

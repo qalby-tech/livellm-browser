@@ -4,7 +4,7 @@ from typing import List, Optional
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException
-from patchright.async_api import Page, ElementHandle
+from core.pw import Page, ElementHandle
 
 from core.dependencies import PageDep
 from models.requests import SearchRequest, SearchHintsRequest

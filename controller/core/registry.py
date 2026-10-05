@@ -7,6 +7,9 @@ logger = logging.getLogger(__name__)
 
 # Path to the operator-maintained browser registry (a mounted ConfigMap).
 # JSON shape: {"browsers": {"<browser_id>": "ws://<svc>:<port>/devtools/browser/<id>", ...}}
+# An entry may also be an object {"wsUrl", "headers"?, "engine"?}: a Camoufox
+# browser's is {"wsUrl": "ws://<svc>:9222/playwright/default", "engine": "camoufox"}
+# (no engine = a Chrome browser's CDP address).
 BROWSERS_CONFIG_PATH = os.environ.get("BROWSERS_CONFIG", "/etc/livellm/browsers.json")
 
 
@@ -39,27 +42,31 @@ class BrowserRegistry:
 
     def __init__(self, path: str = BROWSERS_CONFIG_PATH):
         self.path = path
-        # {browser_id: {"wsUrl": str, "headers": {name: value}}}
+        # {browser_id: {"wsUrl": str, "headers": {name: value}, "engine": str}}
         self._cache: dict[str, dict] = {}
         self._mtime: float = -1.0
 
     @staticmethod
     def _normalize(value) -> Optional[dict]:
-        """Accept a plain ws_url string OR an object {wsUrl, headers}.
+        """Accept a plain ws_url string OR an object {wsUrl, headers, engine}.
 
-        Returns a normalized {"wsUrl": str, "headers": dict} or None if invalid.
-        The object form carries optional auth headers for BYO/remote browsers
-        (e.g. {"wsUrl": "wss://…", "headers": {"Authorization": "Bearer …"}}).
+        Returns a normalized {"wsUrl": str, "headers": dict, "engine": str} or
+        None if invalid. The object form carries optional auth headers for
+        BYO/remote browsers (e.g. {"wsUrl": "wss://…", "headers":
+        {"Authorization": "Bearer …"}}) and a Camoufox browser's engine
+        ({"wsUrl": "ws://…/playwright/default", "engine": "camoufox"}); any
+        other engine, or none, is Chrome.
         """
         if isinstance(value, str):
-            return {"wsUrl": value, "headers": {}} if value else None
+            return {"wsUrl": value, "headers": {}, "engine": "chrome"} if value else None
         if isinstance(value, dict):
             ws = value.get("wsUrl") or ""
             raw_headers = value.get("headers") or {}
             headers = {}
             if isinstance(raw_headers, dict):
                 headers = {str(k): str(v) for k, v in raw_headers.items() if v}
-            return {"wsUrl": str(ws), "headers": headers} if ws else None
+            engine = "camoufox" if value.get("engine") == "camoufox" else "chrome"
+            return {"wsUrl": str(ws), "headers": headers, "engine": engine} if ws else None
         return None
 
     def _load(self) -> dict[str, dict]:
@@ -109,6 +116,11 @@ class BrowserRegistry:
         """Auth headers to send on CDP connect for this browser (may be empty)."""
         entry = self._load().get(browser_id)
         return dict(entry["headers"]) if entry else {}
+
+    def get_browser_engine(self, browser_id: str) -> Optional[str]:
+        """"chrome" or "camoufox" for a browser in the registry, else None."""
+        entry = self._load().get(browser_id)
+        return entry["engine"] if entry else None
 
 
 browser_registry = BrowserRegistry()

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
-from patchright.async_api import async_playwright
+from core.pw import async_playwright
 
 from core.browser import browser_manager
 from core.dependencies import browser_pool

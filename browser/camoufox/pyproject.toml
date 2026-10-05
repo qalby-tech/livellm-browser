@@ -1,7 +1,7 @@
 [project]
 name = "livellm-camoufox"
-# The version of BOTH Camoufox images: camoufox-<v> (this browser) and
-# camoufox-api-<v> (the Camoufox Browser API, built from ../controller).
+# The Camoufox browser image's version: camoufox-<v> (dev-camoufox-<v> from
+# develop).
 version = "1.0.0"
 description = "Camoufox (Firefox) in docker with VNC, served to Playwright clients over a launcher API"
 readme = "README.md"
@@ -9,7 +9,8 @@ requires-python = "==3.12.*"
 dependencies = [
     # camoufox and playwright move together: each Camoufox build speaks one
     # Playwright minor (a client of another is refused with 428), and the
-    # Camoufox Browser API pins the same playwright (../controller/requirements-camoufox.in).
+    # Browser API (../../controller/pyproject.toml) pins the same playwright
+    # (.github/scripts/check-pins.sh).
     "camoufox==0.5.7",
     "playwright==1.62.0",
     "fastapi>=0.121.3",

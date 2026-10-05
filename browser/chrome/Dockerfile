@@ -1,3 +1,9 @@
+# kamasalyamov/livellm-browser:chrome-<v> (<v> = browser/chrome/pyproject.toml).
+#
+# Built with the context browser/ (docker build -f browser/chrome/Dockerfile
+# browser): it copies keeper/ (the control sidecar), desktop/ (startup.sh and
+# locales.json, shared with the Camoufox image) and chrome/ (the launcher).
+
 # The control sidecar (keeper) is a static Go binary built in its own stage.
 FROM golang:1.25.1-bookworm AS keeper
 WORKDIR /src/keeper
@@ -81,7 +87,7 @@ RUN uv python install 3.9
 WORKDIR ${HOME}/Desktop/app
 
 # Copy only dependency files first (for better caching)
-COPY pyproject.toml uv.lock ./
+COPY chrome/pyproject.toml chrome/uv.lock ./
 
 # Install Python dependencies and Chrome (cached layer)
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -116,14 +122,15 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # The offered locales; each must resolve to its font.
-COPY locales.json /etc/livellm/locales.json
-COPY scripts/check_fonts.py /tmp/check_fonts.py
+COPY desktop/locales.json /etc/livellm/locales.json
+COPY chrome/scripts/check_fonts.py /tmp/check_fonts.py
 RUN uv run python /tmp/check_fonts.py /etc/livellm/locales.json && rm /tmp/check_fonts.py
 
 COPY --from=keeper /out/livellm-keeper /usr/local/bin/livellm-keeper
 
-# Now copy the rest of the application code
-COPY . .
+# Now copy the rest of the application code (chrome/ only: the context also
+# holds camoufox/ and keeper/)
+COPY chrome/ ./
 
 # Fix permissions for startup script modification and cache
 RUN chmod 666 /etc/passwd /etc/group && \
@@ -133,7 +140,7 @@ RUN chmod 666 /etc/passwd /etc/group && \
 # Copy the custom startup script. A Windows checkout turns the shebang into
 # "/bin/bash\r" — strip CR so the container doesn't die on start with
 # "exec /usr/local/bin/custom-startup.sh: no such file or directory".
-COPY startup.sh /usr/local/bin/custom-startup.sh
+COPY desktop/startup.sh /usr/local/bin/custom-startup.sh
 RUN sed -i 's/\r$//' /usr/local/bin/custom-startup.sh && \
     chmod +x /usr/local/bin/custom-startup.sh
 

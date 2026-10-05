@@ -1,11 +1,13 @@
-# kamasalyamov/livellm-browser:camoufox-<v> (<v> = camoufox/pyproject.toml).
+# kamasalyamov/livellm-browser:camoufox-<v> (<v> = browser/camoufox/pyproject.toml).
 #
 # The Camoufox engine: Camoufox (a Firefox build) on the same desktop as the
-# Chrome image (TigerVNC :1 1920x1080, xfce, noVNC on 6901, browser/startup.sh),
+# Chrome image (TigerVNC :1 1920x1080, xfce, noVNC on 6901, desktop/startup.sh),
 # served to Playwright clients by its own Playwright server and the launcher
-# API on :9000. Built from the repo root (it shares browser/keeper,
-# browser/startup.sh and browser/locales.json); Dockerfile.dockerignore keeps
-# the context to exactly those and camoufox/.
+# API on :9000. Built with the context browser/ (docker build -f
+# browser/camoufox/Dockerfile browser), as the Chrome image is: it copies
+# keeper/ (the shared control sidecar), desktop/ (startup.sh and
+# locales.json, shared) and camoufox/; browser/.dockerignore keeps caches,
+# tests and local profiles out.
 #
 # Nothing is fetched at runtime: the browser, its fingerprint model and
 # uBlock Origin are pinned by sha256 and baked in here.
@@ -13,9 +15,9 @@
 # The control sidecar (keeper): the same Go source as the Chrome image's.
 FROM golang:1.25.1-bookworm AS keeper
 WORKDIR /src/keeper
-COPY browser/keeper/go.mod browser/keeper/go.sum ./
+COPY keeper/go.mod keeper/go.sum ./
 RUN go mod download
-COPY browser/keeper/ ./
+COPY keeper/ ./
 RUN CGO_ENABLED=0 GOFLAGS=-trimpath go build -ldflags="-s -w" -o /out/livellm-keeper .
 
 FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
@@ -155,7 +157,7 @@ RUN UV_OFFLINE=0 .venv/bin/python -c "from camoufox.fpgen_model import ensure_fp
 RUN .venv/bin/python -c "import json; p = '/opt/camoufox/distribution/policies.json'; d = json.load(open(p)); d['policies']['SearchEngines'] = {'PreventInstalls': True, 'Add': [{'Name': 'Google', 'URLTemplate': 'https://www.google.com/search?q={searchTerms}', 'Method': 'GET'}], 'Default': 'Google', 'Remove': ['None']}; json.dump(d, open(p, 'w'), indent=2); print('default search engine:', d['policies']['SearchEngines']['Default'])"
 
 # The offered locales (the same table as the Chrome image).
-COPY browser/locales.json /etc/livellm/locales.json
+COPY desktop/locales.json /etc/livellm/locales.json
 
 COPY --from=keeper /out/livellm-keeper /usr/local/bin/livellm-keeper
 
@@ -169,7 +171,7 @@ RUN chmod 666 /etc/passwd /etc/group && \
     chown -R "${HEADLESS_USER_ID}":"${HEADLESS_USER_GROUP_ID}" "${HOME}/Desktop/app/profiles" "${HOME}/.cache" "${HOME}/.camoufox" && \
     chown "${HEADLESS_USER_ID}":"${HEADLESS_USER_GROUP_ID}" "${HOME}" "${HOME}/Desktop" "${HOME}/Desktop/app"
 
-COPY browser/startup.sh /usr/local/bin/custom-startup.sh
+COPY desktop/startup.sh /usr/local/bin/custom-startup.sh
 RUN sed -i 's/\r$//' /usr/local/bin/custom-startup.sh && \
     chmod +x /usr/local/bin/custom-startup.sh
 

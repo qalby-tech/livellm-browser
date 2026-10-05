@@ -24,7 +24,8 @@ DEFAULT_LANGUAGES = ("en-US", "en")
 
 LOCALES_PATHS = (
     Path("/etc/livellm/locales.json"),
-    Path(__file__).resolve().parent.parent.parent / "browser" / "locales.json",
+    # A checkout: browser/desktop/locales.json, shared with the Chrome image.
+    Path(__file__).resolve().parents[2] / "desktop" / "locales.json",
 )
 
 _locales_cache: Optional[dict] = None

@@ -1,4 +1,4 @@
-# Python-generated files
+# Python-generated files (chrome/ and camoufox/)
 __pycache__/
 *.py[oc]
 build/
@@ -12,7 +12,7 @@ wheels/
 profiles/
 .pytest_cache/
 *json
-# …except the files the image and the tests are built from.
-!locales.json
+# …except the files the images and the tests are built from.
+!desktop/locales.json
 !keeper/testdata/*.json
 test_ext.py

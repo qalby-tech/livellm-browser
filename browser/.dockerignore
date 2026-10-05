@@ -1,7 +1,12 @@
-.venv
-*md
-__pycache__
-.pytest_cache
-.github
-profiles
+# The build context of both browser images is browser/ (chrome/Dockerfile and
+# camoufox/Dockerfile): each copies keeper/, desktop/ and its own directory.
+# Nothing built or cached locally, and no tests, reaches an image.
+**/*.md
+*/.venv
+**/__pycache__
+*/.pytest_cache
+*/profiles
+*/tests
 keeper/keeper
+keeper/*_test.go
+keeper/testdata

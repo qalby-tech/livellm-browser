@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
 
 LOCALES_PATHS = (
     Path("/etc/livellm/locales.json"),
-    Path(__file__).resolve().parent.parent / "locales.json",
+    # A checkout: browser/desktop/locales.json, shared with the Camoufox image.
+    Path(__file__).resolve().parents[2] / "desktop" / "locales.json",
 )
 
 # Written into the profile when the platform manages a setting, so clearing

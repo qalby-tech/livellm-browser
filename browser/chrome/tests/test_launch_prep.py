@@ -125,7 +125,7 @@ def test_any_other_proxy_keeps_its_bypass(monkeypatch, server):
 
 
 def test_locales_table_shape():
-    table = json.loads((Path(__file__).resolve().parent.parent / "locales.json").read_text())
+    table = json.loads((Path(__file__).resolve().parents[2] / "desktop" / "locales.json").read_text())
     assert len(table) == 36
     for tag, row in table.items():
         assert re.fullmatch(r"[a-z]{2,3}(-[A-Z]{2}|-[0-9]{3})?", tag), tag

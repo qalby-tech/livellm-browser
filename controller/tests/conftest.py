@@ -86,7 +86,7 @@ def fresh_manager(tmp_path):
         browser_manager,
         browsers={}, sessions={}, _in_flight={}, _unhealthy_until={}, _rr=0,
         _connecting={}, _connect_started={}, paused={}, _closing=set(),
-        drivers={}, _driver_pids={}, _driver_locks={}, _starter=pw.async_playwright, _started=False,
+        drivers={}, _driver_pids={}, _driver_locks={}, _starter=pw.async_playwright, _started=False, _stopping=False, _watchers={},
     ), patch.multiple(
         browser_registry, path=str(tmp_path / "absent.json"), _cache={}, _mtime=-1.0,
     ):

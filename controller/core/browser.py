@@ -1,4 +1,5 @@
 import asyncio
+import asyncio.subprocess
 import functools
 import logging
 import os
@@ -38,6 +39,31 @@ TAB_TIMEOUT = 5.0
 # connect before it tries the next. The connect itself goes on, and the
 # browser comes last in the pick until it is up.
 PICK_CONNECT_WAIT = 3.0
+
+
+async def bounded(coro, timeout: float):
+    """``coro``'s result, or asyncio.TimeoutError after ``timeout`` seconds.
+
+    Unlike asyncio.wait_for, the caller never waits for the cancelled call to
+    finish: a Playwright call on a connection whose other end is gone may not
+    end on cancellation either (its abort waits on the same connection).
+    """
+    task = asyncio.ensure_future(coro)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    if not done:
+        task.cancel()
+        task.add_done_callback(_retrieve)
+        raise asyncio.TimeoutError()
+    return task.result()
+
+
+def _retrieve(task: asyncio.Future) -> None:
+    if not task.cancelled():
+        task.exception()
 
 
 class BrowserInfo:
@@ -80,6 +106,10 @@ class BrowserManager:
         # engine -> a client to .start() (core.pw.async_playwright); set by start().
         self._starter = pw.async_playwright
         self._started = False
+        # Set while the process ends: a driver that exits then is not restarted.
+        self._stopping = False
+        # engine -> the task that waits for that driver's process to exit.
+        self._watchers: dict[str, asyncio.Task] = {}
         self.browsers: dict[str, BrowserInfo] = {}
         # session id -> browser id. Kept apart from BrowserInfo.pages so a
         # session outlives a reconnect of its browser: it stays there and
@@ -146,9 +176,12 @@ class BrowserManager:
 
     async def stop_drivers(self, timeout: float = 5.0) -> None:
         """Stop every driver (the end of the process), each bounded."""
+        self._stopping = True
+        for task in list(self._watchers.values()):
+            task.cancel()
         for engine, driver in list(self.drivers.items()):
             try:
-                await asyncio.wait_for(driver.stop(), timeout=timeout)
+                await bounded(driver.stop(), timeout)
             except asyncio.TimeoutError:
                 logger.warning(f"Timeout stopping the {engine} Playwright driver, continuing shutdown")
             except Exception as e:
@@ -171,6 +204,65 @@ class BrowserManager:
         if proc is not None:
             self._driver_pids[engine] = proc.pid
             logger.info(f"Tracking the {engine} Playwright driver PID: {proc.pid}")
+            if isinstance(proc, asyncio.subprocess.Process):  # never a test double
+                # An older watcher (its driver replaced) ends by itself; it may
+                # be the task running this very restart, so it is not cancelled.
+                self._watchers[engine] = asyncio.ensure_future(
+                    self._watch_driver(engine, self.drivers[engine], proc)
+                )
+
+    async def _watch_driver(self, engine: str, driver: Playwright, proc) -> None:
+        """When a driver's process exits on its own, close its engine's
+        connections at once and restart it, reconnecting only that engine's
+        browsers (the other engine's driver and browsers go on)."""
+        try:
+            await proc.wait()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            return
+        if self._stopping or self.drivers.get(engine) is not driver:
+            return  # stopped on purpose, or already replaced by a restart
+        logger.warning(f"The {engine} Playwright driver exited ({proc.returncode}); restarting it")
+        try:  # its pipe's error, which nothing else reads now
+            driver._impl_obj._connection._transport.on_error_future.add_done_callback(_retrieve)
+        except AttributeError:
+            pass
+        infos = [i for i in self.browsers.values() if i.engine == engine]
+        for info in infos:
+            self._fail_remote(info.browser, f"The {engine} Playwright driver exited")
+        async with self._lock(engine):
+            if self._stopping or self.drivers.get(engine) is not driver:
+                return
+            try:
+                await self._restart_driver(engine)
+            except Exception as e:
+                logger.error(f"Restarting the {engine} Playwright driver failed: {type(e).__name__}: {e}")
+
+    @staticmethod
+    def _fail_remote(browser: Browser, reason: str) -> None:
+        """Close a Camoufox connection as its pipe closing would.
+
+        A firefox.connect connection is a pipe inside the local driver; when
+        that driver dies the pipe never reports closed (Playwright 1.62), so
+        every call on it, and its abort, would wait forever. Emitting the
+        pipe's close rejects them, closes the browser's contexts and pages,
+        and ends the connection. Reaches through private attributes, so every
+        step is guarded. A CDP connection (Chrome) fails on its own.
+        """
+        try:
+            transport = browser._impl_obj._connection._transport
+        except AttributeError:
+            return
+        if type(transport).__name__ != "JsonPipeTransport":
+            return
+        try:
+            transport.emit("close", reason)
+        except Exception as e:
+            logger.warning(f"Closing a connection of a dead driver: {type(e).__name__}: {e}")
+        stopped = getattr(transport, "_stopped_future", None)
+        if stopped is not None and not stopped.done():
+            stopped.set_result(None)
 
     def driver_alive(self, engine: str = pw.CHROME) -> bool:
         """Whether an engine's Node driver process is still running (False
@@ -273,10 +365,7 @@ class BrowserManager:
         """One connect on the engine's driver (started first when it has none
         yet), given up after CONNECT_TIMEOUT."""
         driver = await self._driver(engine)
-        return await asyncio.wait_for(
-            self._connect_call(driver, ws_url, headers, engine),
-            timeout=CONNECT_TIMEOUT,
-        )
+        return await bounded(self._connect_call(driver, ws_url, headers, engine), CONNECT_TIMEOUT)
 
     @staticmethod
     async def _default_context(browser: Browser, engine: str) -> BrowserContext:
@@ -324,7 +413,7 @@ class BrowserManager:
             await info.browser.close()
 
         try:
-            await asyncio.wait_for(close_all(), timeout=DISCONNECT_TIMEOUT)
+            await bounded(close_all(), DISCONNECT_TIMEOUT)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -349,7 +438,7 @@ class BrowserManager:
         otherwise be handed out again), then raises.
         """
         try:
-            return await asyncio.wait_for(info.context.new_page(), timeout=TAB_TIMEOUT)
+            return await bounded(info.context.new_page(), TAB_TIMEOUT)
         except Exception as e:
             logger.warning(
                 f"Could not open a tab on '{info.browser_id}': {type(e).__name__}: {e}"
@@ -621,10 +710,26 @@ class BrowserManager:
         reconnect that engine's browsers. The caller holds that engine's lock;
         the other engine's driver and browsers are not touched."""
         engine = self.engine_of(browser_id)
+        info = await self._restart_driver(engine, browser_id, fresh_ws_url, headers)
+        if info is None:
+            raise RuntimeError(
+                f"Failed to recover browser '{browser_id}' "
+                "after Playwright restart"
+            )
+        return info
+
+    async def _restart_driver(
+        self, engine: str, browser_id: Optional[str] = None,
+        fresh_ws_url: Optional[str] = None, headers: Optional[dict] = None,
+    ) -> Optional[BrowserInfo]:
+        """Restart one engine's driver and reconnect every browser of that
+        engine that was connected (plus ``browser_id`` at ``fresh_ws_url``).
+        Returns ``browser_id``'s new connection, if it was asked for and made.
+        The caller holds the engine's lock."""
         logger.warning(f"Restarting the {engine} Playwright driver for full recovery")
 
         saved = {bid: (info.ws_url, info.headers) for bid, info in self.browsers.items() if info.engine == engine}
-        if fresh_ws_url:
+        if browser_id and fresh_ws_url:
             saved[browser_id] = (fresh_ws_url, headers if headers is not None else saved.get(browser_id, (None, {}))[1])
         for bid in saved:
             self.browsers.pop(bid, None)
@@ -632,7 +737,7 @@ class BrowserManager:
         old_pw = self.drivers.pop(engine, None)
         if old_pw is not None:
             try:
-                await asyncio.wait_for(old_pw.stop(), timeout=5.0)
+                await bounded(old_pw.stop(), 5.0)
             except Exception:
                 logger.warning(
                     f"Old {engine} Playwright driver did not stop cleanly, force-killing"
@@ -649,26 +754,18 @@ class BrowserManager:
         new_info: Optional[BrowserInfo] = None
         for bid, (url, hdrs) in saved.items():
             try:
-                browser = await asyncio.wait_for(
-                    self._connect_call(driver, url, hdrs, engine),
-                    timeout=15.0,
-                )
+                browser = await bounded(self._connect_call(driver, url, hdrs, engine), 15.0)
                 context = await self._default_context(browser, engine)
                 info = BrowserInfo(browser, context, ws_url=url, browser_id=bid, headers=hdrs or {}, engine=engine)
                 self.browsers[bid] = info
+                self.mark_healthy(bid)
                 if bid == browser_id:
                     new_info = info
                 logger.info(f"Reconnected '{bid}' after the {engine} Playwright restart")
             except Exception as e:
                 logger.error(
-                    f"Failed to reconnect '{bid}' after Playwright restart: {e}"
+                    f"Failed to reconnect '{bid}' after the {engine} Playwright restart: {e}"
                 )
-
-        if new_info is None:
-            raise RuntimeError(
-                f"Failed to recover browser '{browser_id}' "
-                "after Playwright restart"
-            )
         return new_info
 
     # ── lifecycle ────────────────────────────────────────────
@@ -694,7 +791,7 @@ class BrowserManager:
                 if dead:
                     info.pages.pop(sid, None)
                     try:
-                        await asyncio.wait_for(page.close(), timeout=DISCONNECT_TIMEOUT)
+                        await bounded(page.close(), DISCONNECT_TIMEOUT)
                     except Exception:
                         pass
                     closed += 1
@@ -716,7 +813,7 @@ class BrowserManager:
             logger.info("All browsers disconnected")
 
         try:
-            await asyncio.wait_for(_shutdown(), timeout=timeout)
+            await bounded(_shutdown(), timeout)
         except asyncio.TimeoutError:
             logger.error(f"Shutdown timed out after {timeout}s, forcing cleanup")
             self.browsers.clear()

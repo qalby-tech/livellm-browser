@@ -255,7 +255,7 @@ async def open_page(manager: BrowserManager, browser_info: BrowserInfo) -> Tuple
 async def close_page(page: Page, what: str) -> None:
     """Close a tab without ever holding the call up on a browser that is gone."""
     try:
-        await asyncio.wait_for(page.close(), timeout=browser_mod.DISCONNECT_TIMEOUT)
+        await browser_mod.bounded(page.close(), browser_mod.DISCONNECT_TIMEOUT)
     except Exception as e:
         logger.warning(f"Error closing {what}: {type(e).__name__}: {e}")
 

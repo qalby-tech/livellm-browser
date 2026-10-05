@@ -57,6 +57,12 @@ type Keeper struct {
 	chromeVersion   string
 	probing         atomic.Bool
 
+	// engine is "" for a Chrome browser's sidecar and engineCamoufox for a
+	// Camoufox one (KEEPER_ENGINE). Unset, every answer is Chrome's own.
+	engine         string
+	browserVersion string // Camoufox only, like chromeVersion for Chrome
+	playwright     string // Camoufox only: the Playwright its server speaks
+
 	rotMu sync.Mutex // one rotation at a time
 
 	// Overridable for tests.
@@ -307,6 +313,10 @@ type Status struct {
 	NextRotationAt *time.Time    `json:"nextRotationAt"`
 	LastError      string        `json:"lastError,omitempty"`
 	ChromeVersion  string        `json:"chromeVersion,omitempty"`
+	// Camoufox only (omitted for Chrome, whose answer stays as it was).
+	Engine         string `json:"engine,omitempty"`
+	BrowserVersion string `json:"browserVersion,omitempty"`
+	Playwright     string `json:"playwright,omitempty"`
 }
 
 func tp(t time.Time) *time.Time {
@@ -326,6 +336,10 @@ func (k *Keeper) status() Status {
 		ExitIP: k.exitIP, Country: k.country, MeasuredAt: tp(k.measuredAt), RotatedAt: tp(k.rotatedAt),
 		Generation: k.generation, NextRotationAt: tp(k.nextRotationAt), LastError: k.lastError,
 		ChromeVersion: k.chromeVersion,
+	}
+	if k.engine == engineCamoufox {
+		s.ChromeVersion = ""
+		s.Engine, s.BrowserVersion, s.Playwright = k.engine, k.browserVersion, k.playwright
 	}
 	if r.up != nil {
 		s.Upstream = &upstreamView{Name: r.up.Name, Server: r.up.Server}
@@ -629,6 +643,11 @@ func (k *Keeper) run(ctx context.Context) {
 	defer tick.Stop()
 	lastProbe := k.now()
 	go k.probeOnce(ctx, true)
+	if k.engine == engineCamoufox {
+		// The connect answer reads the browser's Playwright version from the
+		// status: known from the first seconds, not after the first 30.
+		go k.refreshChromeVersion(ctx)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -657,10 +676,32 @@ func (k *Keeper) run(ctx context.Context) {
 
 func (k *Keeper) refreshChromeVersion(ctx context.Context) {
 	v, err := k.launcher.version(ctx)
+	if k.engine == engineCamoufox {
+		if err != nil || v.BrowserVersion == "" {
+			return
+		}
+		k.mu.Lock()
+		k.browserVersion, k.playwright = v.BrowserVersion, v.Playwright
+		k.mu.Unlock()
+		return
+	}
 	if err != nil || v.Chrome == "" {
 		return
 	}
 	k.mu.Lock()
 	k.chromeVersion = v.Chrome
 	k.mu.Unlock()
+}
+
+// ── engines ──
+
+// engineCamoufox is KEEPER_ENGINE for a Camoufox browser's sidecar. Any other
+// value (unset included) is a Chrome browser's, with Chrome's answers.
+const engineCamoufox = "camoufox"
+
+func engineFromEnv(v string) string {
+	if strings.TrimSpace(v) == engineCamoufox {
+		return engineCamoufox
+	}
+	return ""
 }

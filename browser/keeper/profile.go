@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -34,16 +35,39 @@ import (
 // browser's own X25519 identity (K_snap).
 
 const (
-	manifestName     = "livellm-profile.json"
-	profilePrefix    = "profile/"
-	archiveFormat    = 1
-	headroom         = 64 << 20
-	maxEntries       = 200_000
-	exportWorkFactor = 16
-	ageMagic         = "age-encryption.org/v1"
+	manifestName  = "livellm-profile.json"
+	profilePrefix = "profile/"
+	archiveFormat = 1 // a Chrome browser's archive
+	// archiveFormatCamoufox is a Camoufox browser's archive (engine "camoufox"
+	// in the manifest). Profiles move only between browsers of one engine: an
+	// older (Chrome) keeper refuses any format but 1, and a Camoufox keeper
+	// refuses format 1 with profile_engine.
+	archiveFormatCamoufox = 2
+	headroom              = 64 << 20
+	maxEntries            = 200_000
+	exportWorkFactor      = 16
+	ageMagic              = "age-encryption.org/v1"
 )
 
+// Manifest reads either format; it is written in its format's own shape
+// (MarshalJSON), so a Chrome manifest is byte for byte what it always was.
 type Manifest struct {
+	Format         int      `json:"format"`
+	Engine         string   `json:"engine,omitempty"`
+	ChromeVersion  string   `json:"chromeVersion"`
+	ChromeMajor    int      `json:"chromeMajor"`
+	BrowserVersion string   `json:"browserVersion,omitempty"`
+	BrowserMajor   int      `json:"browserMajor,omitempty"`
+	ImageVersion   string   `json:"imageVersion"`
+	CreatedAt      string   `json:"createdAt"`
+	Locale         string   `json:"locale,omitempty"`
+	Timezone       string   `json:"timezone,omitempty"`
+	Extensions     []string `json:"extensions"`
+	SizeBytes      int64    `json:"sizeBytes"`
+}
+
+// manifestChrome is format 1, exactly as Chrome browsers have always written it.
+type manifestChrome struct {
 	Format        int      `json:"format"`
 	ChromeVersion string   `json:"chromeVersion"`
 	ChromeMajor   int      `json:"chromeMajor"`
@@ -55,12 +79,56 @@ type Manifest struct {
 	SizeBytes     int64    `json:"sizeBytes"`
 }
 
+// manifestCamoufox is format 2.
+type manifestCamoufox struct {
+	Format         int      `json:"format"`
+	Engine         string   `json:"engine"`
+	BrowserVersion string   `json:"browserVersion"`
+	BrowserMajor   int      `json:"browserMajor"`
+	ImageVersion   string   `json:"imageVersion"`
+	CreatedAt      string   `json:"createdAt"`
+	Locale         string   `json:"locale,omitempty"`
+	Timezone       string   `json:"timezone,omitempty"`
+	Extensions     []string `json:"extensions"`
+	SizeBytes      int64    `json:"sizeBytes"`
+}
+
+func (m Manifest) MarshalJSON() ([]byte, error) {
+	if m.Format == archiveFormatCamoufox {
+		return json.Marshal(manifestCamoufox{m.Format, m.Engine, m.BrowserVersion, m.BrowserMajor, m.ImageVersion, m.CreatedAt, m.Locale, m.Timezone, m.Extensions, m.SizeBytes})
+	}
+	return json.Marshal(manifestChrome{m.Format, m.ChromeVersion, m.ChromeMajor, m.ImageVersion, m.CreatedAt, m.Locale, m.Timezone, m.Extensions, m.SizeBytes})
+}
+
 type SnapshotMeta struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
 	CreatedAt     string `json:"createdAt"`
 	SizeBytes     int64  `json:"sizeBytes"`
 	ChromeVersion string `json:"chromeVersion"`
+	// Camoufox only: written instead of chromeVersion.
+	Engine         string `json:"engine,omitempty"`
+	BrowserVersion string `json:"browserVersion,omitempty"`
+}
+
+func (m SnapshotMeta) MarshalJSON() ([]byte, error) {
+	if m.Engine == engineCamoufox {
+		return json.Marshal(struct {
+			ID             string `json:"id"`
+			Name           string `json:"name"`
+			CreatedAt      string `json:"createdAt"`
+			SizeBytes      int64  `json:"sizeBytes"`
+			Engine         string `json:"engine"`
+			BrowserVersion string `json:"browserVersion"`
+		}{m.ID, m.Name, m.CreatedAt, m.SizeBytes, m.Engine, m.BrowserVersion})
+	}
+	return json.Marshal(struct {
+		ID            string `json:"id"`
+		Name          string `json:"name"`
+		CreatedAt     string `json:"createdAt"`
+		SizeBytes     int64  `json:"sizeBytes"`
+		ChromeVersion string `json:"chromeVersion"`
+	}{m.ID, m.Name, m.CreatedAt, m.SizeBytes, m.ChromeVersion})
 }
 
 var (
@@ -145,9 +213,18 @@ func readSmall(r *os.Root, name string, max int64) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(f, max))
 }
 
-// listProfile walks dir (relative to r) without following symlinks;
-// symlinks, devices, fifos and sockets are skipped.
+// listProfile walks a Chrome profile at dir (relative to r) without
+// following symlinks; symlinks, devices, fifos and sockets are skipped.
 func listProfile(r *os.Root, dir string) ([]fileEntry, int64, error) {
+	return listProfileFor(r, dir, "")
+}
+
+// listProfileFor is listProfile with the engine's own leave-outs.
+func listProfileFor(r *os.Root, dir, engine string) ([]fileEntry, int64, error) {
+	skip := excluded
+	if engine == engineCamoufox {
+		skip = excludedFirefox
+	}
 	var out []fileEntry
 	var total int64
 	err := fs.WalkDir(r.FS(), dir, func(p string, d fs.DirEntry, err error) error {
@@ -164,7 +241,7 @@ func listProfile(r *os.Root, dir string) ([]fileEntry, int64, error) {
 		t := d.Type()
 		switch {
 		case t.IsDir():
-			if excluded(rel, true) {
+			if skip(rel, true) {
 				return filepath.SkipDir
 			}
 			info, err := d.Info()
@@ -173,7 +250,7 @@ func listProfile(r *os.Root, dir string) ([]fileEntry, int64, error) {
 			}
 			out = append(out, fileEntry{rel: rel, dir: true, mode: info.Mode().Perm(), mod: info.ModTime()})
 		case t.IsRegular():
-			if excluded(rel, false) {
+			if skip(rel, false) {
 				return nil
 			}
 			info, err := d.Info()
@@ -203,7 +280,7 @@ var archiveListed func()
 // writeArchive writes zstd(tar) of the profile at dir (relative to r),
 // manifest first.
 func writeArchive(w io.Writer, r *os.Root, dir string, m Manifest) error {
-	entries, total, err := listProfile(r, dir)
+	entries, total, err := listProfileFor(r, dir, m.Engine)
 	if err != nil {
 		return err
 	}
@@ -211,6 +288,9 @@ func writeArchive(w io.Writer, r *os.Root, dir string, m Manifest) error {
 		archiveListed()
 	}
 	m.Format = archiveFormat
+	if m.Engine == engineCamoufox {
+		m.Format = archiveFormatCamoufox
+	}
 	m.SizeBytes = total
 	if m.Extensions == nil {
 		m.Extensions = []string{}
@@ -278,6 +358,10 @@ type extractOpts struct {
 	runningMajor int
 	force        bool
 	maxBytes     int64 // uncompressed cap
+	// A Camoufox browser's: its engine and full version ("156.0.1-beta.34");
+	// runningMajor is then its Firefox major.
+	engine         string
+	runningVersion string
 }
 
 func profileNewer(n, m int) *apiErr {
@@ -310,11 +394,30 @@ func extractArchive(r io.Reader, fsr *os.Root, dst string, o extractOpts) (*Mani
 		return nil, errNoManifest
 	}
 	var m Manifest
-	if json.Unmarshal(mb, &m) != nil || m.Format != archiveFormat {
-		return nil, errNoManifest
-	}
-	if o.runningMajor > 0 && m.ChromeMajor > o.runningMajor && !o.force {
-		return nil, profileNewer(m.ChromeMajor, o.runningMajor)
+	downgrade := false
+	if o.engine == engineCamoufox {
+		if json.Unmarshal(mb, &m) != nil {
+			return nil, errNoManifest
+		}
+		if m.Format == archiveFormat {
+			return nil, errProfileFromChrome
+		}
+		if m.Format != archiveFormatCamoufox || m.Engine != engineCamoufox {
+			return nil, errNoManifest
+		}
+		if o.runningVersion != "" && camoufoxNewer(m.BrowserMajor, m.BrowserVersion, o.runningMajor, o.runningVersion) {
+			if !o.force {
+				return nil, camoufoxProfileNewer(m.BrowserVersion, o.runningVersion)
+			}
+			downgrade = true
+		}
+	} else {
+		if json.Unmarshal(mb, &m) != nil || m.Format != archiveFormat {
+			return nil, errNoManifest
+		}
+		if o.runningMajor > 0 && m.ChromeMajor > o.runningMajor && !o.force {
+			return nil, profileNewer(m.ChromeMajor, o.runningMajor)
+		}
 	}
 	var total int64
 	count := 0
@@ -336,6 +439,9 @@ func extractArchive(r io.Reader, fsr *os.Root, dst string, o extractOpts) (*Mani
 		rel, ok := cleanEntry(hdr.Name)
 		if !ok {
 			return nil, errBadArchive
+		}
+		if o.engine == engineCamoufox && rel == downgradeMarker {
+			continue // only a forced import writes it, never the archive
 		}
 		target := path.Join(dst, rel)
 		switch hdr.Typeflag {
@@ -381,6 +487,24 @@ func extractArchive(r io.Reader, fsr *os.Root, dst string, o extractOpts) (*Mani
 		default:
 			// Symlinks, hard links, devices, fifos: never.
 			return nil, errBadArchive
+		}
+	}
+	if downgrade {
+		// The launcher starts the next Camoufox once with -allow-downgrade
+		// and removes the marker.
+		f, err := fsr.OpenFile(path.Join(dst, downgradeMarker), os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
+		if err != nil {
+			if isNoSpace(err) {
+				return nil, errNoRoom
+			}
+			return nil, err
+		}
+		_, err = f.Write([]byte(m.BrowserVersion + "\n"))
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
 	return &m, nil
@@ -528,6 +652,9 @@ func (s *profileStore) ensureDirs() (*os.Root, error) {
 func (s *profileStore) tryLock() bool { return s.busy.TryLock() }
 
 func (s *profileStore) manifest(ctx context.Context) Manifest {
+	if s.k.engine == engineCamoufox {
+		return s.manifestCamoufox(ctx)
+	}
 	m := Manifest{CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
 	if v, err := s.k.launcher.version(ctx); err == nil {
 		m.ChromeVersion, m.ChromeMajor, m.ImageVersion = v.Chrome, v.ChromeMajor, v.Image
@@ -612,12 +739,40 @@ type ProfileInfo struct {
 	ChromeVersion string         `json:"chromeVersion"`
 	Snapshots     []SnapshotMeta `json:"snapshots"`
 	FreeBytes     int64          `json:"freeBytes"`
+	// Camoufox only: answered instead of chromeVersion.
+	Engine         string `json:"-"`
+	BrowserVersion string `json:"-"`
+}
+
+func (p ProfileInfo) MarshalJSON() ([]byte, error) {
+	if p.Engine == engineCamoufox {
+		return json.Marshal(struct {
+			SizeBytes      int64          `json:"sizeBytes"`
+			Engine         string         `json:"engine"`
+			BrowserVersion string         `json:"browserVersion"`
+			Snapshots      []SnapshotMeta `json:"snapshots"`
+			FreeBytes      int64          `json:"freeBytes"`
+		}{p.SizeBytes, p.Engine, p.BrowserVersion, p.Snapshots, p.FreeBytes})
+	}
+	return json.Marshal(struct {
+		SizeBytes     int64          `json:"sizeBytes"`
+		ChromeVersion string         `json:"chromeVersion"`
+		Snapshots     []SnapshotMeta `json:"snapshots"`
+		FreeBytes     int64          `json:"freeBytes"`
+	}{p.SizeBytes, p.ChromeVersion, p.Snapshots, p.FreeBytes})
 }
 
 func (s *profileStore) info(ctx context.Context) ProfileInfo {
 	pi := ProfileInfo{Snapshots: s.listSnapshots(), FreeBytes: s.freeBytesFn(s.root)}
 	if r, err := s.vol(); err == nil {
-		_, pi.SizeBytes, _ = listProfile(r, liveRel)
+		_, pi.SizeBytes, _ = listProfileFor(r, liveRel, s.k.engine)
+	}
+	if s.k.engine == engineCamoufox {
+		pi.Engine = engineCamoufox
+		if v, err := s.k.launcher.version(ctx); err == nil {
+			pi.BrowserVersion = v.BrowserVersion
+		}
+		return pi
 	}
 	if v, err := s.k.launcher.version(ctx); err == nil {
 		pi.ChromeVersion = v.Chrome
@@ -670,7 +825,7 @@ func (s *profileStore) sealLive(ctx context.Context, dst string, m Manifest) (in
 		r.Remove(tmp)
 		return 0, err
 	}
-	_, size, _ := listProfile(r, liveRel)
+	_, size, _ := listProfileFor(r, liveRel, s.k.engine)
 	return size, nil
 }
 
@@ -695,7 +850,7 @@ func (s *profileStore) roomFor() (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	_, size, err := listProfile(r, liveRel)
+	_, size, err := listProfileFor(r, liveRel, s.k.engine)
 	if err != nil && !os.IsNotExist(err) {
 		return 0, err
 	}
@@ -768,6 +923,9 @@ func (s *profileStore) snapshotLocked(ctx context.Context, name string, pause bo
 		return nil, err
 	}
 	meta := SnapshotMeta{ID: id, Name: truncate(name, 100), CreatedAt: m.CreatedAt, SizeBytes: size, ChromeVersion: m.ChromeVersion}
+	if s.k.engine == engineCamoufox {
+		meta.ChromeVersion, meta.Engine, meta.BrowserVersion = "", engineCamoufox, m.BrowserVersion
+	}
 	if err := s.writeMeta(meta); err != nil {
 		r.Remove(snapFile(id))
 		return nil, err
@@ -862,7 +1020,16 @@ func (s *profileStore) stage(ctx context.Context, rd io.Reader, force bool) (str
 		r.RemoveAll(dst)
 		return "", nil, errNoRoom
 	}
-	m, err := extractArchive(rd, r, dst, extractOpts{runningMajor: s.runningMajor(ctx), force: force, maxBytes: limit})
+	o := extractOpts{force: force, maxBytes: limit}
+	if s.k.engine == engineCamoufox {
+		o.engine = engineCamoufox
+		if v, err := s.k.launcher.version(ctx); err == nil {
+			o.runningMajor, o.runningVersion = v.BrowserMajor, v.BrowserVersion
+		}
+	} else {
+		o.runningMajor = s.runningMajor(ctx)
+	}
+	m, err := extractArchive(rd, r, dst, o)
 	if err != nil {
 		r.RemoveAll(dst)
 		return "", nil, err
@@ -1065,4 +1232,112 @@ func (s *profileStore) export(ctx context.Context, w io.Writer, snapshot, passwo
 		return err
 	}
 	return aw.Close()
+}
+
+// ── Camoufox (Firefox) profiles ──
+
+// downgradeMarker in a Camoufox profile lets the launcher start the next
+// Camoufox once over a profile a newer Camoufox wrote (-allow-downgrade). Only
+// a forced import of a newer archive writes it; archives never carry it.
+const downgradeMarker = ".livellm-allow-downgrade"
+
+var errProfileFromChrome = &apiErr{422, "profile_engine", "This profile is from a Chrome browser; this browser runs Camoufox. Profiles move only between browsers of one engine — import its cookies instead."}
+
+func camoufoxProfileNewer(archive, running string) *apiErr {
+	return &apiErr{409, "profile_newer", fmt.Sprintf("This profile is from Camoufox %s; this browser runs %s. Import anyway?", archive, running)}
+}
+
+// Firefox's leave-outs, relative to the profile root (profiles/default is the
+// Firefox profile itself): caches and crash/telemetry data it rebuilds, the
+// locks of a running Firefox, and the launcher's one-shot downgrade marker.
+var (
+	firefoxRootDirs = map[string]bool{
+		"cache2": true, "startupCache": true, "thumbnails": true, "shader-cache": true,
+		"crashes": true, "minidumps": true, "datareporting": true, "saved-telemetry-pings": true,
+	}
+	firefoxRootFiles = map[string]bool{"lock": true, ".parentlock": true, downgradeMarker: true}
+	firefoxPaths     = []string{"storage/temporary", "storage/to-be-removed"}
+)
+
+func excludedFirefox(rel string, isDir bool) bool {
+	base := path.Base(rel)
+	if ok, _ := path.Match("*.tmp", base); ok {
+		return true
+	}
+	if !strings.Contains(rel, "/") {
+		if strings.HasPrefix(base, "safebrowsing") {
+			return true
+		}
+		if isDir && firefoxRootDirs[base] {
+			return true
+		}
+		if !isDir && firefoxRootFiles[base] {
+			return true
+		}
+	}
+	for _, p := range firefoxPaths {
+		if rel == p {
+			return true
+		}
+	}
+	return false
+}
+
+// camoufoxVersion splits "156.0.1-beta.34" into its numbers ([156 0 1]) and
+// its build (34). A part that is not a number counts as 0.
+func camoufoxVersion(v string) ([]int, int) {
+	main, build, _ := strings.Cut(strings.TrimSpace(v), "-")
+	var nums []int
+	for _, p := range strings.Split(main, ".") {
+		n, _ := strconv.Atoi(p)
+		nums = append(nums, n)
+	}
+	b := 0
+	if i := strings.LastIndexAny(build, ".-"); i >= 0 {
+		b, _ = strconv.Atoi(build[i+1:])
+	} else {
+		b, _ = strconv.Atoi(build)
+	}
+	return nums, b
+}
+
+// camoufoxNewer reports whether an archive (its major and full version) is
+// from a newer Camoufox than the running one: a newer major, a newer
+// version, or the same version with a newer build.
+func camoufoxNewer(archiveMajor int, archiveVersion string, runningMajor int, runningVersion string) bool {
+	an, ab := camoufoxVersion(archiveVersion)
+	rn, rb := camoufoxVersion(runningVersion)
+	if archiveMajor == 0 && len(an) > 0 {
+		archiveMajor = an[0]
+	}
+	if runningMajor == 0 && len(rn) > 0 {
+		runningMajor = rn[0]
+	}
+	if archiveMajor != runningMajor {
+		return archiveMajor > runningMajor
+	}
+	for i := 0; i < len(an) || i < len(rn); i++ {
+		var a, r int
+		if i < len(an) {
+			a = an[i]
+		}
+		if i < len(rn) {
+			r = rn[i]
+		}
+		if a != r {
+			return a > r
+		}
+	}
+	return ab > rb
+}
+
+// manifestCamoufox is a Camoufox browser's manifest: format 2, its engine and
+// version, and the browser container's settings from the launcher.
+func (s *profileStore) manifestCamoufox(ctx context.Context) Manifest {
+	m := Manifest{Format: archiveFormatCamoufox, Engine: engineCamoufox, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Extensions: []string{}}
+	if v, err := s.k.launcher.version(ctx); err == nil {
+		m.BrowserVersion, m.BrowserMajor, m.ImageVersion = v.BrowserVersion, v.BrowserMajor, v.Image
+		m.Timezone, m.Locale = v.Timezone, v.Locale
+	}
+	return m
 }

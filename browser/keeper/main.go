@@ -33,6 +33,7 @@ func main() {
 	maxArchive, _ := strconv.ParseInt(envOr("KEEPER_MAX_ARCHIVE_MIB", "2048"), 10, 64)
 
 	k := newKeeper(secretDir, runDir+"/state.json", relayRequired, launcher)
+	k.engine = engineFromEnv(os.Getenv("KEEPER_ENGINE"))
 	k.boot()
 	p := newProfileStore(profiles, k, maxSnaps, maxArchive)
 	p.startSweep()

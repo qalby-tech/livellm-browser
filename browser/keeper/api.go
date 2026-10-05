@@ -277,6 +277,10 @@ func (s *server_) importProfile(w http.ResponseWriter, r *http.Request, _ []byte
 		writeErr(w, err)
 		return
 	}
+	if s.k.engine == engineCamoufox {
+		writeJSON(w, 200, map[string]any{"imported": true, "engine": engineCamoufox, "browserVersion": m.BrowserVersion, "sizeBytes": m.SizeBytes})
+		return
+	}
 	writeJSON(w, 200, map[string]any{"imported": true, "chromeVersion": m.ChromeVersion, "sizeBytes": m.SizeBytes})
 }
 
@@ -288,6 +292,24 @@ func (s *server_) cookies(w http.ResponseWriter, r *http.Request, body []byte) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
+	if s.k.engine == engineCamoufox {
+		// Firefox refuses some cookies Chromium takes: the launcher adds what it
+		// can and counts the rest.
+		c, err := s.k.launcher.cookiesCounted(ctx, body)
+		if err != nil {
+			writeJSON(w, 502, map[string]string{"code": "browser_unreachable", "message": "The browser did not take the cookies."})
+			return
+		}
+		added, dropped := len(arr), 0
+		if c.Added != nil {
+			added = *c.Added
+		}
+		if c.Dropped != nil {
+			dropped = *c.Dropped
+		}
+		writeJSON(w, 200, map[string]int{"added": added, "dropped": dropped})
+		return
+	}
 	if err := s.k.launcher.cookies(ctx, body); err != nil {
 		writeJSON(w, 502, map[string]string{"code": "browser_unreachable", "message": "The browser did not take the cookies."})
 		return

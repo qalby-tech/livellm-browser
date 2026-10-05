@@ -27,6 +27,11 @@ type launcherVersion struct {
 	Image       string `json:"image"`
 	Timezone    string `json:"timezone"`
 	Locale      string `json:"locale"`
+	// A Camoufox launcher answers these instead of chrome/chromeMajor.
+	Engine         string `json:"engine"`
+	BrowserVersion string `json:"browserVersion"`
+	BrowserMajor   int    `json:"browserMajor"`
+	Playwright     string `json:"playwright"`
 }
 
 func (l *launcherClient) do(ctx context.Context, method, path string, body any, out any) error {
@@ -92,4 +97,18 @@ var errLauncher = errors.New("launcher refused")
 
 func (l *launcherClient) cookies(ctx context.Context, raw json.RawMessage) error {
 	return l.do(ctx, http.MethodPost, "/browsers/default/cookies", raw, nil)
+}
+
+// cookieCounts is a Camoufox launcher's cookies answer: Firefox refuses some
+// cookies Chromium takes (SameSite=None without Secure, for one), and those
+// are counted, not failed.
+type cookieCounts struct {
+	Added   *int `json:"added"`
+	Dropped *int `json:"dropped"`
+}
+
+func (l *launcherClient) cookiesCounted(ctx context.Context, raw json.RawMessage) (cookieCounts, error) {
+	var c cookieCounts
+	err := l.do(ctx, http.MethodPost, "/browsers/default/cookies", raw, &c)
+	return c, err
 }

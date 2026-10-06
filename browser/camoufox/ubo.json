@@ -1,0 +1,30 @@
+{
+  "_comment": "uBlock Origin's fixed list selection and managed settings (ubo_policy.py writes them into policies.json at build). The lists are uBO's own default set, each read from its copy bundled in the pinned xpi (Dockerfile UBO_VERSION/UBO_SHA256); files pins each bundled copy by sha256. Never add a list without a bundled copy: it would be fetched at runtime. Refresh: README, Camoufox's ad blocker.",
+  "filterLists": [
+    "user-filters",
+    "ublock-filters",
+    "ublock-badware",
+    "ublock-privacy",
+    "ublock-unbreak",
+    "ublock-quick-fixes",
+    "easylist",
+    "easyprivacy",
+    "urlhaus-1",
+    "plowe-0"
+  ],
+  "userSettings": {
+    "autoUpdate": "false",
+    "suspendUntilListsAreLoaded": "false"
+  },
+  "files": {
+    "assets/ublock/filters.min.txt": "c857ada2861624a06d22a60d50f4ca9d6f5bb5fd13abd986d3053194a7bfca43",
+    "assets/ublock/badware.min.txt": "c16aeeef826173e61187e489ea12d96a705ca9f006a5b65e9edd149688cf0d90",
+    "assets/ublock/privacy.min.txt": "8b781cd3fa4527cca907a852488b0c979d119bdc27037205db1e8ed2fe9fd40e",
+    "assets/ublock/unbreak.min.txt": "e9ec1d2531c825f9e3a7c479265aaa547919395aabf4743f4497cf03ead433ae",
+    "assets/ublock/quick-fixes.min.txt": "7ce2da98e792266a2ceb5c6af036abb806048ec4b3db77fd72c0f785029d05b8",
+    "assets/thirdparties/easylist/easylist.txt": "f54f1cc57746f0da7a7be0d9d1bbd8beedf976090bf5bc39365eef111cf3fdf9",
+    "assets/thirdparties/easylist/easyprivacy.txt": "521f476f97ff99f4cbd06781b2d64da6e17bac4676f9fa02f7bd9c3a01f7e85b",
+    "assets/thirdparties/urlhaus-filter/urlhaus-filter-online.txt": "454f58e5439bd0470260ccd811665c424f9d6c639e3b662df60b00d0e161e9cf",
+    "assets/thirdparties/pgl.yoyo.org/as/serverlist": "6e359d5069fcd093d762d04b562ba955a8c0af2c9e683aaeea79fa1eb352be39"
+  }
+}

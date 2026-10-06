@@ -2,7 +2,7 @@
 name = "livellm-camoufox"
 # The Camoufox browser image's version: camoufox-<v> (dev-camoufox-<v> from
 # develop).
-version = "1.0.0"
+version = "1.0.1"
 description = "Camoufox (Firefox) in docker with VNC, served to Playwright clients over a launcher API"
 readme = "README.md"
 requires-python = "==3.12.*"

@@ -10,7 +10,8 @@
 # tests and local profiles out.
 #
 # Nothing is fetched at runtime: the browser, its fingerprint model and
-# uBlock Origin are pinned by sha256 and baked in here.
+# uBlock Origin are pinned by sha256 and baked in here, and uBO's filter
+# lists are the copies bundled in its xpi, never updated (ubo.json).
 
 # The control sidecar (keeper): the same Go source as the Chrome image's.
 FROM golang:1.25.1-bookworm AS keeper
@@ -155,6 +156,19 @@ RUN UV_OFFLINE=0 .venv/bin/python -c "from camoufox.fpgen_model import ensure_fp
 # fetch; the bar then shows Firefox's generic "Search or enter address". Its
 # own layer: the release above stays cached.
 RUN .venv/bin/python -c "import json; p = '/opt/camoufox/distribution/policies.json'; d = json.load(open(p)); d['policies']['SearchEngines'] = {'PreventInstalls': True, 'Add': [{'Name': 'Google', 'URLTemplate': 'https://www.google.com/search?q={searchTerms}', 'Method': 'GET'}], 'Default': 'Google', 'Remove': ['None']}; json.dump(d, open(p, 'w'), indent=2); print('default search engine:', d['policies']['SearchEngines']['Default'])"
+
+# uBlock Origin's managed settings (policies.json 3rdparty, read by uBO as
+# storage.managed): a fixed list selection, the same for every locale (uBO's
+# default lists, each read from its copy bundled in the xpi above and pinned
+# again by sha256 in ubo.json), no list updates, and page loads never wait
+# for the lists. Without it uBO turned on the regional list of the browser's
+# language (not bundled) and fetched it at every launch, holding page loads
+# ~80 s when it could not reach it, and updated its lists through the
+# person's proxy. ubo_policy.py fails the build if a selected list has no
+# bundled copy or a copy's sha256 moved.
+COPY camoufox/ubo.json camoufox/ubo_policy.py /tmp/ubo/
+RUN .venv/bin/python /tmp/ubo/ubo_policy.py /tmp/ubo/ubo.json /opt/camoufox-addons/ubo /opt/camoufox/distribution/policies.json && \
+    rm -rf /tmp/ubo
 
 # The offered locales (the same table as the Chrome image).
 COPY desktop/locales.json /etc/livellm/locales.json

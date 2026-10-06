@@ -14,5 +14,6 @@ profiles/
 *json
 # …except the files the images and the tests are built from.
 !desktop/locales.json
+!camoufox/ubo.json
 !keeper/testdata/*.json
 test_ext.py

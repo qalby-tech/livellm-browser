@@ -45,19 +45,15 @@ jobs:
         run: uv sync --frozen && uv run --frozen pytest tests/ -v --tb=short
 
       # ── The Chrome browser (Python 3.9) ──
-
-      - name: Set up Python 3.9
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.9'
+      # uv fetches 3.9 itself: newer runner images no longer ship it.
 
       - name: Install Chrome browser dependencies
         working-directory: browser/chrome
-        run: uv sync --all-extras
+        run: uv sync --all-extras --python 3.9
 
       - name: Run Chrome browser tests
         working-directory: browser/chrome
-        run: uv run pytest tests/ -v --tb=short
+        run: uv run --python 3.9 pytest tests/ -v --tb=short
 
       # ── The control sidecar (both browser images) ──
 
